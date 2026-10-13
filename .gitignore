@@ -1,0 +1,18 @@
+# Dependencies
+node_modules/
+
+# Runtime data and local configuration
+.env
+.env.*
+!.env.example
+instances.json
+data/
+plugin-ota/
+
+# Generated platform frontend
+public/platform/
+
+# Build and OS artifacts
+.build/
+*.tsbuildinfo
+.DS_Store

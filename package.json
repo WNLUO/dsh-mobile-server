@@ -1,0 +1,41 @@
+{
+  "name": "dsh-mobile-server",
+  "version": "0.1.0",
+  "private": true,
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/WNLUO/dsh-mobile-server.git"
+  },
+  "description": "DeepSeek Harness 远程操控中转服务器：宿主端出站隧道 + 手机端配对鉴权 + HTTP/WS 反向代理",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test/smoke.js && node test/forward-headers.test.cjs && node test/integration-tunnel.js && node test/cache-while-revalidate.js && node test/empty-degradation.cjs && node test/credentials-revoke-all.test.cjs && node test/device-credential-revoke.cjs && node test/request-trace-flush.cjs && node test/sse-idle.cjs && node test/sse-header-timeout.cjs && node test/tunnel-id-allocation.cjs && node test/tunnel-id-release.cjs && node test/instance-view-state.cjs && node test/mirror-disk-fallback.cjs && node test/mirror-empty-guard.cjs && node test/mirror-sync-drop.cjs && node test/ws-queue-flush.cjs && node test/phone-ws-heartbeat.cjs && node test/superseded-tunnel.cjs && node test/background-refresh-credential.cjs && node test/relay-auth-contract.js && node test/tunnel-registration.test.cjs && node test/protocol-doc-parity.cjs",
+    "test:headers": "node test/forward-headers.test.cjs",
+    "test:integration": "node test/integration-tunnel.js",
+    "test:auth-contract": "node test/relay-auth-contract.js",
+    "test:revoke": "node test/device-credential-revoke.cjs",
+    "test:trace": "node test/request-trace-flush.cjs",
+    "test:sse-idle": "node test/sse-idle.cjs",
+    "test:sse-header-timeout": "node test/sse-header-timeout.cjs",
+    "test:tunnel-id": "node test/tunnel-id-allocation.cjs",
+    "test:tunnel-id-release": "node test/tunnel-id-release.cjs",
+    "test:instance-view": "node test/instance-view-state.cjs",
+    "test:mirror-fallback": "node test/mirror-disk-fallback.cjs",
+    "test:mirror-empty-guard": "node test/mirror-empty-guard.cjs",
+    "test:mirror-sync-drop": "node test/mirror-sync-drop.cjs",
+    "test:ws-queue-flush": "node test/ws-queue-flush.cjs",
+    "test:phone-ws-heartbeat": "node test/phone-ws-heartbeat.cjs",
+    "test:superseded-tunnel": "node test/superseded-tunnel.cjs",
+    "test:bg-refresh-credential": "node test/background-refresh-credential.cjs",
+    "test:empty": "node test/empty-degradation.cjs",
+    "test:registration": "node test/tunnel-registration.test.cjs",
+    "test:protocol-doc": "node test/protocol-doc-parity.cjs"
+  },
+  "engines": {
+    "node": ">= 20"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

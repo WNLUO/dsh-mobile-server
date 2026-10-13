@@ -1,0 +1,16 @@
+/*
+ * 平台前端的全局样式入口。
+ *
+ * @source 必须写成相对本文件的真实路径：Tailwind v4 默认忽略 node_modules，
+ * 漏了这一行 appica 组件的类名不会被扫描到，页面会完全没有样式。
+ */
+@import 'tailwindcss';
+@import '@appica/ui-react/styles.css';
+
+@source '../node_modules/@appica/ui-react/dist';
+
+html,
+body,
+#root {
+  min-height: 100%;
+}
