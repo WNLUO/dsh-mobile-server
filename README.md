@@ -24,9 +24,9 @@ Cordis Host 中）主动向本服务建立出站 WSS 隧道，手机的 HTTPS/WS
 | `HOST` | `0.0.0.0` | 监听地址 |
 | `RELAY_SECRET` | `''` | 配对 cookie HMAC 密钥。**必填**，建议 `openssl rand -hex 32` |
 | `PAIR_TTL_SEC` | `2592000`（30 天） | 配对 cookie 有效期 |
-| `PLUGIN_CONTROL_TOKEN` | `''` | 插件 OTA 控制面 Bearer token；为空则控制面全部拒绝 |
-| `PLUGIN_OTA_ROOT` | `<包目录>/plugin-ota` | 运维数据根目录（诊断快照、请求轨迹）。**名字是历史遗留**：它以前装的是插件 OTA 物料，2026-10 插件改走 npm 之后只剩运维数据了；改名会移动线上文件，所以留着 |
-| `PLUGIN_PUBLIC_BASE_URL` | `''` | 插件 OTA 下载地址的公开基址；配置后 check 一律用它，为空才回退到请求头 Host（并做语法校验） |
+| `PLUGIN_CONTROL_TOKEN` | `''` | 插件 OTA 发布及运维控制面的 Bearer token；为空则控制面拒绝 |
+| `PLUGIN_OTA_ROOT` | `<包目录>/plugin-ota` | 运维与插件 OTA 数据根目录：诊断快照、请求轨迹，以及 `releases.json` 和完整 tgz |
+| `PLUGIN_PUBLIC_BASE_URL` | `''` | 插件 OTA 包下载公开基址；为空时根据请求 Host 与转发协议生成（nginx `/` 转发可用） |
 | `RELAY_CACHE_TTL_MS` | `30000` | 移动端镜像缓存的新鲜期 |
 | `MIRROR_DATA_DIR` | `<包目录>/data` | 移动端镜像缓存数据目录 |
 | `DEVICE_CREDENTIALS_FILE` | `$DSH_HOME/relay-device-credentials.json` | 设备凭证落盘位置 |
@@ -81,7 +81,7 @@ systemctl daemon-reload && systemctl enable --now dsh-relay
 ```
 
 > `PLUGIN_CONTROL_TOKEN` 为空时，`/api/desktop-plugins/control/*` 整个控制面都会拒绝（401）。
-> 插件 OTA 本身 2026-10 已经删掉，见下面「第一方插件 OTA（已删除）」。
+> 插件 OTA 只负责独立的设备更新链；npm 仍是正式分发源，App OTA 不在本服务。
 
 ## 端点
 
@@ -111,22 +111,31 @@ systemctl daemon-reload && systemctl enable --now dsh-relay
 「吊销本实例全部设备」不是 HTTP 路由，而是宿主 → 中转的隧道消息
 `revokeAll (0x18)` / `revokeAllAck (0x19)`。
 
-### 第一方插件 OTA（2026-10 已删除）
+### 插件 OTA（npm 分发之外的设备更新链）
 
-**这里从前有一整套插件 OTA**：落盘索引 + 每平台物料目录、匿名只读的 check /
-versions / releases 资产 / installer.mjs、以及发布与遥测控制端点（publish / trigger /
-rollback / telemetry / clients）。
+npm 是插件正式分发源；OTA 服务只发布完整 npm tgz，供设备检查与下载，不参与 App OTA。
+公开接口只提供 stable：
 
-现在没有了。插件改成**从 npm 分发**、更新交给 DSH 的插件市场（市场负责在 profile 里跑
-pnpm、核验落盘版本、留回滚点与重启守卫）。于是中转这边：插件不再是分发源，相关的存储、
-路由、`lib/plugin-ota.js`、`lib/plugin-telemetry.js` 与它们的测试一并删掉。
+- `GET /api/desktop-plugins/ota/latest?platform=<process.platform>&channel=stable` 返回 `{ok:true,data:{version,platform,channel,packageUrl}}`。
+- `GET /api/desktop-plugins/ota/releases/<version>/package.tgz?platform=<process.platform>` 流式下载该平台版本包。
+- `PUT /api/desktop-plugins/control/ota/releases/<version>/package.tgz?platform=<process.platform>&channel=stable` 发布原始 gzip npm tarball；仅接受 `Authorization: Bearer <PLUGIN_CONTROL_TOKEN>`，并校验包内 `package/package.json` 的名称为 `dsh-mobile-plugin`、版本与 URL 一致。请求上限 128 MiB。
 
-删掉的东西不再接受请求：`/api/desktop-plugins/check`、`/api/sdk/check-desktop-plugins`、
-`/api/desktop-plugins/versions`、`/api/desktop-plugins/installer.mjs`、
-`/api/desktop-plugins/releases/...`、`/api/desktop-plugins/telemetry`、
-`/api/desktop-plugins/control/{status,query,clients,publish,trigger,rollback,retract}`
-（现在是 404 / 401，取决于是否先撞上控制面鉴权）。**App 的 OTA 不受影响**：它走的是另一套
-分发平台（`app.wnluo.com` 的 `/api/open/apps/*`、`/api/sdk/check-ota-update`），与本服务无关。
+索引写入 `PLUGIN_OTA_ROOT/releases.json`（platform→version），包体写入 `PLUGIN_OTA_ROOT/releases/<platform>/<version>.tgz`。latest 从该平台 stable 版本按 SemVer 推导。配置了 `PLUGIN_PUBLIC_BASE_URL` 时包地址使用该基址；否则按请求 Host 与 `X-Forwarded-Proto` 生成，nginx 根路径转发无需额外前缀。
+
+发布示例（在插件仓库根目录执行；需已安装依赖）：
+
+```sh
+VERSION=$(node -p "require('./package.json').version")
+PLATFORM=$(node -p "process.platform")
+npm pack --pack-destination /tmp
+curl --fail-with-body -X PUT \
+  -H "Authorization: Bearer $PLUGIN_CONTROL_TOKEN" \
+  -H 'Content-Type: application/gzip' \
+  --data-binary "@/tmp/dsh-mobile-plugin-$VERSION.tgz" \
+  "https://dsh-hub.wnluo.com/api/desktop-plugins/control/ota/releases/$VERSION/package.tgz?platform=$PLATFORM&channel=stable"
+```
+
+`PLATFORM` 必须与设备上的 Node `process.platform` 相同；macOS 返回 `darwin`。发布前先确认 `PLUGIN_CONTROL_TOKEN` 已在当前 shell 设置。**App 的 OTA 不受影响**：它使用 `app.wnluo.com` 的独立分发 API。
 
 ### 桌面插件的运维观测（还在）
 
@@ -146,9 +155,9 @@ pnpm、核验落盘版本、留回滚点与重启守卫）。于是中转这边�
 ## 测试
 
 ```sh
-npm test                  # 全量：smoke + plugin-ota + integration + cache + credentials + auth-contract
+npm test                  # 全量：包含 OTA API 与 relay 回归
+npm run test:ota-api       # 发布鉴权、tarball 校验、latest 与下载
 npm run test:integration  # test/integration-tunnel.js（手机 → relay → 真实隧道 → 假上游）
-npm run test:ota          # test/plugin-ota.js
 npm run test:auth-contract # test/relay-auth-contract.js（鉴权契约 / 吊销立即生效）
 ```
 

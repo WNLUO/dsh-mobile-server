@@ -22,6 +22,8 @@
 
 const http = require('node:http');
 const fs = require('node:fs');
+const path = require('node:path');
+const zlib = require('node:zlib');
 const crypto = require('node:crypto');
 const { EventEmitter } = require('node:events');
 const { WebSocketServer, WebSocket } = require('ws');
@@ -62,6 +64,8 @@ const {
 } = require('./lib/mirror-state.js');
 const { isFreshRequest } = require('./lib/fresh-request.js');
 const { REGISTER_TIMEOUT_MS, MAX_FRAME_BYTES, MAX_TUNNELS, MAX_PENDING_PAIRS, TUNNEL_REGISTER_SECRET, TUNNEL_INSTANCES, TUNNEL_INSTANCES_FILE } = require('./lib/config.js');
+const PLUGIN_OTA_ROOT = process.env.PLUGIN_OTA_ROOT || path.join(__dirname, 'plugin-ota');
+const PLUGIN_PUBLIC_BASE_URL = process.env.PLUGIN_PUBLIC_BASE_URL || '';
 const { tunnelRegistrationDecision } = require('./lib/tunnel-registration.js');
 const credentials = require('../dsh-mobile-plugin/dsh-mobile-credentials/lib/credentials.js');
 const diagnostics = require('./lib/diagnostics.js');
@@ -454,18 +458,139 @@ function readRequestJson(req, limit = 16 * 1024 * 1024) {
 /**
  * 中转侧的桌面插件控制面（`/api/desktop-plugins/control/*`）。
  *
- * 2026-10 之前这里还有整个**插件 OTA 存储**：check / versions / releases 资产 / installer.mjs
- * / telemetry，以及它的 publish / trigger / rollback 控制端点。插件改从 npm 分发、更新交给
- * DSH 的插件市场之后，那些端点就没有生产者与消费者了，整套删掉（同时删掉 lib/plugin-ota.js、
- * lib/plugin-telemetry.js 与 test/plugin-ota.js）。
- *
- * 留下的是与 OTA 无关的**运维观测**：设备在线/配对统计、诊断、请求轨迹、镜像快照。
- * 它们以前搭在同一个路径前缀下，只是因为当初一起写的；别顺手把它们也删了。
+ * 插件仍以 npm 为正式分发源；此处仅恢复独立的设备 OTA 包发布、stable 查询与下载。
+ * 发布只接受 Bearer 控制 token 和完整 npm tgz，物料与版本索引落在 PLUGIN_OTA_ROOT。
+ * 同路径前缀下的设备在线/配对统计、诊断、请求轨迹与镜像快照仍是运维观测接口。
  */
+const PLUGIN_VERSION_PATTERN = /^\d+\.\d+\.\d+$/;
+const PLUGIN_PLATFORM_PATTERN = /^[a-z0-9_-]{1,32}$/;
+const PLUGIN_MAX_TGZ_BYTES = 128 * 1024 * 1024;
+
+function validPluginVersion(value) {
+  if (!PLUGIN_VERSION_PATTERN.test(value || '')) return false;
+  return value.split('.').every((part) => Number(part) <= 999);
+}
+function comparePluginVersions(a, b) {
+  const parse = (value) => {
+    const [core, suffix = ''] = value.split('-', 2);
+    return { core: core.split('.').map(Number), suffix };
+  };
+  const left = parse(a); const right = parse(b);
+  for (let i = 0; i < 3; i += 1) if (left.core[i] !== right.core[i]) return left.core[i] - right.core[i];
+  if (!left.suffix && right.suffix) return 1;
+  if (left.suffix && !right.suffix) return -1;
+  return left.suffix.localeCompare(right.suffix);
+}
+function pluginOtaIndexFile() { return path.join(PLUGIN_OTA_ROOT, 'releases.json'); }
+function pluginOtaAssetFile(platform, version) { return path.join(PLUGIN_OTA_ROOT, 'releases', platform, `${version}.tgz`); }
+function readPluginOtaIndex() {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(pluginOtaIndexFile(), 'utf8'));
+    return parsed && typeof parsed === 'object' && parsed.releases && typeof parsed.releases === 'object' ? parsed : { releases: {} };
+  } catch (error) {
+    if (error.code === 'ENOENT') return { releases: {} };
+    throw error;
+  }
+}
+function validatePluginTarball(buffer, version) {
+  const tar = zlib.gunzipSync(buffer, { maxOutputLength: 256 * 1024 * 1024 });
+  let offset = 0;
+  while (offset + 512 <= tar.length) {
+    const header = tar.subarray(offset, offset + 512);
+    if (header.every((byte) => byte === 0)) break;
+    const name = header.subarray(0, 100).toString().replace(/\0.*$/, '');
+    const prefix = header.subarray(345, 500).toString().replace(/\0.*$/, '');
+    const entryName = prefix ? `${prefix}/${name}` : name;
+    const size = Number.parseInt(header.subarray(124, 136).toString().replace(/\0.*$/, '').trim() || '0', 8);
+    if (!Number.isFinite(size) || size < 0 || offset + 512 + size > tar.length) throw new Error('invalid npm tarball');
+    if (entryName === 'package/package.json') {
+      const metadata = JSON.parse(tar.subarray(offset + 512, offset + 512 + size).toString('utf8'));
+      if (metadata.name !== 'dsh-mobile-plugin' || metadata.version !== version) throw new Error('tarball package name/version does not match release');
+      return;
+    }
+    offset += 512 + Math.ceil(size / 512) * 512;
+  }
+  throw new Error('npm tarball package.json not found');
+}
+function readRequestBuffer(req, limit = PLUGIN_MAX_TGZ_BYTES) {
+  return new Promise((resolve, reject) => {
+    const chunks = []; let size = 0; let settled = false;
+    req.on('data', (chunk) => {
+      size += chunk.length;
+      if (size > limit) { settled = true; reject(new Error('request body too large')); req.destroy(); return; }
+      chunks.push(chunk);
+    });
+    req.on('end', () => { if (!settled) resolve(Buffer.concat(chunks)); });
+    req.on('error', (error) => { if (!settled) reject(error); });
+  });
+}
+function pluginAssetUrl(req, platform, version) {
+  let base = PLUGIN_PUBLIC_BASE_URL;
+  if (!base) {
+    const host = req.headers.host;
+    if (!host || /[\\s/@]/.test(host)) throw new Error('invalid request host');
+    base = `${req.headers['x-forwarded-proto'] === 'https' ? 'https' : 'http'}://${host}`;
+  }
+  const parsed = new URL(base);
+  if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password) throw new Error('invalid public base URL');
+  return `${parsed.origin}/api/desktop-plugins/ota/releases/${encodeURIComponent(version)}/package.tgz?platform=${encodeURIComponent(platform)}`;
+}
 async function handlePluginOta(req, res, url) {
+  if (url.pathname.startsWith('/api/desktop-plugins/ota/releases/')) {
+    const match = /^\/api\/desktop-plugins\/ota\/releases\/(\d+\.\d+\.\d+)\/package\.tgz$/.exec(url.pathname);
+    if (req.method !== 'GET') return sendJson(res, 405, { error: 'method not allowed' });
+    if (!match || !validPluginVersion(match[1])) return sendJson(res, 404, { error: 'release not found' });
+    const version = match[1];
+    const platform = url.searchParams.get('platform');
+    if (!platform || !PLUGIN_PLATFORM_PATTERN.test(platform)) return sendJson(res, 400, { error: 'platform is required' });
+    const index = readPluginOtaIndex();
+    const entry = index.releases[platform]?.[version];
+    if (!entry) return sendJson(res, 404, { error: 'release not found' });
+    res.writeHead(200, { 'content-type': 'application/gzip', 'content-length': entry.size, 'cache-control': 'public, max-age=31536000, immutable' });
+    fs.createReadStream(pluginOtaAssetFile(platform, version)).pipe(res);
+    return true;
+  }
+  if (url.pathname === '/api/desktop-plugins/ota/latest') {
+    if (req.method !== 'GET') return sendJson(res, 405, { error: 'method not allowed' });
+    const platform = url.searchParams.get('platform');
+    const channel = url.searchParams.get('channel') || 'stable';
+    if (!platform || !PLUGIN_PLATFORM_PATTERN.test(platform) || channel !== 'stable') return sendJson(res, 400, { error: 'invalid plugin update query' });
+    const index = readPluginOtaIndex();
+    const latest = Object.values(index.releases[platform] || {}).filter((release) => release.channel === channel && validPluginVersion(release.version)).sort((a, b) => comparePluginVersions(a.version, b.version)).at(-1);
+    if (!latest) return sendJson(res, 404, { ok: false, error: 'release not found' });
+    return sendJson(res, 200, { ok: true, data: { version: latest.version, platform, channel, packageUrl: pluginAssetUrl(req, platform, latest.version) } });
+  }
+  if (url.pathname.startsWith('/api/desktop-plugins/ota/')) {
+    if (req.method !== 'GET') return sendJson(res, 405, { error: 'method not allowed' });
+    return sendJson(res, 404, { error: 'endpoint not found' });
+  }
   if (!url.pathname.startsWith('/api/desktop-plugins/control/')) return false;
   if (!controlAuthorized(req)) return sendJson(res, 401, { error: 'control authorization required' });
   try {
+    if (req.method === 'PUT' && url.pathname.startsWith('/api/desktop-plugins/control/ota/releases/')) {
+      const match = /^\/api\/desktop-plugins\/control\/ota\/releases\/(\d+\.\d+\.\d+)\/package\.tgz$/.exec(url.pathname);
+      const platform = url.searchParams.get('platform');
+      if (!match || !validPluginVersion(match[1]) || !platform || !PLUGIN_PLATFORM_PATTERN.test(platform) || url.searchParams.get('channel') !== 'stable') return sendJson(res, 400, { error: 'invalid release path or metadata' });
+      if (!/^application\/gzip$/.test(String(req.headers['content-type'] || '').split(';')[0])) return sendJson(res, 415, { error: 'content-type must be application/gzip' });
+      const version = match[1];
+      const body = await readRequestBuffer(req);
+      if (!body.length) return sendJson(res, 400, { error: 'empty release asset' });
+      try { validatePluginTarball(body, version); }
+      catch (error) { return sendJson(res, 400, { error: error.message }); }
+      const asset = pluginOtaAssetFile(platform, version);
+      fs.mkdirSync(path.dirname(asset), { recursive: true });
+      const temporary = `${asset}.${process.pid}.${Date.now()}.tmp`;
+      fs.writeFileSync(temporary, body, { flag: 'wx' });
+      fs.renameSync(temporary, asset);
+      const index = readPluginOtaIndex();
+      index.releases[platform] ||= {};
+      index.releases[platform][version] = { platform, version, channel: 'stable', size: body.length, publishedAt: new Date().toISOString() };
+      const indexFile = pluginOtaIndexFile();
+      const temporaryIndex = `${indexFile}.${process.pid}.${Date.now()}.tmp`;
+      fs.writeFileSync(temporaryIndex, JSON.stringify(index, null, 2));
+      fs.renameSync(temporaryIndex, indexFile);
+      return sendJson(res, 201, { release: index.releases[platform][version] });
+    }
     if (req.method === 'GET' && url.pathname === '/api/desktop-plugins/control/device-stats') {
       const paired = credentials.listActive();
       const byInstance = {};
