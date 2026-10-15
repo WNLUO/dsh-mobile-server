@@ -1,0 +1,24 @@
+{
+  "name": "dsh-mobile-relay-cloudflare",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "4.151.0"
+  },
+  "cloudflare": {
+    "bindings": {
+      "RELAY_SECRET": {
+        "description": "Relay signing secret. Set a long random value in the Cloudflare deployment setup; keep it private."
+      },
+      "TUNNEL_REGISTER_SECRET": {
+        "description": "Optional shared secret required from desktop host tunnels. Configure the same value in the DSH host plugin."
+      }
+    }
+  }
+}

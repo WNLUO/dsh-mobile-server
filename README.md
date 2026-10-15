@@ -6,6 +6,16 @@ Cordis Host 中）主动向本服务建立出站 WSS 隧道，手机的 HTTPS/WS
 
 隧道帧格式、配对与鉴权细节见 [`PROTOCOL.md`](./PROTOCOL.md)。
 
+## Cloudflare Workers 一键部署（个人自建）
+
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/WNLUO/dsh-mobile-server/tree/main/cloudflare)
+
+每位用户都在自己的 Cloudflare 账号部署独立中转。点击按钮后登录 Cloudflare 并授权 GitHub，Cloudflare 会把 `cloudflare/` 子目录复制到你的仓库，自动创建 Worker 和 Durable Object，并提供 `workers.dev` 地址；不需要自有域名、备案或服务器。
+
+部署时设置 `RELAY_SECRET`（随机生成，至少 32 个字符）。公开使用建议同时设置 `TUNNEL_REGISTER_SECRET`，并在 DSH 桌面端中转设置里填入相同密钥。部署后把 Worker 地址配置到桌面端，再通过桌面端的配对码或二维码连接手机。更多说明见 [Cloudflare Relay 部署指南](./cloudflare/README.md)。
+
+该版本面向个人自用；Cloudflare 生命周期或部署更新可能断开长连接，进行中的请求会失败，不应作为多人共享中转服务。
+
 ## 环境变量
 
 | 变量 | 默认值 | 说明 |
