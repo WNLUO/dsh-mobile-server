@@ -9,10 +9,5 @@ instances.json
 data/
 plugin-ota/
 
-# Generated platform frontend
-public/platform/
-
 # Build and OS artifacts
-.build/
-*.tsbuildinfo
 .DS_Store

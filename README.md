@@ -6,11 +6,22 @@ Cordis Host 中）主动向本服务建立出站 WSS 隧道，手机的 HTTPS/WS
 
 隧道帧格式、配对与鉴权细节见 [`PROTOCOL.md`](./PROTOCOL.md)。
 
+## 三个后端版本
+
+本仓库是**自建版**：纯中转，可以单独一台服务器跑起来，不含平台与中控。
+
+- **运营版**（我们自己部署的那台）= 本仓库的中转核心 + 平台（登录 / 支付 / 授权码）+ 中控，
+  在 [`dsh-mobile-hub`](../dsh-mobile-hub/README.md)。它**引用**本仓库（`start({ modules })`），不拷贝核心。
+- **Workers 版**在独立仓库 [`WNLUO/dsh-cloudflare-relay`](https://github.com/WNLUO/dsh-cloudflare-relay)；
+  本仓库不再保留副本（旧地址兼容副本 2026-10 已下线）。
+
+中转核心不认识平台与中控，只提供「额外模块」挂载点（`start({ modules })`），挂什么由入口决定。
+
 ## Cloudflare Workers 一键部署（个人自建）
 
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/WNLUO/dsh-cloudflare-relay)
 
-Cloudflare Workers 版的唯一维护源是独立公开仓库：[WNLUO/dsh-cloudflare-relay](https://github.com/WNLUO/dsh-cloudflare-relay)。点击按钮后登录 Cloudflare 并授权 GitHub，Cloudflare 会把该仓库复制到你的账号，自动创建 Worker 和 Durable Object，并提供 `workers.dev` 地址；不需要自有域名、备案或服务器。旧 `cloudflare/` 路径暂作旧版插件一键部署入口的兼容副本，后续维护以独立仓库为准。
+Cloudflare Workers 版的唯一维护源是独立公开仓库：[WNLUO/dsh-cloudflare-relay](https://github.com/WNLUO/dsh-cloudflare-relay)。点击按钮后登录 Cloudflare 并授权 GitHub，Cloudflare 会把该仓库复制到你的账号，自动创建 Worker 和 Durable Object，并提供 `workers.dev` 地址；不需要自有域名、备案或服务器。旧 `cloudflare/` 路径暂作旧版插件一键部署入口的兼容副本已于 2026-10 下线，本仓库不再保留副本，维护只在独立仓库。
 
 部署时设置 `RELAY_SECRET`（随机生成，至少 32 个字符）。公开使用建议同时设置 `TUNNEL_REGISTER_SECRET`，并在 DSH 桌面端中转设置里填入相同密钥。部署后把 Worker 地址配置到桌面端，再通过桌面端的配对码或二维码连接手机。部署与自动更新说明见 [Cloudflare Relay README](https://github.com/WNLUO/dsh-cloudflare-relay#readme)。
 

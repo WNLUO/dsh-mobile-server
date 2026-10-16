@@ -70,7 +70,6 @@ const { tunnelRegistrationDecision } = require('./lib/tunnel-registration.js');
 const credentials = require('../dsh-mobile-plugin/dsh-mobile-credentials/lib/credentials.js');
 const diagnostics = require('./lib/diagnostics.js');
 const requestTrace = require('./lib/request-trace.js');
-const { createPlatform } = require('./lib/platform/index.js');
 
 // ── 配置 ────────────────────────────────────────────────────────────
 const HOST = process.env.HOST || '0.0.0.0';
@@ -635,9 +634,9 @@ async function handlePluginOta(req, res, url) {
 // Set TRUST_PROXY=1 only when a trusted proxy always sets X-Forwarded-For.
 const TRUST_PROXY = process.env.TRUST_PROXY === '1';
 
-// DSH 中转平台（授权/收费）实例。在 start() 里才创建：模块级 require 会
-// 让每个 import server.js 的测试都去打开 SQLite 文件。
-let platform = null;
+// 入口脚本挂上来的额外模块（运营版的平台、中控）。中转自己不认识它们，
+// 只在请求入口按顺序问一句「这个请求你接不接」，见下面的挂载点。
+const mountedModules = [];
 function clientIp(req) {
   if (TRUST_PROXY) {
     const forwarded = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
@@ -679,12 +678,12 @@ const server = http.createServer((req, res) => {
       return sendJson(res, 200, { ok: true, service: 'dsh-mobile-relay', version: RELAY_VERSION });
     }
 
-    // DSH 中转平台（授权/收费）：JSON API 在 /api/platform/v1/*，
-    // 前端 SPA 在 /platform/*。挂在中转进程里的原因是 nginx 的
-    // `location /` 已经反代到这个端口，这样零 nginx 改动；而且以后
-    // 「按授权码放行设备」可以在同进程内直接查库。
-    // handle() 是 async（自己负责应答），返回 true 表示已接管这个请求。
-    if (platform && platform.handle(req, res, url)) return;
+    // 额外模块（运营版的平台 / 中控）：`handle()` 同步返回 true 表示它已接管
+    // 并自行应答这个请求，false 表示继续走中转逻辑。中转自己的路由一条都没让
+    // 出去，所以不挂模块时这里就是个空循环。
+    for (const extra of mountedModules) {
+      if (extra.handle(req, res, url)) return;
+    }
 
     // 桌面插件的运维观测面（`/api/desktop-plugins/control/*`）。插件 OTA 本身 2026-10 已删，
     // 见 handlePluginOta 的文件头。
@@ -1069,20 +1068,10 @@ function start(options = {}) {
   const host = options.host || HOST;
   const port = options.port == null ? PORT : Number(options.port);
 
-  // 平台是可选组件：默认关（PLATFORM_ENABLED=1 才起），配置不全或开关关掉时不能拖垮中转本体。
-  // 这里不预判环境变量，由 createPlatform 自己判——省得开关语义散在两处（见 lib/platform/config.js）。
-  if (!platform) {
-    try {
-      const created = createPlatform({ log });
-      if (created.enabled) {
-        platform = created;
-        log(`[platform] enabled: api=${created.config.apiPrefix} web=${created.config.webPrefix} db=${created.config.dbPath} (${created.describe()})`);
-      }
-    } catch (error) {
-      platform = null;
-      log(`[platform] 初始化失败，平台已禁用：${error.message}`);
-    }
-  }
+  // 额外模块由入口脚本创建后传进来（运营版见 dsh-mobile-hub/server.js）。中转
+  // 不预判有谁、也不在模块级 require 它们——那会让每个 import server.js 的
+  // 测试都替它们开一次数据库或文件。
+  if (Array.isArray(options.modules)) mountedModules.push(...options.modules);
 
   return new Promise((resolve, reject) => {
     const onError = (error) => { server.off('listening', onListening); reject(error); };
@@ -1109,18 +1098,23 @@ function stop() {
     releaseTunnelIds(inst.instanceId);
   }
   instances.clear();
-  const closingPlatform = platform;
-  platform = null;
+  const closingModules = mountedModules.splice(0, mountedModules.length);
   return new Promise((resolve) => {
     const finish = () => {
       // 请求追踪是 1s 防抖落盘（saveTimer 还被 unref 了），退出时不刷盘就会丢掉
       // 最后一秒的条目 —— 而 request-trace.js 文件头写明的意图正是「重启不丢」。
       requestTrace.flush();
-      if (closingPlatform) {
-        closingPlatform.close().catch((error) => log('[platform] close failed:', error.message)).finally(resolve);
-        return;
-      }
-      resolve();
+      if (!closingModules.length) return resolve();
+      Promise.all(
+        closingModules.map((extra) => {
+          try {
+            return Promise.resolve(extra.close?.());
+          } catch (error) {
+            log('module close failed:', error.message);
+            return Promise.resolve();
+          }
+        }),
+      ).then(resolve, (error) => { log('module close failed:', error.message); resolve(); });
     };
     if (!server.listening) return finish();
     server.close(finish);
