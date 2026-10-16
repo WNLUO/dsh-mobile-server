@@ -121,7 +121,16 @@ test('后台镜像刷新把新鲜 body 写回本体槽位', () => {
 
 test('server.js 契约：先取本体再交给 proxyCached/proxyRequest，凭据走 options', () => {
   const code = stripComments(fs.readFileSync(path.join(__dirname, '..', 'server.js'), 'utf8'));
-  assert.match(code, /const view = mobileInstance\(req\) \|\| pairedInstance\(req\);/, '必须先拿视图');
+  assert.match(
+    code,
+    /const view = mobileInstance\(req\) \|\| \(declaredInstanceId \? null : pairedInstance\(req\)\);/,
+    '必须先拿视图，且点名了实例就不许回落到配对 cookie（cookie 是设备级全局槽位，会把离线设备的请求发给另一台在线设备）',
+  );
+  assert.match(
+    code,
+    /const declaredInstanceId = typeof req\.headers\['x-dsh-instance'\] === 'string'/,
+    '实例标识要先判定「请求带没带」',
+  );
   assert.match(code, /const inst = canonicalInstance\(view\);/, '必须立刻还原本体');
   assert.match(code, /const credential = view && view\.__deviceCredential;/, '凭据从视图上取');
   // 命中镜像/响应缓存的两个前提：有设备凭据（= 走的是移动端读路径），且不是

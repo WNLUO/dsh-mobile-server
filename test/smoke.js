@@ -206,6 +206,64 @@ async function main() {
     assert.strictEqual(await res.text(), 'SECOND-DESKTOP');
   });
 
+  await test('点名的实例离线时不得转给 cookie 指向的另一台在线设备', async () => {
+    const upOne = http.createServer((req, res) => {
+      res.writeHead(200, { 'content-type': 'text/plain' });
+      res.end('ONE');
+    });
+    const upTwo = http.createServer((req, res) => {
+      res.writeHead(200, { 'content-type': 'text/plain' });
+      res.end('TWO');
+    });
+    await new Promise((r) => upOne.listen(0, '127.0.0.1', r));
+    await new Promise((r) => upTwo.listen(0, '127.0.0.1', r));
+    const one = new RelayTunnel({
+      relayUrl: RELAY_WS,
+      instanceId: 'routing1',
+      pairingCode: '111111',
+      name: 'Routing One',
+      upstream: `http://127.0.0.1:${upOne.address().port}`,
+    });
+    const two = new RelayTunnel({
+      relayUrl: RELAY_WS,
+      instanceId: 'routing2',
+      pairingCode: '222222',
+      name: 'Routing Two',
+      upstream: `http://127.0.0.1:${upTwo.address().port}`,
+    });
+    try {
+      await one.start();
+      await two.start();
+      // 同一部手机先配 routing1、再配 routing2 —— 全局 dsh_pair 槽位落在 routing2 上
+      let jar = '';
+      for (const [instanceId, code] of [['routing1', '111111'], ['routing2', '222222']]) {
+        const paired = await fetch(`${RELAY_HTTP}/pair`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ instanceId, code, device: { name: 'Routing-Phone' } }),
+        });
+        assert.strictEqual(paired.status, 200);
+        const m = (paired.headers.get('set-cookie') || '').match(/dsh_pair=([^;]+)/);
+        assert.ok(m, '配对响应缺少 dsh_pair cookie');
+        jar = `dsh_pair=${m[1]}`;
+      }
+      // routing1 关机下线（隧道断开），手机依旧点名要 routing1
+      one.stop();
+      await delay(200);
+      const res = await fetch(`${RELAY_HTTP}/api/mobile/v1/status`, {
+        headers: { Cookie: jar, 'X-Dsh-Instance': 'routing1', Authorization: 'Bearer test-token' },
+      });
+      const body = await res.text();
+      assert.notStrictEqual(body, 'TWO', '离线设备的请求被转给了另一台在线设备');
+      assert.strictEqual(res.status, 401, `离线实例应被拒，实际 ${res.status} body=${JSON.stringify(body.slice(0, 80))}`);
+    } finally {
+      one.stop();
+      two.stop();
+      upOne.close();
+      upTwo.close();
+    }
+  });
+
   await test('移动 status 禁止无 Authorization 的实例探测', async () => {
     const res = await fetch(`${RELAY_HTTP}/api/mobile/v1/status`, {
       headers: { 'X-Dsh-Instance': 'smoke02' },

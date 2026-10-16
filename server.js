@@ -827,9 +827,13 @@ const server = http.createServer((req, res) => {
     // merge/retain a single global dsh_pair cookie across multiple pairings.
     // Prefer that id; the desktop-side Bearer token remains the authorization
     // boundary. Cookie routing remains the fallback for browser/legacy clients.
+    // 但「点名了哪台设备」就必须照实回绝它离线：dsh_pair 是设备级全局槽位，
+    // 多台配对时它指向最后配对的那台，回落会把离线设备的请求发给另一台在线设备，
+    // 手机分不清响应来自谁（名字/图标/项目被顶成那台的），且这个错会被持久化。
     // 解析函数返回的是携带凭据的浅拷贝视图；写实例状态一律走本体，
     // 否则 mirror / mirrorAt / mirrorSlotAt / mirrorDiskMissAt 的赋值会丢在视图上。
-    const view = mobileInstance(req) || pairedInstance(req);
+    const declaredInstanceId = typeof req.headers['x-dsh-instance'] === 'string' ? req.headers['x-dsh-instance'].trim() : '';
+    const view = mobileInstance(req) || (declaredInstanceId ? null : pairedInstance(req));
     const inst = canonicalInstance(view);
     if (url.pathname === '/api/mobile/v1/device-credential/revoke' && req.method === 'POST') {
       const instanceId = req.headers['x-dsh-instance'];
