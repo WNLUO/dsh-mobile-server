@@ -1,0 +1,89 @@
+# Applies stable Relay releases only after tests and a Wrangler dry-run pass.
+name: Update DSH Cloudflare Relay
+
+on:
+  schedule:
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: dsh-cloudflare-relay-update-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  update:
+    if: github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.20.0
+
+      - name: Find newest stable upstream release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tags="$(gh api repos/WNLUO/dsh-cloudflare-relay/releases --paginate --jq '.[] | select(.draft == false and .prerelease == false and (.tag_name | startswith("cloudflare-v"))) | .tag_name' | sort -V)"
+          tag="$(printf '%s\n' "$tags" | tail -n 1)"
+          if [ -z "$tag" ]; then
+            echo 'tag=' >> "$GITHUB_OUTPUT"
+            echo 'No stable Cloudflare Relay release is available yet.'
+            exit 0
+          fi
+          if ! [[ "$tag" =~ ^cloudflare-v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "Unexpected upstream release tag: $tag" >&2
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout stable upstream release
+        if: steps.release.outputs.tag != ''
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: git clone --depth 1 --branch "$RELEASE_TAG" https://github.com/WNLUO/dsh-cloudflare-relay.git "$RUNNER_TEMP/dsh-cloudflare-relay"
+
+      - name: Apply upstream release
+        id: sync
+        if: steps.release.outputs.tag != ''
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          version="${RELEASE_TAG#cloudflare-v}"
+          node scripts/sync-release.mjs --source "$RUNNER_TEMP/dsh-cloudflare-relay" --target . --version "$version" > "$RUNNER_TEMP/sync-result.json"
+          updated="$(node -e 'console.log(JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8")).updated)' "$RUNNER_TEMP/sync-result.json")"
+          echo "updated=$updated" >> "$GITHUB_OUTPUT"
+
+      - name: Install updated package dependencies
+        if: steps.sync.outputs.updated == 'true'
+        run: npm ci
+
+      - name: Run Worker tests
+        if: steps.sync.outputs.updated == 'true'
+        run: npm test
+
+      - name: Check Wrangler deployment bundle
+        if: steps.sync.outputs.updated == 'true'
+        run: npx wrangler deploy --dry-run
+
+      - name: Commit and push verified update
+        if: steps.sync.outputs.updated == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          git add --all
+          if git diff --cached --quiet; then exit 0; fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m "chore: update Cloudflare Relay to $RELEASE_TAG"
+          gh auth setup-git
+          git push origin "HEAD:$GITHUB_REF_NAME"

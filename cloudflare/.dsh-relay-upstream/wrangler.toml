@@ -1,0 +1,16 @@
+name = "dsh-mobile-relay"
+main = "src/index.mjs"
+compatibility_date = "2026-10-15"
+workers_dev = true
+
+[[durable_objects.bindings]]
+name = "RELAY"
+class_name = "RelayInstance"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["RelayInstance"]
+
+[vars]
+# Deploy-to-Cloudflare replaces/creates bindings; secrets must be set privately in setup.
+# Set TUNNEL_REGISTER_SECRET only when the desktop host is configured with the same secret.

@@ -1,0 +1,5 @@
+# Required to sign relay cookies. Keep this value stable after deployment.
+RELAY_SECRET=replace-with-a-random-value-at-least-32-characters
+
+# Optional. Must match the desktop host's tunnel registration secret.
+# TUNNEL_REGISTER_SECRET=replace-with-a-long-random-value

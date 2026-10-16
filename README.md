@@ -10,7 +10,7 @@ Cordis Host 中）主动向本服务建立出站 WSS 隧道，手机的 HTTPS/WS
 
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/WNLUO/dsh-cloudflare-relay)
 
-Cloudflare Workers 版已拆成独立公开仓库：[WNLUO/dsh-cloudflare-relay](https://github.com/WNLUO/dsh-cloudflare-relay)。点击按钮后登录 Cloudflare 并授权 GitHub，Cloudflare 会把该仓库复制到你的账号，自动创建 Worker 和 Durable Object，并提供 `workers.dev` 地址；不需要自有域名、备案或服务器。
+Cloudflare Workers 版的唯一维护源是独立公开仓库：[WNLUO/dsh-cloudflare-relay](https://github.com/WNLUO/dsh-cloudflare-relay)。点击按钮后登录 Cloudflare 并授权 GitHub，Cloudflare 会把该仓库复制到你的账号，自动创建 Worker 和 Durable Object，并提供 `workers.dev` 地址；不需要自有域名、备案或服务器。旧 `cloudflare/` 路径暂作旧版插件一键部署入口的兼容副本，后续维护以独立仓库为准。
 
 部署时设置 `RELAY_SECRET`（随机生成，至少 32 个字符）。公开使用建议同时设置 `TUNNEL_REGISTER_SECRET`，并在 DSH 桌面端中转设置里填入相同密钥。部署后把 Worker 地址配置到桌面端，再通过桌面端的配对码或二维码连接手机。部署与自动更新说明见 [Cloudflare Relay README](https://github.com/WNLUO/dsh-cloudflare-relay#readme)。
 
