@@ -32,7 +32,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          tags="$(gh api repos/WNLUO/dsh-mobile-server/releases --paginate --jq '.[] | select(.draft == false and .prerelease == false and (.tag_name | startswith("cloudflare-v"))) | .tag_name' | sort -V)"
+          tags="$(gh api repos/WNLUO/dsh-cloudflare-relay/releases --paginate --jq '.[] | select(.draft == false and .prerelease == false and (.tag_name | startswith("cloudflare-v"))) | .tag_name' | sort -V)"
           tag="$(printf '%s\n' "$tags" | tail -n 1)"
           if [ -z "$tag" ]; then
             echo 'tag=' >> "$GITHUB_OUTPUT"
@@ -49,7 +49,7 @@ jobs:
         if: steps.release.outputs.tag != ''
         env:
           RELEASE_TAG: ${{ steps.release.outputs.tag }}
-        run: git clone --depth 1 --branch "$RELEASE_TAG" https://github.com/WNLUO/dsh-mobile-server.git "$RUNNER_TEMP/dsh-mobile-server"
+        run: git clone --depth 1 --branch "$RELEASE_TAG" https://github.com/WNLUO/dsh-cloudflare-relay.git "$RUNNER_TEMP/dsh-cloudflare-relay"
 
       - name: Apply upstream release
         id: sync
@@ -58,7 +58,7 @@ jobs:
           RELEASE_TAG: ${{ steps.release.outputs.tag }}
         run: |
           version="${RELEASE_TAG#cloudflare-v}"
-          node scripts/sync-release.mjs --source "$RUNNER_TEMP/dsh-mobile-server/cloudflare" --target . --version "$version" > "$RUNNER_TEMP/sync-result.json"
+          node scripts/sync-release.mjs --source "$RUNNER_TEMP/dsh-cloudflare-relay" --target . --version "$version" > "$RUNNER_TEMP/sync-result.json"
           updated="$(node -e 'console.log(JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8")).updated)' "$RUNNER_TEMP/sync-result.json")"
           echo "updated=$updated" >> "$GITHUB_OUTPUT"
 

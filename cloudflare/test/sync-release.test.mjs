@@ -28,6 +28,8 @@ async function makeFixture(t, { currentVersion = '0.1.0', releaseVersion = '0.2.
   const sourceDir = join(root, 'release', 'cloudflare');
   const targetDir = join(root, 'deployment');
   await mkdir(join(sourceDir, '.dsh-relay-upstream'), { recursive: true });
+  await mkdir(join(sourceDir, '.github', 'workflows'), { recursive: true });
+  await writeFile(join(sourceDir, '.github', 'workflows', 'release.yml'), 'canonical release workflow\n');
   await mkdir(join(sourceDir, 'src'), { recursive: true });
   await mkdir(join(targetDir, '.dsh-relay-upstream'), { recursive: true });
   await mkdir(join(targetDir, 'src'), { recursive: true });
@@ -69,10 +71,10 @@ test('requires a stable release to match its package and deployment baseline and
   }), /must be newer than cloudflare-v0.1.0/);
   assert.throws(() => validateReleaseVersion({
     version: '0.2.0', packageVersion: '0.1.0', baselineVersion: '0.2.0', releasedVersions: [],
-  }), /does not match cloudflare\/package\.json/);
+  }), /does not match package\.json/);
   assert.throws(() => validateReleaseVersion({
     version: '0.2.0', packageVersion: '0.2.0', baselineVersion: '0.1.0', releasedVersions: [],
-  }), /does not match cloudflare\/\.dsh-relay-upstream-version/);
+  }), /does not match \.dsh-relay-upstream-version/);
   assert.throws(() => validateReleaseVersion({
     version: '1.0.0-rc.1', packageVersion: '1.0.0-rc.1', baselineVersion: '1.0.0-rc.1', releasedVersions: [],
   }), /Expected a stable x\.y\.z version/);
@@ -96,6 +98,7 @@ test('updates package files while preserving user Wrangler settings and local se
   assert.equal(await readFile(join(targetDir, '.dev.vars.example'), 'utf8'), 'RELAY_SECRET=example-for-0.2.0\n');
   assert.equal(await readFile(join(targetDir, '.env.example'), 'utf8'), 'PUBLIC_ENV=example-only\n');
   assert.equal(await readFile(join(targetDir, '.dsh-relay-upstream', 'wrangler.toml'), 'utf8'), await readFile(join(sourceDir, 'wrangler.toml'), 'utf8'));
+  await assert.rejects(readFile(join(targetDir, '.github', 'workflows', 'release.yml')), { code: 'ENOENT' });
 });
 
 test('does not change deployment files when the release conflicts with user Wrangler edits', async (t) => {

@@ -27,10 +27,10 @@ export function compareStableVersions(left, right) {
 export function validateReleaseVersion({ version, packageVersion, baselineVersion, releasedVersions = [] }) {
   parseStableVersion(version);
   if (packageVersion !== version) {
-    throw new Error(`Release version ${version} does not match cloudflare/package.json (${packageVersion})`);
+    throw new Error(`Release version ${version} does not match package.json (${packageVersion})`);
   }
   if (baselineVersion !== version) {
-    throw new Error(`Release version ${version} does not match cloudflare/.dsh-relay-upstream-version (${baselineVersion})`);
+    throw new Error(`Release version ${version} does not match .dsh-relay-upstream-version (${baselineVersion})`);
   }
   const latest = releasedVersions.map((candidate) => {
     parseStableVersion(candidate);
@@ -45,6 +45,7 @@ function isLocalOnly(relativePath) {
   const parts = relativePath.split(sep);
   const name = basename(relativePath);
   if (parts.some((part) => part === '.git' || part === '.wrangler' || part === 'node_modules')) return true;
+  if (relativePath === '.github/workflows/release.yml') return true;
   if (name === WRANGLER_FILE || relativePath === VERSION_FILE || parts[0] === WRANGLER_BASE_DIR) return true;
   if (name === '.dev.vars' || (name.startsWith('.dev.vars.') && name !== '.dev.vars.example')) return true;
   if (name === '.env' || (name.startsWith('.env.') && name !== '.env.example')) return true;
