@@ -8,13 +8,13 @@ Cordis Host 中）主动向本服务建立出站 WSS 隧道，手机的 HTTPS/WS
 
 ## Cloudflare Workers 一键部署（个人自建）
 
-[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/WNLUO/dsh-mobile-server/tree/main/cloudflare)
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/WNLUO/dsh-cloudflare-relay)
 
-每位用户都在自己的 Cloudflare 账号部署独立中转。点击按钮后登录 Cloudflare 并授权 GitHub，Cloudflare 会把 `cloudflare/` 子目录复制到你的仓库，自动创建 Worker 和 Durable Object，并提供 `workers.dev` 地址；不需要自有域名、备案或服务器。
+Cloudflare Workers 版已拆成独立公开仓库：[WNLUO/dsh-cloudflare-relay](https://github.com/WNLUO/dsh-cloudflare-relay)。点击按钮后登录 Cloudflare 并授权 GitHub，Cloudflare 会把该仓库复制到你的账号，自动创建 Worker 和 Durable Object，并提供 `workers.dev` 地址；不需要自有域名、备案或服务器。
 
-部署时设置 `RELAY_SECRET`（随机生成，至少 32 个字符）。公开使用建议同时设置 `TUNNEL_REGISTER_SECRET`，并在 DSH 桌面端中转设置里填入相同密钥。部署后把 Worker 地址配置到桌面端，再通过桌面端的配对码或二维码连接手机。更多说明见 [Cloudflare Relay 部署指南](./cloudflare/README.md)。
+部署时设置 `RELAY_SECRET`（随机生成，至少 32 个字符）。公开使用建议同时设置 `TUNNEL_REGISTER_SECRET`，并在 DSH 桌面端中转设置里填入相同密钥。部署后把 Worker 地址配置到桌面端，再通过桌面端的配对码或二维码连接手机。部署与自动更新说明见 [Cloudflare Relay README](https://github.com/WNLUO/dsh-cloudflare-relay#readme)。
 
-该版本面向个人自用；Cloudflare 生命周期或部署更新可能断开长连接，进行中的请求会失败，不应作为多人共享中转服务。用户仓库会每日检查官方稳定版，先通过测试和 Wrangler dry-run 再提交更新，由 Cloudflare Builds 自动部署；可在 GitHub Actions 暂停，也可撤销更新提交回退代码。更新会保留自己的 Worker 配置和 Cloudflare 密钥，Durable Object 数据迁移不能随代码回退。详见 [自动更新与发布说明](./cloudflare/README.md#automatic-stable-updates)。
+该版本面向个人自用；Cloudflare 生命周期或部署更新可能断开长连接，进行中的请求会失败，不应作为多人共享中转服务。用户仓库会每日检查独立 Cloudflare Relay 仓库的稳定版，先通过测试和 Wrangler dry-run 再提交更新，由 Cloudflare Builds 自动部署；可在 GitHub Actions 暂停，也可撤销更新提交回退代码。更新会保留自己的 Worker 配置和 Cloudflare 密钥，Durable Object 数据迁移不能随代码回退。
 
 ## 环境变量
 
