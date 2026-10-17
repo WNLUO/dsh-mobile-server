@@ -16,6 +16,9 @@ cd dsh-mobile-server
 sudo ./server/relay/rust/deploy/install.sh
 ```
 
+机器上没有 git 的话，下载 zip 也一样（右上角 **Code → Download ZIP**，或者
+`curl -L https://github.com/WNLUO/dsh-mobile-server/archive/refs/heads/main.tar.gz | tar xz`）。
+
 脚本做四件事：装 Rust（走国内镜像）、编译、把二进制放到 `/opt/dsh-relay/`、写 systemd
 服务并启动（监听 `127.0.0.1:18788`）。
 
