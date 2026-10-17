@@ -1,0 +1,5 @@
+# wasm-bindgen 需要 externref 表才能生成 catch 包装，而 Rust 1.95 在 wasm32-unknown-unknown
+# 上默认不再开 reference-types。两边对不上时 worker-build 会在 wasm-bindgen 那步报
+# 「externref table required for catch wrappers」。这里显式打开它。
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "target-feature=+reference-types"]

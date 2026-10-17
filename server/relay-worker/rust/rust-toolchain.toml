@@ -1,0 +1,6 @@
+# worker-build 0.8.7 调 wasm-bindgen 时会硬加 `--force-enable-abort-handler`，那个参数
+# 在新版 Rust 生成的 wasm 上会报「externref table required for catch wrappers」。
+# 固定到 worker-build 的 MSRV（1.91）：这是目前唯一能让构建跑通的组合。
+[toolchain]
+channel = "1.91.0"
+targets = ["wasm32-unknown-unknown"]

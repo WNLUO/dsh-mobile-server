@@ -1,0 +1,22 @@
+# Cloudflare 一键部署按钮要求这份文件在**仓库根目录**，所以它在这里；
+# Rust 源码、toolchain 与 cargo 配置都在 server/relay-worker/rust/，构建命令里 cd 进去。
+name = "dsh-mobile-relay"
+main = "server/relay-worker/rust/build/worker/shim.mjs"
+compatibility_date = "2026-10-15"
+workers_dev = true
+
+[build]
+# 先 cd 进 Rust 目录再编：rust-toolchain.toml（钉 1.91）与 .cargo/config.toml
+# （开 reference-types）都只在那个目录下生效，在根目录直接跑 worker-build 会踩
+# 「externref table required for catch wrappers」。
+# --no-panic-recovery：worker-build 默认加 --force-enable-abort-handler，那个参数在当前
+# 工具链上稳定报同一个错。加上就不加那两个参数，代价是 panic 不再被捕获。
+command = "cd server/relay-worker/rust && cargo install -q worker-build && worker-build --release --no-panic-recovery"
+
+[[durable_objects.bindings]]
+name = "RELAY"
+class_name = "RelayInstance"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["RelayInstance"]

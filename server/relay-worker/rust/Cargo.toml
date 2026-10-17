@@ -1,0 +1,26 @@
+[package]
+name = "dsh-relay-worker"
+version = "0.1.0"
+edition = "2021"
+description = "DSH Workers 版中转：Durable Object + WebSocket 隧道（Rust 实现）"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+worker = "0.8.7"
+worker-macros = "0.8.7"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+console_error_panic_hook = "0.1"
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dsh-relay-protocol = { path = "../../relay-core/rust" }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
