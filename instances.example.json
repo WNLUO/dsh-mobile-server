@@ -1,6 +1,0 @@
-{
-  "//": "复制为 instances.json（与 server.js 同目录）后即可生效：只有列在这里的 instanceId 能注册隧道。桌面端不需要任何配置。文件不存在 = 开放模式。",
-  "instances": [
-    "e889ea75"
-  ]
-}

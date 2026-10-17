@@ -1,0 +1,11 @@
+[package]
+name = "dsh-relay-protocol"
+version = "0.1.0"
+edition = "2021"
+description = "DSH 隧道协议 v2 的 Rust 实现（编解码与本仓 JS 版逐字节一致）"
+
+[lib]
+name = "dsh_relay_protocol"
+path = "src/lib.rs"
+
+[dependencies]

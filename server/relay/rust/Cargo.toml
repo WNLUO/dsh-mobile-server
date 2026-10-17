@@ -1,0 +1,35 @@
+[package]
+name = "dsh-relay"
+version = "0.1.1"
+edition = "2021"
+description = "DSH 自建版中转：出站隧道 + HTTP/WS 纯转发（Rust 实现）"
+
+[[bin]]
+name = "dsh-relay"
+path = "src/main.rs"
+
+[lib]
+name = "dsh_relay"
+path = "src/lib.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "signal"] }
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
+http = "1"
+bytes = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dsh-relay-protocol = { path = "../../relay-core/rust" }
+# 控制台的数据层。bundled = SQLite 编进二进制，服务器上不用装系统 sqlite。
+rusqlite = { version = "0.40", features = ["bundled"] }
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4"] }
+rand = "0.8"
+base64 = "0.22"
+# 控制台要跟登录系统打交道（换 token / 取 userinfo）。rustls 编进二进制，
+# 服务器上不用装 OpenSSL 开发包。
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "charset"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }

@@ -1,0 +1,32 @@
+# 中转的日志切割规则。
+#
+# 为什么必须有：relay.log 由 systemd 的 `StandardOutput=append:` 直接写，没有任何
+# 轮转。每条隧道重连都记一行，真实流量下会一直涨；磁盘写满之后第一个坏掉的不是日志，
+# 是同一个分区上的 SQLite——面板与准入全跟着挂。
+#
+# `copytruncate` 是这里的关键：进程用 append 模式一直握着同一个 fd，没法通知它换文件，
+# 只能「拷一份再把原件清空」。副作用是切的那一瞬间可能丢几行日志，对运维日志可以接受。
+/opt/dsh-mobile/logs/relay.log {
+    # 按大小切。**不用 `daily` + `size` 混写**：logrotate 会告警
+    # 'size' overrides 'daily'，两个一起写实际上只剩 size 生效，看起来像配了两道锁、
+    # 其实只有一道。50M 一份、留 7 份，上限 350M，对一个转发日志绰绰有余。
+    size 50M
+    rotate 7
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    su root root
+}
+
+# 备份脚本自己的日志，同样别让它无限长。
+/opt/dsh-mobile/logs/backup.log {
+    monthly
+    rotate 3
+    missingok
+    notifempty
+    compress
+    copytruncate
+    su root root
+}
