@@ -1,0 +1,120 @@
+# 把这个中转副本跟随上游自建版仓库更新。
+#
+# 一键部署把仓库复制成你自己账号下的一份之后，它与上游就脱钩了。这个定时任务每天检查
+# 一次上游有没有新的稳定版标签（`relay-vX.Y.Z`），有就拉过来——**先跑测试和
+# `wrangler deploy --dry-run`，全过了才提交**，所以放上来的永远是验证过的版本。
+# 提交后 Cloudflare 会按你自己仓库的 Git 集成自动重新部署；没接 Git 集成的话，
+# 拉到本地跑一次 `npm run deploy` 即可。
+#
+# 你自己的改动不会被覆盖：`wrangler.toml` 走三方合并，冲突时整次更新放弃并报错；
+# `.dev.vars`、`.env`、`.github/`、`.dsh-relay-upstream*` 一律不动。
+#
+# 不想自动更新：删掉这个文件即可，中转照常运行。
+name: Update DSH Relay
+
+on:
+  schedule:
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: dsh-relay-update-${{ github.repository }}
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: WNLUO/dsh-mobile-server
+
+jobs:
+  update:
+    if: github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.20.0
+
+      - name: 找上游最新的稳定版标签
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tags="$(gh api "repos/$UPSTREAM_REPO/releases" --paginate \
+            --jq '.[] | select(.draft == false and .prerelease == false and (.tag_name | startswith("relay-v"))) | .tag_name' | sort -V || true)"
+          tag="$(printf '%s\n' "$tags" | tail -n 1)"
+          if [ -z "$tag" ]; then
+            echo '上游还没有稳定版标签，跳过。'
+            echo 'tag=' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! [[ "$tag" =~ ^relay-v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "上游标签格式不认识：$tag" >&2
+            exit 1
+          fi
+          current="$(cat .dsh-relay-upstream-version 2>/dev/null || echo '')"
+          if [ "$current" = "${tag#relay-v}" ]; then
+            echo "已经是最新版本 $tag，跳过。"
+            echo 'tag=' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "发现新版本 $tag（当前 ${current:-无}）"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: 拉取上游那一版
+        if: steps.release.outputs.tag != ''
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "$RELEASE_TAG" \
+            "https://github.com/$UPSTREAM_REPO.git" "$RUNNER_TEMP/upstream"
+
+      - name: 应用更新
+        id: sync
+        if: steps.release.outputs.tag != ''
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#relay-v}"
+          result="$(node scripts/sync-release.mjs --source "$RUNNER_TEMP/upstream" --target . --version "$version")"
+          echo "$result"
+          echo "updated=$(node -e 'console.log(JSON.parse(process.argv[1]).updated)' "$result")" >> "$GITHUB_OUTPUT"
+
+      - name: 装依赖
+        if: steps.sync.outputs.updated == 'true'
+        run: npm ci
+
+      - name: 跑 Worker 测试
+        if: steps.sync.outputs.updated == 'true'
+        run: npm run test:worker
+
+      - name: 验证能构建
+        if: steps.sync.outputs.updated == 'true'
+        run: npx wrangler deploy --dry-run
+
+      - name: 提交并推送
+        if: steps.sync.outputs.updated == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git add --all
+          if git diff --cached --quiet; then
+            echo '没有变化。'
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m "chore: 更新中转到 $RELEASE_TAG"
+          gh auth setup-git
+          git push origin "HEAD:$GITHUB_REF_NAME"
