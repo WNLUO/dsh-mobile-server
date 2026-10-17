@@ -14,11 +14,21 @@ WSS 隧道；手机上的 HTTP / SSE / WebSocket 请求原样送进那条隧道�
 
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/WNLUO/dsh-mobile-server)
 
-点一下按钮，登录 Cloudflare 账号，部署完会给你一个 `https://<名字>.<账号>.workers.dev`
-地址。**不需要配任何密钥**，也不用管证书。
+点一下按钮 → 登录 Cloudflare → 点「部署」。**构建命令留空就行**，不用填任何东西：
+仓库里已经放好了编译好的产物（`dist/`），Cloudflare 拿到的就是能直接跑的东西。
+
+部署完会给你一个 `https://<名字>.<账号>.workers.dev` 地址。不需要配任何密钥，也不用管证书。
 
 免费额度对这个用途是够的（主要是 Durable Object 的请求数与时长）。要绑自己的域名，
 在 Cloudflare 的 Workers 面板里加 Custom Domain 就行。
+
+> **改了 Rust 代码之后**要重新出产物，否则部署的还是旧的：
+> ```sh
+> cd server/relay-worker/rust
+> worker-build --release --no-panic-recovery
+> cp build/worker/shim.mjs build/worker/index.wasm ../../../dist/
+> ```
+> 没有 `worker-build` 就先 `cargo install worker-build`。产物一共 430KB 左右。
 
 ### 方式二：自己的服务器
 
