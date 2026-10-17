@@ -37,8 +37,9 @@ function fakeInst(tunnelOverrides = {}) {
   return {
     instanceId: 'ws-1',
     pending: new Map(),
+    nextId: 0,
     frames: [],
-    tunnel: {
+    ws: {
       readyState: 1,
       bufferedAmount: 0,
       send(frame) { this.owner.frames.push(Buffer.from(frame)); },
@@ -68,8 +69,8 @@ function captureLog(fn) {
 test('T.wsOpen：隧道写不进去 → 记日志、清队列、断开这条手机 WS（不静默丢帧）', () => {
   const phone = fakePhone();
   const inst = fakeInst();
-  inst.tunnel.owner = inst;
-  inst.tunnel.bufferedAmount = 17 * 1024 * 1024; // 超过 MAX_TUNNEL_BUFFERED_BYTES
+  inst.ws.owner = inst;
+  inst.ws.bufferedAmount = 17 * 1024 * 1024; // 超过 MAX_TUNNEL_BUFFERED_BYTES
   const entry = entryWith(phone, [q('hello'), q('world')]);
   inst.pending.set(7, entry);
 
@@ -88,7 +89,7 @@ test('T.wsOpen：隧道写不进去 → 记日志、清队列、断开这条手�
 test('T.wsOpen：正常冲刷按原顺序送出，队列清零且不断连接', () => {
   const phone = fakePhone();
   const inst = fakeInst();
-  inst.tunnel.owner = inst;
+  inst.ws.owner = inst;
   const entry = entryWith(phone, [q('first'), q('second', true)]);
   inst.pending.set(11, entry);
 
@@ -116,7 +117,7 @@ test('T.wsOpen：冲到一半失败 → 已送出的不重复、队列清零、�
       this.owner.frames.push(Buffer.from(frame));
     },
   });
-  inst.tunnel.owner = inst;
+  inst.ws.owner = inst;
   const entry = entryWith(phone, [q('a'), q('b'), q('c')]);
   inst.pending.set(13, entry);
 
@@ -137,7 +138,7 @@ test('T.wsOpen：冲到一半失败 → 已送出的不重复、队列清零、�
 test('T.wsOpen 幂等：重复回执不得重放队列', () => {
   const phone = fakePhone();
   const inst = fakeInst();
-  inst.tunnel.owner = inst;
+  inst.ws.owner = inst;
   const entry = entryWith(phone, [q('once')]);
   inst.pending.set(17, entry);
 
@@ -148,7 +149,7 @@ test('T.wsOpen 幂等：重复回执不得重放队列', () => {
 
 test('源码契约：冲刷必须检查返回值并清零 queuedBytes', () => {
   const src = fs.readFileSync(path.join(__dirname, '..', 'lib', 'tunnel-handler.js'), 'utf8');
-  assert.match(src, /if \(!sendWsFrame\(inst, id, q\)\) \{ delivered = false; break; \}/);
+  assert.match(src, /if \(!sendWsFrame\(tunnel, id, q\)\) \{ delivered = false; break; \}/);
   assert.match(src, /entry\.queuedBytes = 0;/);
   assert.match(src, /ws open queue flush failed/);
 });

@@ -77,8 +77,9 @@ function fakeInst() {
   return {
     instanceId: 'sse-1',
     pending: new Map(),
+    nextId: 0,
     frames: [],
-    tunnel: {
+    ws: {
       readyState: 1,
       bufferedAmount: 0,
       owner: null,
@@ -94,7 +95,7 @@ function decodeAll(buffers) {
 }
 function startSse() {
   const inst = fakeInst();
-  inst.tunnel.owner = inst;
+  inst.ws.owner = inst;
   const res = fakeRes();
   proxyRequest(inst, fakeReq('text/event-stream'), res, {});
   return { inst, res, id: [...inst.pending.keys()][0] };
@@ -125,7 +126,7 @@ test('非 SSE 请求的 header 超时行为不变（回归）', () => {
   const timers = fakeTimers();
   try {
     const inst = fakeInst();
-    inst.tunnel.owner = inst;
+    inst.ws.owner = inst;
     const res = fakeRes();
     proxyRequest(inst, fakeReq('application/json'), res, {});
     const armed = timers.live(UPSTREAM_HEADER_TIMEOUT_MS);

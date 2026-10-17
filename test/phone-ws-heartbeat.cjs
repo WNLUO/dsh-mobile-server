@@ -45,8 +45,9 @@ function fakeInst(instanceId = 'pong-1') {
   return {
     instanceId,
     pending: new Map(),
+    nextId: 0,
     frames: [],
-    tunnel: {
+    ws: {
       readyState: 1,
       bufferedAmount: 0,
       owner: null,
@@ -56,7 +57,7 @@ function fakeInst(instanceId = 'pong-1') {
 }
 function openPhoneWs(inst) {
   const phone = fakePhone();
-  inst.tunnel.owner = inst;
+  inst.ws.owner = inst;
   handlePhoneWs(phone, { url: '/api/mobile/v1/ws', headers: { 'x-dsh-instance': inst.instanceId } }, inst);
   return phone;
 }

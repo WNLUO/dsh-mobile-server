@@ -5,11 +5,11 @@
  *
  * 宿主插件的 lib/relay/tunnel.js（class RelayTunnel）按本文件逻辑实现：
  *  1. 连接 wss://<relay>/tunnel
- *  2. 发送 register 帧（instanceId + pairingCode + name）
- *  3. 处理中转发来的 httpRequest / wsUpgrade 帧，转发到本地 127.0.0.1:<port>
- *  4. 把上游响应以 httpHead / httpChunk / httpEnd / wsText / wsBinary 回传
+ *  2. 处理中转发来的 httpRequest / wsUpgrade 帧，转发到本地 127.0.0.1:<port>
+ *  3. 把上游响应以 httpHead / httpChunk / httpEnd / wsText / wsBinary 回传
  *
- * 协议见 ../PROTOCOL.md（v2 章节），帧编解码见 ../lib/protocol.js。
+ * 自建版中转不再要求任何注册帧：连上 /tunnel 就是那条隧道。协议见 ../PROTOCOL.md
+ * （v2 章节），帧编解码见 ../lib/protocol.js。
  */
 
 const http = require('node:http');
@@ -33,31 +33,20 @@ class RelayTunnel {
   /**
    * @param {object} opts
    * @param {string} opts.relayUrl  如 ws://127.0.0.1:8700
-   * @param {string} opts.instanceId
-   * @param {string} opts.pairingCode
-   * @param {string} [opts.name]
    * @param {string} opts.upstream  本地上游地址，如 http://127.0.0.1:port
    * @param {(msg: string)=>void} [opts.onLog]
    */
   constructor(opts) {
     this.relayUrl = opts.relayUrl;
-    this.instanceId = opts.instanceId;
-    this.pairingCode = opts.pairingCode;
-    this.name = opts.name || '';
-    this.lanUrls = opts.lanUrls || [];
-    this.lanCandidates = opts.lanCandidates || [];
     this.upstream = new URL(opts.upstream);
     this.onLog = opts.onLog || (() => {});
-    /** 收到 pairRequest 时是否自动批准（模拟桌面用户点"允许"）；可传 onPairRequest 覆盖 */
-    this.autoApprovePair = opts.autoApprovePair !== false;
-    this.onPairRequest = opts.onPairRequest || null;
     this.ws = null;
     this.wsClients = new Map();  // relay 侧 ws id -> 上游 ws client
-    this.reqClients = new Map(); // relay 侧 http id -> 上游 http request
+    this.reqClients = new Map(); // relay 侧 http id -> { req, res, headSent }
   }
 
   log(...args) {
-    this.onLog(`[desktop-tunnel ${this.instanceId}]`, ...args);
+    this.onLog('[host-tunnel]', ...args);
   }
 
   sendFrame(type, id, payload) {
@@ -66,223 +55,154 @@ class RelayTunnel {
     }
   }
   sendJson(type, id, obj) {
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.ws.send(jsonFrame(type, id, obj));
-    }
+    this.sendFrame(type, id, JSON.stringify(obj));
   }
 
-  /** 更新配对码：先更新本地，再经已建立的隧道通知中转（旧码即刻失效）。 */
-  updatePairingCode(code) {
-    this.pairingCode = code;
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.sendJson(T.updatePairing, 0, { pairingCode: code });
-    }
-  }
-
-  /** 连接中转并注册实例；resolve 于收到 registered 回执 */
-  start() {
+  /** 建隧道；resolve 时握手完成（宿主可以开始收帧）。 */
+  connect() {
     return new Promise((resolve, reject) => {
-      let settled = false;
-      const done = (fn, arg) => {
-        if (!settled) {
-          settled = true;
-          fn(arg);
-        }
-      };
-      const ws = new WebSocket(`${this.relayUrl}/tunnel`, { perMessageDeflate: true });
+      const ws = new WebSocket(`${this.relayUrl.replace(/\/+$/, '')}/tunnel`);
       this.ws = ws;
-      const timer = setTimeout(() => {
-        done(reject, new Error('register timeout'));
-        try { ws.close(); } catch { /* ignore */ }
-      }, 8000);
-      const push = createFrameDecoder((frame) => {
-        if (frame.type === T.registered) {
-          clearTimeout(timer);
-          done(resolve);
-          this.log('registered');
-          return;
-        }
-        this.handleFrame(frame);
-      });
+      const push = createFrameDecoder((frame) => this.handleFrame(frame), { onError: () => {} });
       ws.on('open', () => {
-        this.sendJson(T.register, 0, {
-          instanceId: this.instanceId,
-          pairingCode: this.pairingCode,
-          name: this.name,
-          lanUrls: this.lanUrls || [],
-          lanCandidates: this.lanCandidates || [],
-        });
+        this.log('connected');
+        resolve();
       });
-      ws.on('message', (data, isBinary) => push(Buffer.isBuffer(data) ? data : Buffer.from(data)));
-      ws.on('close', (code, reason) => {
-        clearTimeout(timer);
-        this.log(`tunnel closed: ${code} ${reason}`);
-        this.ws = null;
-        for (const [, client] of this.wsClients) {
-          try { client.terminate(); } catch { /* ignore */ }
-        }
-        this.wsClients.clear();
-        for (const [, req] of this.reqClients) {
-          try { req.destroy(); } catch { /* ignore */ }
-        }
-        this.reqClients.clear();
-        done(reject, new Error(`隧道关闭: ${code} ${reason}`));
-      });
-      ws.on('error', (err) => {
-        clearTimeout(timer);
-        done(reject, err);
-      });
+      ws.on('message', (data) => push(Buffer.isBuffer(data) ? data : Buffer.from(data)));
+      ws.on('error', (err) => reject(err));
+      ws.on('close', (code, reason) => this.log(`closed code=${code} reason=${reason || ''}`));
     });
   }
 
-  stop() {
-    for (const [, client] of this.wsClients) {
-      try { client.terminate(); } catch { /* ignore */ }
-    }
-    this.wsClients.clear();
-    for (const [, req] of this.reqClients) {
-      try { req.destroy(); } catch { /* ignore */ }
+  close() {
+    for (const [, client] of this.reqClients) {
+      try { client.req.destroy(); } catch { /* ignore */ }
+      try { if (!client.res.destroyed) client.res.destroy(); } catch { /* ignore */ }
     }
     this.reqClients.clear();
+    for (const [, client] of this.wsClients) {
+      try { client.close(1000, 'tunnel closed'); } catch { /* ignore */ }
+    }
+    this.wsClients.clear();
     if (this.ws) {
-      try { this.ws.close(); } catch { /* ignore */ }
-      this.ws = null;
+      try { this.ws.close(1000, 'bye'); } catch { /* ignore */ }
     }
   }
 
   handleFrame(frame) {
     const { type, id, payload } = frame;
-    switch (type) {
-      case T.httpRequest: {
-        const msg = parseJson(payload);
-        const req = http.request(
-          {
-            host: this.upstream.hostname,
-            port: this.upstream.port,
-            method: msg.method,
-            path: msg.path,
-            headers: {
-              ...(msg.headers || {}),
-              // 保留手机端原始 Host（信任围栏按 Host 判定）；缺省回退本地上游
-              host: (msg.headers && msg.headers.host) || this.upstream.host,
-            },
-          },
-          (res) => {
-            this.sendJson(T.httpHead, id, { status: res.statusCode, headers: res.headers });
-            res.on('data', (c) => this.sendFrame(T.httpChunk, id, c));
-            res.on('end', () => this.sendFrame(T.httpEnd, id, Buffer.alloc(0)));
-            res.on('error', (err) => this.sendJson(T.httpError, id, { message: err.message }));
-          },
-        );
-        this.reqClients.set(id, req);
-        req.on('error', (err) => {
-          this.reqClients.delete(id);
-          this.sendJson(T.httpError, id, { message: err.message });
-        });
-        break;
-      }
-      case T.httpBody: {
-        const req = this.reqClients.get(id);
-        if (!req) break;
-        if (payload.length === 0) {
-          this.reqClients.delete(id);
-          try { req.end(); } catch { /* ignore */ }
-        } else {
-          try { req.write(payload); } catch { /* ignore */ }
-        }
-        break;
-      }
-      case T.wsUpgrade: {
-        const msg = parseJson(payload);
-        this.forwardWs(id, msg.path, msg.headers);
-        break;
-      }
-      case T.wsText:
-      case T.wsBinary: {
-        const client = this.wsClients.get(id);
-        if (client && client.readyState === WebSocket.OPEN) {
-          client.send(payload, { binary: type === T.wsBinary });
-        }
-        break;
-      }
-      case T.wsClose: {
-        const client = this.wsClients.get(id);
-        if (client) {
-          this.wsClients.delete(id);
-          try { client.close(codeFromPayload(payload)); } catch { /* ignore */ }
-        }
-        break;
-      }
-      case T.pairRequest: {
-        const msg = parseJson(payload);
-        if (this.onPairRequest) {
-          this.onPairRequest(msg);
-          break;
-        }
-        if (this.autoApprovePair) {
-          this.sendJson(T.pairConfirm, 0, {
-            requestId: msg.requestId,
-            approved: true,
-            token: `test-token-${this.instanceId}`,
-          });
-        }
-        break;
-      }
-      case T.ping:
-        this.sendFrame(T.pong, 0, Buffer.alloc(0));
-        break;
-      default:
-        break;
-    }
-  }
-
-  /** 把手机发来的 WS 升级请求桥接到本地上游 WS */
-  forwardWs(id, path, headers) {
-    const url = `ws://${this.upstream.host}${path}`;
-    let client;
-    try {
-      client = new WebSocket(url, { headers });
-    } catch (err) {
-      this.sendJson(T.wsError, id, { message: err.message });
+    if (type === T.ping) {
+      this.sendFrame(T.pong, 0, Buffer.alloc(0));
       return;
     }
-    this.wsClients.set(id, client);
-    client.on('open', () => this.sendFrame(T.wsOpen, id, Buffer.alloc(0)));
-    client.on('message', (data, isBinary) =>
-      this.sendFrame(isBinary ? T.wsBinary : T.wsText, id, data),
-    );
-    client.on('close', (code) => this.sendFrame(T.wsClose, id, encodeCloseCode(code)));
-    client.on('error', (err) => {
-      this.sendJson(T.wsError, id, { message: err.message });
+    if (type === T.pong) return;
+    if (type === T.httpRequest) return this.onHttpRequest(id, parseJson(payload));
+    if (type === T.httpBody) return this.onHttpBody(id, payload);
+    if (type === T.httpCancel) return this.onHttpCancel(id);
+    if (type === T.httpPause) return this.onHttpPause(id);
+    if (type === T.httpResume) return this.onHttpResume(id);
+    if (type === T.wsUpgrade) return this.onWsUpgrade(id, parseJson(payload));
+    if (type === T.wsText || type === T.wsBinary) return this.onWsData(id, payload, type === T.wsBinary);
+    if (type === T.wsClose) return this.onWsClose(id, codeFromPayload(payload));
+  }
+
+  // ── HTTP ──────────────────────────────────────────────────────────
+  onHttpRequest(id, msg) {
+    const headers = { ...(msg.headers || {}) };
+    delete headers.host;
+    const req = http.request({
+      host: this.upstream.hostname,
+      port: this.upstream.port,
+      method: msg.method,
+      path: msg.path,
+      headers,
+    });
+    const client = { req, res: null, headSent: false };
+    this.reqClients.set(id, client);
+    req.on('response', (res) => {
+      client.res = res;
+      this.sendJson(T.httpHead, id, { status: res.statusCode, headers: res.headers });
+      client.headSent = true;
+      res.on('data', (chunk) => this.sendFrame(T.httpChunk, id, chunk));
+      res.on('end', () => {
+        this.reqClients.delete(id);
+        this.sendFrame(T.httpEnd, id, Buffer.alloc(0));
+      });
+      res.on('error', (err) => this.failHttp(id, err));
+    });
+    req.on('error', (err) => this.failHttp(id, err));
+  }
+
+  onHttpBody(id, payload) {
+    const client = this.reqClients.get(id);
+    if (!client) return;
+    if (payload.length === 0) {
+      client.req.end();
+      return;
+    }
+    client.req.write(Buffer.from(payload));
+  }
+
+  onHttpCancel(id) {
+    const client = this.reqClients.get(id);
+    if (!client) return;
+    this.reqClients.delete(id);
+    try { client.req.destroy(); } catch { /* ignore */ }
+    try { if (client.res && !client.res.destroyed) client.res.destroy(); } catch { /* ignore */ }
+  }
+
+  onHttpPause(id) {
+    const client = this.reqClients.get(id);
+    if (client && client.res) client.res.pause();
+  }
+
+  onHttpResume(id) {
+    const client = this.reqClients.get(id);
+    if (client && client.res) client.res.resume();
+  }
+
+  failHttp(id, err) {
+    if (!this.reqClients.has(id)) return;
+    this.reqClients.delete(id);
+    this.sendJson(T.httpError, id, { message: err && err.message ? err.message : String(err) });
+  }
+
+  // ── WebSocket ─────────────────────────────────────────────────────
+  onWsUpgrade(id, msg) {
+    const target = new URL(msg.path, this.upstream);
+    const headers = { ...(msg.headers || {}) };
+    delete headers.host;
+    const ws = new WebSocket(target, { headers });
+    this.wsClients.set(id, ws);
+    ws.on('open', () => this.sendFrame(T.wsOpen, id, Buffer.alloc(0)));
+    ws.on('message', (data, isBinary) => this.sendFrame(isBinary ? T.wsBinary : T.wsText, id, data));
+    ws.on('close', (code, reason) => {
+      if (!this.wsClients.has(id)) return;
       this.wsClients.delete(id);
+      this.sendFrame(T.wsClose, id, Buffer.concat([
+        encodeCloseCode(code),
+        Buffer.from(String(reason || '').slice(0, 100), 'utf8'),
+      ]));
+    });
+    ws.on('error', (err) => {
+      if (!this.wsClients.has(id)) return;
+      this.wsClients.delete(id);
+      this.sendJson(T.wsError, id, { message: err && err.message ? err.message : String(err) });
     });
   }
-}
 
-// ── CLI 模式：手动联调用 ────────────────────────────────────────────
-// node test/fake-desktop.js --relay ws://127.0.0.1:8700 --id smoke01 \
-//      --code 123456 --name "Mac mini" --upstream http://127.0.0.1:9000
-if (require.main === module) {
-  const argv = process.argv.slice(2);
-  const get = (k, d) => {
-    const i = argv.indexOf(k);
-    return i >= 0 ? argv[i + 1] : d;
-  };
-  const tunnel = new RelayTunnel({
-    relayUrl: get('--relay', 'ws://127.0.0.1:8700'),
-    instanceId: get('--id', 'smoke01'),
-    pairingCode: get('--code', '123456'),
-    name: get('--name', ''),
-    upstream: get('--upstream', 'http://127.0.0.1:9000'),
-    onLog: (...a) => console.log(...a),
-  });
-  tunnel
-    .start()
-    .then(() => console.log('tunnel ready. Ctrl+C to stop.'))
-    .catch((e) => {
-      console.error('tunnel failed:', e.message);
-      process.exit(1);
-    });
+  onWsData(id, payload, isBinary) {
+    const ws = this.wsClients.get(id);
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    try { ws.send(payload, { binary: isBinary }); } catch { /* ignore */ }
+  }
+
+  onWsClose(id, code) {
+    const ws = this.wsClients.get(id);
+    if (!ws) return;
+    this.wsClients.delete(id);
+    try { ws.close(code); } catch { /* ignore */ }
+  }
 }
 
 module.exports = { RelayTunnel };

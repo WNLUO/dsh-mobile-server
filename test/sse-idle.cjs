@@ -38,8 +38,9 @@ function fakeInstance() {
   return {
     instanceId: 'inst-1',
     pending: new Map(),
+    nextId: 0,
     frames,
-    tunnel: { readyState: 1, bufferedAmount: 0, send: (frame) => frames.push(frame) },
+    ws: { readyState: 1, bufferedAmount: 0, send: (frame) => frames.push(frame) },
   };
 }
 
@@ -139,16 +140,16 @@ test('tunnel-handler wires the sentinel on head/chunk and clears it on end/error
   const source = fs.readFileSync(path.join(__dirname, '..', 'lib', 'tunnel-handler.js'), 'utf8');
   assert.ok(source.includes('armSseIdle'), 'tunnel-handler 必须引入 armSseIdle');
   assert.ok(
-    /entry\.res\.writeHead\(msg\.status \|\| 502, sanitizeRespHeaders\(msg\.headers\)\);\s*\n\s*armSseIdle\(inst, id, entry\);/.test(source),
+    /entry\.res\.writeHead\(msg\.status \|\| 502, sanitizeRespHeaders\(msg\.headers\)\);\s*\n\s*armSseIdle\(tunnel, id, entry\);/.test(source),
     'T.httpHead 必须武装哨兵',
   );
   assert.ok(
-    /const writable = entry\.res\.write\(payload\);\s*\n\s*armSseIdle\(inst, id, entry\);/.test(source),
+    /const writable = entry\.res\.write\(payload\);\s*\n\s*armSseIdle\(tunnel, id, entry\);/.test(source),
     'T.httpChunk 必须重置哨兵',
   );
   assert.equal(
     (source.match(/if \(entry\.idleTimer\) clearTimeout\(entry\.idleTimer\);/g) || []).length,
-    2,
-    'T.httpEnd 与 T.httpError 都必须清掉哨兵',
+    3,
+    'T.httpEnd、T.httpError 与隧道断开（failAllPending）都必须清掉哨兵',
   );
 });
