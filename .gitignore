@@ -11,3 +11,6 @@ plugin-ota/
 
 # Build and OS artifacts
 .DS_Store
+**/target/
+server/relay/rust/dist-console/
+server/relay/rust/console/node_modules/

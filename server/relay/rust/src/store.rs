@@ -111,6 +111,9 @@ CREATE TABLE IF NOT EXISTS ota_releases (
   version      TEXT NOT NULL,
   package_path TEXT NOT NULL,
   size         INTEGER NOT NULL DEFAULT 0,
+  -- 包的 sha256（小写十六进制）。客户端下载后核对：半个包 / 被中间层改过的包在激活前就挡住。
+  -- 老库补列时默认为空串，客户端见到空串就不校验（向后兼容）。
+  sha256       TEXT NOT NULL DEFAULT '',
   created_at   TEXT NOT NULL,
   UNIQUE (platform, channel, version)
 );
@@ -156,6 +159,10 @@ fn ensure_columns(conn: &Connection) {
         (
             "SELECT revoked_at FROM nodes LIMIT 1",
             "ALTER TABLE nodes ADD COLUMN revoked_at TEXT",
+        ),
+        (
+            "SELECT sha256 FROM ota_releases LIMIT 1",
+            "ALTER TABLE ota_releases ADD COLUMN sha256 TEXT NOT NULL DEFAULT ''",
         ),
     ] {
         if conn.prepare(probe).is_err() {
@@ -866,12 +873,14 @@ impl Store {
         version: &str,
         package_path: &str,
         size: i64,
+        sha256: &str,
     ) {
         let _ = self.lock().execute(
-            "INSERT INTO ota_releases (id, platform, channel, version, package_path, size, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "INSERT INTO ota_releases (id, platform, channel, version, package_path, size, sha256, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(platform, channel, version) DO UPDATE SET
-               package_path = excluded.package_path, size = excluded.size, created_at = excluded.created_at",
+               package_path = excluded.package_path, size = excluded.size,
+               sha256 = excluded.sha256, created_at = excluded.created_at",
             params![
                 uuid::Uuid::new_v4().to_string(),
                 platform,
@@ -879,6 +888,7 @@ impl Store {
                 version,
                 package_path,
                 size,
+                sha256,
                 now_iso()
             ],
         );
@@ -1078,6 +1088,8 @@ pub struct OtaRelease {
     #[serde(rename = "packagePath")]
     pub package_path: String,
     pub size: i64,
+    #[serde(default)]
+    pub sha256: String,
     #[serde(rename = "createdAt")]
     pub created_at: String,
 }
@@ -1090,6 +1102,7 @@ fn map_ota(row: &rusqlite::Row<'_>) -> rusqlite::Result<OtaRelease> {
         version: row.get("version")?,
         package_path: row.get("package_path")?,
         size: row.get("size")?,
+        sha256: row.get("sha256")?,
         created_at: row.get("created_at")?,
     })
 }

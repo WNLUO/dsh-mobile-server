@@ -3,10 +3,9 @@
 /**
  * 端到端验证：起 Rust 中转 → 连一个参考宿主隧道 → 用 HTTP 请求穿过它。
  *
- * 这不是单元测试，是「Rust 版到底能不能干活」的验收脚本。它复用 Node 版的参考宿主
- * 实现（test/fake-desktop.js），所以验的是真实协议往返，不是自说自话。
+ * 这不是单元测试，是端到端验收：用 test/fake-desktop.js 连接真实二进制，验证协议往返。
  *
- *   node server/relay/rust/scripts/e2e.mjs <rust-relay-binary>
+ *   node server/relay/rust/scripts/e2e.cjs <rust-relay-binary>
  */
 
 const http = require('node:http');
@@ -206,10 +205,10 @@ async function main() {
       `host=${echo.headers['host']}`,
     );
 
-    // 6. 部署前缀：中转地址填成 `https://host/relay`、或者照抄了带路由前缀的地址时，
-    // 请求路径会多出一截。中转要认出自己的路径，转发给宿主的路径也得把这截剥掉——
+    // 6. 部署前缀：中转地址填成 `https://host/relay` 时，请求路径会多出一截。
+    // 中转要认出自己的路径，转发给宿主的路径也得把这截剥掉——
     // 宿主的 API 全在 `/api/mobile/v1/` 下，带前缀一律 404。
-    const prefixedHealth = await request('GET', '/relay-worker/healthz');
+    const prefixedHealth = await request('GET', '/relay/healthz');
     check(
       '带部署前缀的 /healthz 仍然认得出',
       prefixedHealth.status === 200 && prefixedHealth.body === 'ok',
@@ -224,8 +223,8 @@ async function main() {
     );
 
     // 手机 API 的路径：部署前缀落在中间，必须连前缀一起剥干净。这是最常走的那条路
-    // （用户把中转地址填成 `https://host/relay`、或照抄了带路由前缀的地址）。
-    const mobilePath = await request('POST', '/relay-worker/api/mobile/v1/echo', '{"a":1}');
+    // （用户把中转地址填成 `https://host/relay`）。
+    const mobilePath = await request('POST', '/relay/api/mobile/v1/echo', '{"a":1}');
     const mobileEcho = JSON.parse(mobilePath.body);
     check(
       '手机 API 路径剥掉部署前缀后再送进隧道',

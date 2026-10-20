@@ -1,19 +1,14 @@
 //! 跨语言逐字节对撞：Rust 实现与 JS 权威实现必须对同一输入编出**完全相同**的字节。
 //!
-//! 这个测试在运行时调用 `node` 跑 JS 那份权威实现（`node/lib/protocol.js`），
-//! 不手抄期望值——手抄的期望值只能证明「今天两边碰巧一样」，证明不了以后一样。
-//!
-//! 依赖 `node` 在本机可用；没有就跳过整组并打印原因，不让 CI 因为缺工具变红。
+//! 测试运行时调用 Node 执行本仓 `../test/protocol.js`，使用其实际编码字节作为参照，
+//! 与 Rust 实现逐帧比对。中转仓库的 CI 安装 Node 与 Rust 工具链。
 
 use std::process::Command;
 
 use dsh_relay_protocol::{encode_close_payload, encode_frame, t, Payload};
 
-/// JS 实现的路径，相对本 crate（`server/relay-core/rust`）。
-///
-/// 2026-10-22 Node 版中转删除后，JS 侧的实现只剩 Workers 版这一份
-/// （`server/dsh-mobile-server/src/index.mjs` 导出 encodeFrame / encodeClosePayload）。
-const JS_PROTOCOL: &str = "../../dsh-mobile-server/src/index.mjs";
+/// JS 对照实现位于 relay-core 的测试夹具目录；本仓库独立构建，不依赖插件仓库检出。
+const JS_PROTOCOL: &str = "../test/protocol.js";
 const JS_TYPES: &str = "../protocol-types.js";
 
 fn node_available() -> bool {
@@ -40,9 +35,7 @@ fn run_node(script: &str) -> Option<String> {
         .output()
         .ok()?;
     if !output.status.success() {
-        // **不静默跳过**：这组测试的全部价值就在「真的对撞了」。找不到 JS 实现或它跑
-        // 不起来时必须红，否则它会以「全部通过」的样子呈现出根本没验过的假绿
-        // （2026-10-22 Node 版删除后就出现过一次：路径失效，4 条全绿但断言一条没跑）。
+        // JS 参照实现缺失或无法执行时，让对撞测试明确失败。
         panic!(
             "JS 实现跑不起来（{}）：{}",
             JS_PROTOCOL,

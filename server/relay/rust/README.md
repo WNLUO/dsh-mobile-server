@@ -6,10 +6,6 @@
 主动向本服务建立一条出站 WSS 隧道；手机上来的 HTTP / SSE / WebSocket 原样送进那条隧道，
 宿主的响应原样送回手机。所以本服务无需入站可达用户电脑的网络。
 
-同一个仓库还有跑在 Cloudflare 上的 Workers 版（`server/relay-worker/rust`）与 JS 版
-（`server/dsh-mobile-server`），三者说同一种隧道协议，行为一致，差别只在运行时。控制台
-只有这一个二进制里有。
-
 ## 边界
 
 - **多台宿主同时在线**。按宿主自报的实例 id（注册帧里的 `instanceId`）各存一条隧道，
@@ -195,17 +191,20 @@ curl -X POST -H "authorization: Bearer $TOKEN" --data-binary @pkg.tar.gz \
 
 ## 开发
 
+从仓库根目录安装面板依赖并运行：
+
 ```sh
-cargo test                              # 单元测试
-npm run build:relay-rust                # 编 release
-npm run test:relay-rust-e2e             # 两组端到端（普通转发 / 流式与长连接 + 控制台）
-npm run build:relay-console             # 编面板前端到 dist-console/
-npm run typecheck:relay-console         # 面板前端类型检查
+npm ci
+npm ci --prefix server/relay/rust/console
+npm run test:relay-core
+npm run test:relay
+npm run build:relay
+npm run test:e2e
 ```
 
-端到端用的是 `test/fake-desktop.js`——一份参考宿主实现，复用它的好处是验的是真实协议
-往返，而不是自己跟自己比。它依赖插件的 `ws`。它**不发 `register` 帧**，所以测不出注册
-回执那条路；控制台的准入是用裸 ws 探测验的。
+`build:relay` 编 release 二进制并构建控制台前端。端到端用 `test/fake-desktop.js` 作为参考宿主，
+共享同仓测试协议实现；WebSocket 测试依赖由仓库根目录的 `ws` 提供。它**不发 `register` 帧**，
+所以测不出注册回执那条路；控制台的准入是用裸 ws 探测验的。
 
 发布后确认线上跑的是哪份代码：`curl https://你的域名/api/platform/v1/config` 会带回
 `buildId`。cargo 会按文件 mtime 跳过编译，改了源码记得 `touch` 再编，别信「Finished」。
@@ -265,24 +264,17 @@ SELF_UPDATE_SOURCE=https://your-domain.example/relay-updates   # 必须写，指
 的运营机，那意味着「开了自动更新但没改源」的用户会来别人的域名取二进制、校验通过、
 然后替换掉自己的程序——那不是更新，是把远程执行的口子交给了一个陌生人。
 
-三种部署方式下这件事的实情：
+两种情形下这件事的实情：
 
 - **自己部署这台中转**：开关一开就生效，去看更新源上有没有 `latest.json`。但**你得自己
   有地方发布**——这套机制是给「我们自己发版给一批中转用」设计的，不是给单节点用户准备
   的升级通道。单节点用户直接重装更快：`git pull` 后重跑一遍 `deploy/install.sh`。
   没有更新源就别开这个开关。
-- **Cloudflare Workers 版**：**没有也不需要自动更新**。那是托管的 V8 沙箱，没有文件系统、
-  没有长期驻留的进程，也没有「二进制」这个东西。改完推上去就是新版本，回滚就是推回上一版。
-  把它当成一台服务器来做自我替换，方向从一开始就不对。
 - **用我们发布的二进制**：那才有意义。前提是 `SELF_UPDATE_SOURCE` 指向发布方的更新源，
   并且那个地址在国内稳定可访问（为什么不能用 GitHub Release，见下）。
 
 一句话：**这项能力的存在前提是「有一方在批量发布、有一方在批量消费」。** 不是那种前提时，
 直接重装。
-
-> Workers 版（`server/relay-worker/rust`）与本仓的 JS 版（`server/dsh-mobile-server`）里
-> **根本没有这段代码**，不是漏了：它们在 Cloudflare 上跑，换代是「重新部署」而不是「自己
-> 替换自己」。给它们加自动更新既做不到（没有文件系统）也没意义。
 
 更新源是一个自己控制的静态目录：一个 `latest.json` 加若干二进制。
 

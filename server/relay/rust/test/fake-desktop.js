@@ -12,23 +12,19 @@
  * 单隧道场景）；传了就先发 `register` 再等 `registered`，与真实插件一致——公用中转
  * 靠这个字段把请求分给对应的宿主。
  *
- * 协议见 ../../relay-core/PROTOCOL.md（v2 章节），帧编解码见 ../lib/protocol.js。
+ * 协议见 ../../../relay-core/PROTOCOL.md，测试编解码见 ../../../relay-core/test/protocol.js。
  */
 
 const http = require('node:http');
-const path = require('node:path');
-const { WebSocket } = require(path.resolve(__dirname, '..', '..', '..', '..', 'dsh-mobile-plugin', 'node_modules', 'ws'));
-// 协议三件套取自共用类型表与 Workers 版那份编解码（Node 版 2026-10-22 已删除）。
-// 这个文件是**测试夹具**：它模拟一台参考宿主，所以宁可在这里少量自包，也不要
-// 反过来把生产代码的形状改成适配测试。
+const { WebSocket } = require('ws');
+// 协议类型取自 relay-core；帧编解码使用与 Rust 对撞的本地 JS 测试实现。
 const SHARED = require('../../../relay-core/protocol-types.js');
-const WORKER = require('../../../dsh-mobile-server/src/index.mjs');
+const PROTOCOL = require('../../../relay-core/test/protocol.js');
 const T = SHARED.T;
-const encodeFrame = WORKER.encodeFrame;
-function createFrameDecoder(onFrame) {
-  const decoder = new WORKER.FrameDecoder(onFrame);
-  return (chunk) => decoder.push(chunk);
-}
+const encodeFrame = PROTOCOL.encodeFrame;
+// 插件那份的解码器是工厂函数（`createFrameDecoder(onFrame)` 返回 push(chunk)），
+// 这里对齐成夹具要的签名。
+const createFrameDecoder = (onFrame) => PROTOCOL.createFrameDecoder(onFrame);
 const jsonFrame = (type, id, obj) => encodeFrame(type, id, JSON.stringify(obj));
 function parseJson(payload) {
   try { return JSON.parse(Buffer.from(payload).toString('utf8')); } catch { return {}; }
@@ -43,8 +39,8 @@ function encodeCloseCode(code) {
 }
 function codeFromPayload(payload) {
   if (!payload || payload.length < 2) return 1000;
-  // 手读两个大端字节：解码器现在给出的是 Uint8Array（Workers 版），没有 Buffer 的
-  // readUInt16BE；直接下标取字节两种类型都能用。
+  // 手读两个大端字节：解码器给出的是 Uint8Array，没有 Buffer 的 readUInt16BE；
+  // 直接下标取字节两种类型都能用。
   const c = (payload[0] << 8) | payload[1];
   return Number.isInteger(c) && c >= 1000 && c <= 4999 ? c : 1000;
 }

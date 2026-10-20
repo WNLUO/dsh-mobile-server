@@ -16,7 +16,7 @@ const { spawn } = require('node:child_process');
 const ROOT = path.resolve(__dirname, '..');
 
 const { RelayTunnel } = require(path.join(ROOT, 'test', 'fake-desktop.js'));
-const { WebSocketServer, WebSocket } = require(path.join(ROOT, '..', '..', '..', 'dsh-mobile-plugin', 'node_modules', 'ws'));
+const { WebSocketServer, WebSocket } = require('ws');
 
 const RELAY_PORT = 18800;
 /** 夹具宿主的实例 id：公用中转按它分发请求，宿主与请求头都要带。 */

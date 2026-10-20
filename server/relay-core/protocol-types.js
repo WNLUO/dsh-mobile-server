@@ -4,15 +4,13 @@
  * DSH 隧道协议 v2 —— 帧类型表与线格式常量（唯一事实源）。
  *
  * 这个文件里只有数据和纯规则，**不碰任何运行时 API**（没有 Buffer、没有
- * Uint8Array、没有 crypto），所以 Node 中转、Cloudflare Workers 中转和宿主插件
- * 三边都能直接引用同一份。编解码函数各运行时各有一份实现，因为它们必须用各自
- * 运行时才有的字节类型（Node 用 Buffer、Workers 用 Uint8Array + DataView），
- * 但那两份实现共用这里的编号，改编号只改这一处。
+ * Uint8Array、没有 crypto）。Rust 中转按镜像常量实现，独立发布的宿主插件内联
+ * 类型表和 Buffer 编解码；变更编号须同步 Rust 与插件，并运行协议对撞测试。
  *
  * 线格式：每条隧道消息 = 一个 WS binary 帧
  *   [type: 1B][id: 4B 大端][length: 4B 大端][payload: length B]
  *
- * 协议语义见 ../dsh-mobile-server/PROTOCOL.md（v2 章节）。
+ * 协议语义见同目录 PROTOCOL.md。
  */
 
 /** 帧类型编号。id=0 表示无请求号（控制帧），id=N 表示对应某次请求。 */
@@ -82,8 +80,8 @@ const OWNED_PATHS = ['/', '/healthz', '/status', '/api/mobile/v1/health', '/tunn
 /**
  * 手机 API 的固定前缀。`/health` 是 405 那条，这一条是「整段手机 API」。
  *
- * 单独放一条是因为部署前缀也可能**落在中间**：用户照抄 Cloudflare 路由（`/relay-worker`）、
- * 或者把中转地址填成 `https://host/relay` 时，路径长成 `/relay/api/mobile/v1/sessions`。
+ * 单独放一条是因为部署前缀也可能**落在中间**：中转地址被填成 `https://host/relay`
+ * 时，路径长成 `/relay/api/mobile/v1/sessions`。
  * 只按「以认领路径结尾」判的话这一条命中不了，而它正是几乎全部真实流量。
  */
 const MOBILE_PREFIX = '/api/mobile/v1/';

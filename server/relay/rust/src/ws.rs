@@ -195,6 +195,11 @@ pub async fn accept_tunnel(
 
     let (mut sink, mut source) = ws.split();
     let last_pong = Arc::new(AtomicI64::new(now_ms()));
+    // 关隧道那一刻要能一眼看出「哪台、活了多久、为什么关」。以前只打一句
+    // `tunnel closed`，真机上一天断十几次也分不清是中转踢的、被新连接顶掉的，
+    // 还是对面悄悄消失——每次都要两边日志对着猜。
+    let connected_at = std::time::Instant::now();
+    let mut instance_label = "unregistered".to_string();
 
     // 写任务：把 out_rx 里的帧串行写出去，写完再减积压。
     let backlog = tunnel.backlog_handle();
@@ -250,29 +255,37 @@ pub async fn accept_tunnel(
     // 读循环：解帧 → 代次守卫 → 分发。心跳超时会通过 kill_rx 打断它。
     let mut decoder = FrameDecoder::new(crate::config().max_frame_bytes);
     let mut kill_rx = kill_rx;
-    loop {
+    // 带标签是为了两件事能真的「断开」而不是只跳出内层 for：准入被拒要在外层的
+    // 读循环上收尾（原来那个裸 break 只跳出 for，隧道其实还连着）。
+    let close_reason: Option<String> = 'tunnel: loop {
         let message = tokio::select! {
             next = source.next() => match next {
                 Some(Ok(message)) => message,
-                _ => break,
+                Some(Err(error)) => break 'tunnel Some(format!("read error: {error}")),
+                None => break 'tunnel Some("stream ended without a close frame (1006)".to_string()),
             },
             _ = &mut kill_rx => {
                 log("tunnel killed by heartbeat timeout");
-                break;
+                break 'tunnel Some("heartbeat timeout".to_string());
             }
         };
         let bytes = match message {
             Message::Binary(bytes) => bytes,
             Message::Ping(_) | Message::Pong(_) => continue,
             Message::Text(_text) => continue,
-            Message::Close(_) => break,
+            Message::Close(frame) => {
+                break 'tunnel Some(match frame {
+                    Some(frame) => format!("peer close code={} reason={}", u16::from(frame.code), frame.reason),
+                    None => "peer close without a code".to_string(),
+                });
+            }
             Message::Frame(_) => continue,
         };
         tunnel.touch();
 
         // 代次守卫：被取代的旧连接仍可能推帧，不能落进新隧道的 pending。
         if !slot.is_current(&tunnel) {
-            break;
+            break 'tunnel Some("superseded by a newer tunnel".to_string());
         }
 
         let mut frames: Vec<(u8, u32, Vec<u8>)> = Vec::new();
@@ -281,7 +294,7 @@ pub async fn accept_tunnel(
         });
         if outcome == DecodeOutcome::FrameTooLarge {
             log("tunnel frame too large, closing");
-            break;
+            break 'tunnel Some("frame too large".to_string());
         }
         for (frame_type, id, payload) in frames {
             tunnel.touch();
@@ -319,7 +332,7 @@ pub async fn accept_tunnel(
                             0,
                             &format!(r#"{{"message":"{reason}"}}"#),
                         );
-                        break;
+                        break 'tunnel Some(format!("admission rejected: {reason}"));
                     }
                 }
                 // **实例 id 在注册帧里，这是公用中转分发的唯一依据。**
@@ -333,22 +346,29 @@ pub async fn accept_tunnel(
                     .to_string();
                 if instance_id.is_empty() {
                     log("tunnel registered without instanceId; it will receive no requests");
-                } else if let Some(previous) = slot.register(&instance_id, tunnel.clone()) {
-                    // 同一台机器的重连：新连接直接赢，把旧的收掉。
-                    //
-                    // **顺序要紧**：表里已经换成新连接了，这里只处理旧连接自己的收尾
-                    // （标记关闭 + 让它的在途请求快速失败），绝不再动表——旧连接那边的
-                    // 清理分支晚一步跑起来时会用 `clear_if_current` 自查，指针不是它就不动。
-                    log(format!("replacing existing tunnel for instance={instance_id}"));
-                    previous.mark_closed();
-                    crate::proxy::fail_all_pending(&previous, "replaced");
+                } else {
+                    // 重报注册（同一个实例、同一条连接）也会走到这里，所以只在第一次
+                    // 自报家门时改标签：收尾日志里要的是这条连接的身份，不是最后一次的。
+                    if instance_label == "unregistered" {
+                        instance_label = instance_id.clone();
+                    }
+                    if let Some(previous) = slot.register(&instance_id, tunnel.clone()) {
+                        // 同一台机器的重连：新连接直接赢，把旧的收掉。
+                        //
+                        // **顺序要紧**：表里已经换成新连接了，这里只处理旧连接自己的收尾
+                        // （标记关闭 + 让它的在途请求快速失败），绝不再动表——旧连接那边的
+                        // 清理分支晚一步跑起来时会用 `clear_if_current` 自查，指针不是它就不动。
+                        log(format!("replacing existing tunnel for instance={instance_id}"));
+                        previous.mark_closed();
+                        crate::proxy::fail_all_pending(&previous, "replaced");
+                    }
                 }
                 tunnel.send_json(t::REGISTERED, 0, r#"{"ok":true}"#);
                 continue;
             }
             crate::proxy::handle_tunnel_frame(&tunnel, frame_type, id as u64, &payload);
         }
-    }
+    };
 
     heartbeat.abort();
     writer.abort();
@@ -357,9 +377,12 @@ pub async fn accept_tunnel(
     // 走到这里，表里已经是新连接了，摘不得。
     let removed = slot.clear_if_current(&tunnel);
     crate::proxy::fail_all_pending(&tunnel, "tunnel closed");
+    let close_reason = close_reason
+        .unwrap_or_else(|| "stream ended without a close frame (1006)".to_string());
     log(format!(
-        "tunnel closed (removed={removed}, online={})",
-        slot.online_count()
+        "tunnel closed (removed={removed}, online={}, instance={instance_label}, lived={}s, reason={close_reason})",
+        slot.online_count(),
+        connected_at.elapsed().as_secs()
     ));
     Ok(())
 }

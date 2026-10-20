@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  relay:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.20.0'
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - run: npm ci
+      - run: npm run test:relay-core
+      - run: npm run test:relay
+      - run: npm ci
+        working-directory: server/relay/rust/console
+      - run: npm run typecheck
+        working-directory: server/relay/rust/console
+      - run: npm run build:relay
+      - run: npm run test:e2e

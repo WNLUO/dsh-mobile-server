@@ -12,14 +12,17 @@
 //!
 //! **刻意比运营版简单**：不再有 manifest 校验、content hash、增量发布、多插件矩阵——
 //! 那套是给「正式分发」设计的，而这边是临时救急：把某个版本塞给某台机器。客户端
-//! （`device-ota.js`）只读上面那四个字段，给它多余的契约没有收益，只有维护成本。
+//! （`device-ota.js`）只读得到那五个字段（version / platform / channel / packageUrl / sha256）。
 //!
-//! 包格式必须与客户端 `unpackTarGz` 对得上：tar 里条目以 `package/` 打头，且包含
-//! `package.json` 与 `lib/impl.js`，否则客户端会判「OTA 包结构不完整」。
+//! 包格式必须与客户端的解包器对得上：tar 里条目以 `package/` 打头，且包含
+//! `package.json` 与 `lib/impl.js`，否则客户端会判「OTA 包结构不完整」。包里还有一份
+//! `lib/ota-manifest.json`（发布脚本生成），客户端解包后逐项核对——缺文件、大小不符都在
+//! **激活之前**失败。哈希也在这里算：下载回来的字节对不上就不装。
 
 use std::path::{Path, PathBuf};
 
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 use crate::store::Store;
 use super::config::ConsoleConfig;
@@ -81,6 +84,8 @@ pub fn handle_latest(
                         release.version
                     ),
                     "size": release.size,
+                    // 客户端下载后核对；老库/老记录这里是空串，客户端见到空串就跳过校验。
+                    "sha256": release.sha256,
                 }
             }),
         ),
@@ -176,18 +181,21 @@ pub fn handle_publish(
             json!({ "ok": false, "error": format!("写包失败: {error}") }),
         );
     }
+    // 哈希在这里算：客户端下载后会核对，半个包 / 被中间层改过的包在激活之前就会被挡下。
+    let sha256 = format!("{:x}", Sha256::digest(body));
     store.put_ota_release(
         &platform,
         &channel,
         &version,
         &file.to_string_lossy(),
         body.len() as i64,
+        &sha256,
     );
     ConsoleResponse::json(
         200,
         json!({
             "ok": true,
-            "data": { "platform": platform, "channel": channel, "version": version, "size": body.len() },
+            "data": { "platform": platform, "channel": channel, "version": version, "size": body.len(), "sha256": sha256 },
         }),
     )
 }
@@ -241,6 +249,13 @@ mod tests {
             &[0x1f, 0x8b, 0x08, 0x00],
         );
         assert_eq!(published.status, 200, "{:?}", String::from_utf8_lossy(&published.body));
+        let published_body: serde_json::Value = serde_json::from_slice(&published.body).unwrap();
+        assert_eq!(published_body["data"]["size"].as_u64().unwrap(), 4, "回执里的 size 必须是真收下的字节数");
+        assert_eq!(
+            published_body["data"]["sha256"].as_str().unwrap(),
+            format!("{:x}", Sha256::digest([0x1f, 0x8b, 0x08, 0x00])),
+            "发布回执必须带上哈希，发布脚本据此核对"
+        );
 
         let latest = handle_latest(&store, &config, "platform=darwin&channel=stable");
         let body: serde_json::Value = serde_json::from_slice(&latest.body).unwrap();
@@ -250,6 +265,13 @@ mod tests {
             .as_str()
             .unwrap()
             .starts_with("https://relay.example.com/api/desktop-plugins/ota/download/darwin/stable/0.1.61"));
+        // 客户端拿这个哈希核对下载回来的字节：发布体是 [0x1f,0x8b,0x08,0x00] 这四字节。
+        assert_eq!(
+            body["data"]["sha256"].as_str().unwrap(),
+            format!("{:x}", Sha256::digest([0x1f, 0x8b, 0x08, 0x00])),
+            "latest 必须把发布时算好的 sha256 原样带回去"
+        );
+        assert_eq!(body["data"]["size"].as_u64().unwrap(), 4);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

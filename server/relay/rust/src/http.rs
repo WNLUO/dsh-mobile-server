@@ -109,7 +109,7 @@ fn strip_deploy_prefix(pathname: &str) -> &str {
     // Linux 显示成 `99d9d3ee`）。`/api/mobile/v1/health` 是唯一真正由中转自答的路径，
     // 它在 OWNED_PATHS 里、上面已经精确匹配先返回了。
     //
-    // 部署前缀照旧剥掉：`/relay-worker/api/mobile/v1/health` 要能被认成手机 API 路径。
+    // 部署前缀照旧剥掉：`/relay/api/mobile/v1/health` 要能被认成手机 API 路径。
     if let Some(at) = pathname.find(MOBILE_PREFIX) {
         return if at > 0 { &pathname[at..] } else { pathname };
     }
@@ -297,21 +297,36 @@ pub async fn respond_json(
     .await
 }
 
-/// 读控制台请求体。上限 64KB——控制台只有被控端上报那条带体，且内容是个小 JSON。
-async fn read_console_body(reader: &mut BufReader<TcpStream>, head: &RequestHead) -> Vec<u8> {
-    const MAX_CONSOLE_BODY: usize = 64 * 1024;
+/// 控制台自己的请求体上限。控制台只有被控端上报那条带体，内容是个小 JSON。
+const MAX_CONSOLE_BODY: usize = 64 * 1024;
+/// 插件 OTA 发布的请求体上限。发布的是**整包**（npm tgz，几百 KB 到几 MB），
+/// 不能套用控制台那个 64KB。
+const MAX_OTA_PUBLISH_BODY: usize = 32 * 1024 * 1024;
+
+/// 读请求体。上限由调用点给：控制台 64KB，OTA 发布 32MB。
+///
+/// **超限回 `Err(())` 让调用方回 413，绝不截断**：截断过去的表现是 publish 回
+/// `ok:true`、盘上只有前 64KB，客户端装到一半才报「OTA 包结构不完整」（2026-10-17
+/// 真机踩到，而接口自始至终都说成功）。
+async fn read_console_body(
+    reader: &mut BufReader<TcpStream>,
+    head: &RequestHead,
+    limit: usize,
+) -> Result<Vec<u8>, ()> {
     let Some(length) = head.content_length() else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
-    let length = length.min(MAX_CONSOLE_BODY);
+    if length > limit {
+        return Err(());
+    }
     let mut body = vec![0u8; length];
     // ⚠️ 必须从 **BufReader** 读，不能从 `reader.get_mut()` 读：读请求头时 BufReader
     // 很可能已经把 body 一起预读进自己的缓冲区了，这时裸流上已经没有字节，
-    // `read_exact` 会一直等（请求挂死、服务端什么都不记）。同 A4-12 那个
+    // `read_exact` 会一直等（请求挂死、服务端什么都不记）。同 A4-11 那个
     // `into_inner()` 丢缓冲区的坑，方向相反但同一个根因。
     match tokio::io::AsyncReadExt::read_exact(&mut *reader, &mut body).await {
-        Ok(_) => body,
-        Err(_) => Vec::new(),
+        Ok(_) => Ok(body),
+        Err(_) => Ok(Vec::new()),
     }
 }
 
@@ -373,7 +388,7 @@ pub async fn handle_owned_path(
             Ok(true)
         }
         "/status" => {
-            // 与 Workers 版对齐的在线状态：只回答「隧道通没通」，不泄露实例与设备。
+            // 在线状态只回答「隧道通没通」，不泄露实例与设备。
             let host_connected = slot.get().map(|t| !t.is_closed()).unwrap_or(false);
             let body = format!(r#"{{"ok":true,"hostConnected":{host_connected}}}"#);
             respond_json(reader, 200, &body).await?;
@@ -387,7 +402,18 @@ pub async fn handle_owned_path(
                     return Ok(false);
                 };
                 let body = if head.method == "POST" {
-                    read_console_body(reader, head).await
+                    match read_console_body(reader, head, MAX_OTA_PUBLISH_BODY).await {
+                        Ok(body) => body,
+                        Err(()) => {
+                            respond_json(
+                                reader,
+                                413,
+                                r#"{"ok":false,"error":"package too large"}"#,
+                            )
+                            .await?;
+                            return Ok(true);
+                        }
+                    }
                 } else {
                     Vec::new()
                 };
@@ -421,7 +447,14 @@ pub async fn handle_owned_path(
             };
             if console.matches_api(other) {
                 // 控制台要读 POST 体（只有被控端上报那条会用到，但读法统一）。
-                let body = read_console_body(reader, head).await;
+                let body = match read_console_body(reader, head, MAX_CONSOLE_BODY).await {
+                    Ok(body) => body,
+                    Err(()) => {
+                        respond_json(reader, 413, r#"{"ok":false,"error":"body too large"}"#)
+                            .await?;
+                        return Ok(true);
+                    }
+                };
                 let response = console
                     .handle_api(
                         &head.method,
@@ -528,16 +561,16 @@ mod tests {
 
     #[test]
     fn owned_path_is_hit_under_deploy_prefix() {
-        // Worker 挂在自定义域名下时，控制台给的路由带前缀；用户照抄进 App 就是这个形状。
-        for path in ["/relay-worker/healthz", "/relay/healthz", "/healthz"] {
+        // 反代把中转挂在子路径下时，用户照抄进 App 的地址就带前缀，请求是这个形状。
+        for path in ["/relay/healthz", "/healthz"] {
             assert_eq!(strip_deploy_prefix(path), "/healthz", "{path}");
         }
-        assert_eq!(strip_deploy_prefix("/relay-worker/status"), "/status");
+        assert_eq!(strip_deploy_prefix("/relay/status"), "/status");
         assert_eq!(
-            strip_deploy_prefix("/relay-worker/api/mobile/v1/health"),
+            strip_deploy_prefix("/relay/api/mobile/v1/health"),
             "/api/mobile/v1/health"
         );
-        assert_eq!(strip_deploy_prefix("/relay-worker/tunnel"), "/tunnel");
+        assert_eq!(strip_deploy_prefix("/relay/tunnel"), "/tunnel");
         // 末尾判定是刻意取舍：`/relay/status` 会命中 `/status`。但**手机 API 前缀下的
         // 路径绝不能被末尾匹配抢走**——见下面那条用例。
     }
@@ -564,7 +597,7 @@ mod tests {
         assert_eq!(strip_deploy_prefix("/relay/status"), "/status");
         // 手机 API 路径带部署前缀：剥掉前缀后交给宿主。
         assert_eq!(
-            strip_deploy_prefix("/relay-worker/api/mobile/v1/status"),
+            strip_deploy_prefix("/relay/api/mobile/v1/status"),
             "/api/mobile/v1/status"
         );
     }
@@ -601,17 +634,17 @@ mod tests {
     fn forwarded_path_drops_prefix_but_keeps_query() {
         // 前缀必须丢掉：宿主只认 /api/mobile/v1/...，带前缀那边一律 404。
         assert_eq!(
-            head("/relay-worker/api/mobile/v1/health?x=1").routed_path(),
+            head("/relay/api/mobile/v1/health?x=1").routed_path(),
             "/api/mobile/v1/health?x=1"
         );
-        // 部署前缀也可能落在中间：用户照抄 Cloudflare 路由、或者把中转地址填成
-        // `https://host/relay` 时，真实流量长成这个形状。
+        // 部署前缀也可能落在中间：中转地址被填成 `https://host/relay` 时，
+        // 真实流量长成这个形状。
         assert_eq!(
             head("/relay/api/mobile/v1/sessions?x=1").routed_path(),
             "/api/mobile/v1/sessions?x=1"
         );
         assert_eq!(
-            head("/relay-worker/api/mobile/v1/sessions").routed_path(),
+            head("/relay/api/mobile/v1/sessions").routed_path(),
             "/api/mobile/v1/sessions"
         );
         // 不含手机 API 前缀的路径不做任何改写。
