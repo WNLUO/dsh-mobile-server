@@ -34,7 +34,7 @@
 | 0x14 | httpCancel | N | 空 | 取消上游 HTTP 请求 |
 | 0x15 | httpPause | N | 空 | 暂停上游响应流 |
 | 0x16 | httpResume | N | 空 | 恢复上游响应流 |
-| 0x17 | sync | 0 | JSON | 保留编号 |
+| 0x17 | sync | 0 | JSON | 宿主把整份镜像推给中转（会话清单 + 工作区 + 已签发设备凭据的 sha256）。转发路径不用它；中转只在宿主那条隧道不在时拿它兜底，`MIRROR_CACHE=0` 时收到就丢 |
 | 0x18 | revokeAll | 0 | JSON | 保留编号 |
 | 0x19 | revokeAllAck | 0 | JSON | 保留编号 |
 

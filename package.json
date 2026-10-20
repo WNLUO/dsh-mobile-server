@@ -7,7 +7,7 @@
     "test:relay-core": "cargo test --manifest-path server/relay-core/rust/Cargo.toml",
     "test:relay": "cargo test --manifest-path server/relay/rust/Cargo.toml",
     "build:relay": "cargo build --release --manifest-path server/relay/rust/Cargo.toml && npm run build --prefix server/relay/rust/console",
-    "test:e2e": "node server/relay/rust/scripts/e2e.cjs server/relay/rust/target/release/dsh-relay && node server/relay/rust/scripts/e2e-stream.cjs server/relay/rust/target/release/dsh-relay"
+    "test:e2e": "node server/relay/rust/scripts/e2e.cjs server/relay/rust/target/release/dsh-relay && node server/relay/rust/scripts/e2e-stream.cjs server/relay/rust/target/release/dsh-relay && node server/relay/rust/scripts/e2e-mirror.cjs server/relay/rust/target/release/dsh-relay"
   },
   "devDependencies": {
     "ws": "8.18.0"

@@ -39,6 +39,19 @@ pub struct Config {
     pub upstream_header_timeout_ms: u64,
     pub debug_sse: bool,
 
+    /// 宿主离线时用最后一份镜像兜底（`MIRROR_CACHE`，**默认开**）。
+    ///
+    /// 开着的时候这台中转会**存着**宿主推上来的会话清单与工作区，并在宿主那条隧道不在
+    /// 时回给手机（标成 stale）。纯转发那句承诺只对 `MIRROR_CACHE=0` 的部署成立：包了
+    /// 公共域名、又不想让中转进程持有会话内容的，关掉它即可，转发本身一个字都不变。
+    pub mirror_cache: bool,
+    /// 宿主这么久还没回头就先给缓存（毫秒；**0 = 关**，退回「只有隧道不在才兜底」）。
+    ///
+    /// 弱网下最难受的不是「没有数据」，是「一直在转圈」：宿主还活着、请求也真的发过去了，
+    /// 只是两段链路叠起来要好几秒。到点先把中转手上那份给手机（标 stale），再取消上游；
+    /// 手机下次轮询照常再问一次。
+    pub mirror_fallback_ms: u64,
+
     // ── 自动更新 ─────────────────────────────────────────────────
     /// **默认关**。开了之后这台中转会自己从发布仓库升到新版本。
     pub self_update: bool,
@@ -46,6 +59,27 @@ pub struct Config {
     pub self_update_interval_seconds: u64,
     /// 更新源基址，下面要能取到 `latest.json`。
     pub self_update_source: String,
+}
+
+/// 读一个可以为 0 的整数环境变量；越界或非整数直接报错。
+///
+/// 与 `positive_int` 的区别只有一处：0 是合法值（在这个项目里一律表示「关掉」），
+/// 而不是「设错了」。
+fn non_negative_int(name: &str, fallback: usize, max: usize) -> Result<usize, String> {
+    match env::var(name) {
+        Err(_) => Ok(fallback),
+        Ok(raw) if raw.is_empty() => Ok(fallback),
+        Ok(raw) => {
+            let value: i64 = raw
+                .trim()
+                .parse()
+                .map_err(|_| format!("{name} must be an integer between 0 and {max}"))?;
+            if value < 0 || (value as u64) > max as u64 {
+                return Err(format!("{name} must be an integer between 0 and {max}"));
+            }
+            Ok(value as usize)
+        }
+    }
 }
 
 /// 读一个正整数环境变量；越界或非整数直接报错。
@@ -96,6 +130,14 @@ impl Config {
                 env::var("DEBUG_SSE").unwrap_or_default().to_ascii_lowercase().as_str(),
                 "1" | "true" | "yes"
             ),
+            // 缺省开：不设这个变量就是「宿主离线时手机还能看见列表」。显式写 0/false/no
+            // 才是纯转发——两种口径都要能被部署方一眼选中，所以不设中间态。
+            mirror_cache: !matches!(
+                env::var("MIRROR_CACHE").unwrap_or_default().to_ascii_lowercase().as_str(),
+                "0" | "false" | "no"
+            ),
+            // 0 是合法的「关」：谁只想留「隧道不在时兜底」这一半，就把它设成 0。
+            mirror_fallback_ms: non_negative_int("MIRROR_FALLBACK_MS", 2_500, 60_000)? as u64,
             self_update: matches!(
                 env::var("SELF_UPDATE").unwrap_or_default().to_ascii_lowercase().as_str(),
                 "1" | "true" | "yes"
@@ -134,6 +176,8 @@ impl Default for Config {
             tunnel_pong_timeout_ms: 60_000,
             upstream_header_timeout_ms: 30_000,
             debug_sse: false,
+            mirror_cache: true,
+            mirror_fallback_ms: 2_500,
             self_update: false,
             self_update_interval_seconds: 86_400,
             self_update_source: String::new(),
@@ -167,5 +211,7 @@ mod tests {
         assert_eq!(config.max_sse_connections, 16);
         assert_eq!(config.tunnel_heartbeat_ms, 15_000);
         assert_eq!(config.tunnel_pong_timeout_ms, 60_000);
+        assert!(config.mirror_cache, "离线镜像兜底默认开");
+        assert_eq!(config.mirror_fallback_ms, 2_500, "弱网兜底默认 2.5 秒");
     }
 }

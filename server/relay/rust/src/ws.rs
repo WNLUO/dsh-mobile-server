@@ -366,7 +366,7 @@ pub async fn accept_tunnel(
                 tunnel.send_json(t::REGISTERED, 0, r#"{"ok":true}"#);
                 continue;
             }
-            crate::proxy::handle_tunnel_frame(&tunnel, frame_type, id as u64, &payload);
+            crate::proxy::handle_tunnel_frame(&tunnel, &instance_label, frame_type, id as u64, &payload);
         }
     };
 

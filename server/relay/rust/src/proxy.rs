@@ -16,7 +16,7 @@ use tokio::sync::oneshot;
 
 use crate::config::Config;
 use crate::headers::pick_forward_headers;
-use crate::http::{respond_json, respond_text, RequestHead};
+use crate::http::{respond_json, respond_text, respond_with, RequestHead};
 use crate::tunnel::{
     log, HttpHead, HttpPending, Pending, Tunnel, TunnelSlot, TUNNEL_FEED_HIGH_WATER_BYTES,
 };
@@ -36,12 +36,24 @@ struct ResponseSink<'a> {
     paused: bool,
 }
 
+/// 等宿主回响应头的三种结局。
+enum HeadOutcome {
+    Head(HttpHead),
+    /// 连 `UPSTREAM_HEADER_TIMEOUT_MS` 都过了：宿主不在了。
+    Timeout,
+    /// 弱网阈值到点：先把缓存给了，宿主那份不再等。
+    Mirror,
+}
+
 /// 处理一次普通 HTTP 转发：把请求送进隧道，等宿主把响应推回来。
 pub async fn proxy_request(
     reader: BufReader<TcpStream>,
     head: RequestHead,
     tunnel: Arc<Tunnel>,
     _slot: Arc<TunnelSlot>,
+    // 已经备好的一次缓存读（只有「默认视图的列表读」才会带进来）：
+    // 宿主在阈值内没回头就先拿它答手机，见下面 HeadOutcome::Mirror。
+    fallback: Option<crate::mirror::Fallback>,
 ) -> std::io::Result<()> {
     let config = crate::config();
     let is_sse = head
@@ -105,24 +117,67 @@ pub async fn proxy_request(
     // 请求体：按 content-length 或读到结束，分块发进去。
     forward_request_body(&mut reader, &head, &tunnel, id, &config).await;
 
-    // 等宿主回 httpHead（带超时）。
-    let head_result = tokio::time::timeout(
-        std::time::Duration::from_millis(config.upstream_header_timeout_ms),
-        head_rx,
-    )
-    .await;
+    // 等宿主回 httpHead（带超时）。备了缓存的多等一个「弱网阈值」：到点还没回就先把手
+    // 上那份给手机，再把上游取消——手机下次轮询照常再问一次，宿主那边回来也没人等了。
+    let header_wait = std::time::Duration::from_millis(config.upstream_header_timeout_ms);
+    let mirror_wait = match (&fallback, config.mirror_fallback_ms) {
+        (Some(_), ms) if ms > 0 => Some(std::time::Duration::from_millis(ms)),
+        _ => None,
+    };
+    let head_outcome = match mirror_wait {
+        Some(ms) => tokio::select! {
+            result = tokio::time::timeout(header_wait, head_rx) => match result {
+                Ok(Ok(head)) => HeadOutcome::Head(head),
+                _ => HeadOutcome::Timeout,
+            },
+            () = tokio::time::sleep(ms) => HeadOutcome::Mirror,
+        },
+        None => match tokio::time::timeout(header_wait, head_rx).await {
+            Ok(Ok(head)) => HeadOutcome::Head(head),
+            _ => HeadOutcome::Timeout,
+        },
+    };
 
-    let Ok(Ok(http_head)) = head_result else {
-        // 超时或宿主没回：通知宿主取消，给手机 504。
-        let still_ours = {
-            let mut pending = tunnel.pending.lock().unwrap_or_else(|e| e.into_inner());
-            pending.remove(&id).is_some()
-        };
-        if still_ours {
-            tunnel.send_empty(t::HTTP_CANCEL, id);
-            respond_text(&mut reader, 504, "upstream response timeout").await?;
+    let http_head = match head_outcome {
+        HeadOutcome::Head(head) => head,
+        HeadOutcome::Timeout => {
+            // 超时或宿主没回：通知宿主取消，给手机 504。
+            let still_ours = {
+                let mut pending = tunnel.pending.lock().unwrap_or_else(|e| e.into_inner());
+                pending.remove(&id).is_some()
+            };
+            if still_ours {
+                tunnel.send_empty(t::HTTP_CANCEL, id);
+                respond_text(&mut reader, 504, "upstream response timeout").await?;
+            }
+            return Ok(());
         }
-        return Ok(());
+        HeadOutcome::Mirror => {
+            // 条目先摘掉：宿主那份响应之后到了也没有等待方，会被静默丢弃；再通知它收尾。
+            let still_ours = {
+                let mut pending = tunnel.pending.lock().unwrap_or_else(|e| e.into_inner());
+                pending.remove(&id).is_some()
+            };
+            if still_ours {
+                tunnel.send_empty(t::HTTP_CANCEL, id);
+            }
+            match fallback.as_ref().and_then(|entry| entry.serve()) {
+                Some(body) => {
+                    log(format!("mirror fallback answered id={id}"));
+                    respond_with(
+                        &mut reader,
+                        200,
+                        "application/json; charset=utf-8",
+                        body.as_bytes(),
+                        &[("x-dsh-relay-mirror".to_string(), "stale".to_string())],
+                    )
+                    .await?;
+                }
+                // 备着的这份此刻拿不出来（凭据对不上 / 已被淘汰）：老实报超时，别假装有数据。
+                None => respond_text(&mut reader, 504, "upstream response timeout").await?,
+            }
+            return Ok(());
+        }
     };
 
     // 写响应头，然后把后续 chunk 流式写给手机。
@@ -449,8 +504,14 @@ fn encode_chunk(data: &[u8]) -> Vec<u8> {
 }
 
 /// 分发宿主推回来的一帧。
-pub fn handle_tunnel_frame(tunnel: &Arc<Tunnel>, frame_type: u8, id: u64, payload: &[u8]) {
+pub fn handle_tunnel_frame(tunnel: &Arc<Tunnel>, instance_id: &str, frame_type: u8, id: u64, payload: &[u8]) {
     match frame_type {
+        t::SYNC => {
+            // 宿主推上来的整份镜像（会话清单 + 工作区 + 已签发设备凭据的摘要）。
+            // 转发路径本身用不到它——只有这条隧道不在之后手机才来读（见 `mirror`）。
+            // 存不下、格式不对都只是这一次不更新，绝不回执也不会断开隧道。
+            crate::mirror::remember(instance_id, payload);
+        }
         t::HTTP_HEAD => {
             let value = parse_json_value(payload);
             let status = value

@@ -297,6 +297,26 @@ pub async fn respond_json(
     .await
 }
 
+/// 手机带来的设备凭据（`dshc_…`）。
+///
+/// App 把它单独放在 `X-Dsh-Device-Credential` 头里，`Authorization` 那份留给宿主 token；
+/// 只有很早的客户端会把 `dshc_` 塞在 Bearer 位上，两条都认（与 `mobile/auth.js` 同一口径）。
+/// 中转拿它算 sha256 去对宿主推上来的摘要，既看不到凭据原文，也不持有任何签名密钥。
+fn presented_credential(head: &RequestHead) -> Option<String> {
+    if let Some(raw) = head.header("x-dsh-device-credential") {
+        let value = raw.trim();
+        if value.starts_with("dshc_") {
+            return Some(value.to_string());
+        }
+    }
+    let authorization = head.header("authorization")?.trim();
+    let token = authorization
+        .strip_prefix("Bearer ")
+        .or_else(|| authorization.strip_prefix("bearer "))?
+        .trim();
+    token.starts_with("dshc_").then(|| token.to_string())
+}
+
 /// 控制台自己的请求体上限。控制台只有被控端上报那条带体，内容是个小 JSON。
 const MAX_CONSOLE_BODY: usize = 64 * 1024;
 /// 插件 OTA 发布的请求体上限。发布的是**整包**（npm tgz，几百 KB 到几 MB），
@@ -504,6 +524,41 @@ pub async fn serve_connection(stream: TcpStream, slot: Arc<TunnelSlot>) -> std::
     if handle_owned_path(&mut reader, &head, &slot, peer).await? {
         return Ok(());
     }
+    // 宿主那条隧道不在的时候，中转手上还有它最后推上来的那份清单（见 `mirror`）。
+    //
+    // **只在隧道不可用时**走这条路：隧道活着就照旧转发，哪怕对面慢，也不让一份旧副本
+    // 顶掉新数据。给不出去（没有缓存、凭据对不上、这次读的是归档/翻页/写后刷新）就
+    // 原样往下走，回到今天那句「那台宿主不在线」——不新增错误面。
+    let instance_id = head.header("x-dsh-instance").unwrap_or_default().trim().to_string();
+    // 这一次读能不能用镜像兜底：隧道不在就直接给，隧道在就带着它去转发（弱网阈值到点才用）。
+    let mut mirror_fallback: Option<crate::mirror::Fallback> = None;
+    if !instance_id.is_empty() && crate::config().mirror_cache {
+        let routed = strip_forward_prefix(&head.normalized_pathname()).to_string();
+        if let Some((kind, rev)) = crate::mirror::parse_read(&head.method, &routed, &head.query) {
+            let credential = presented_credential(&head);
+            let unreachable = slot
+                .get_for(&instance_id)
+                .map(|tunnel| tunnel.is_closed())
+                .unwrap_or(true);
+            let fallback = crate::mirror::Fallback::new(instance_id.clone(), kind, rev, credential);
+            if unreachable {
+                if let Some(body) = fallback.serve() {
+                    respond_with(
+                        &mut reader,
+                        200,
+                        "application/json; charset=utf-8",
+                        body.as_bytes(),
+                        &[("x-dsh-relay-mirror".to_string(), "stale".to_string())],
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            } else {
+                mirror_fallback = Some(fallback);
+            }
+        }
+    }
+
     // 分发给哪条隧道，看手机自己带的 `X-Dsh-Instance`。
     //
     // **找不到就 503，绝不退回到「随便挑一条」**：公用中转上随便挑一条等于把 A 家的
@@ -511,7 +566,7 @@ pub async fn serve_connection(stream: TcpStream, slot: Arc<TunnelSlot>) -> std::
     // 是切换地址还是重连。
     //
     // 没带实例 id 的唯一例外是手动输配对码（见下）：中转上只有一台宿主时才无歧义。
-    let instance = head.header("x-dsh-instance").unwrap_or_default();
+    let instance = instance_id.as_str();
     let tunnel = if instance.trim().is_empty() {
         match slot.sole() {
             Some(tunnel) => tunnel,
@@ -538,7 +593,7 @@ pub async fn serve_connection(stream: TcpStream, slot: Arc<TunnelSlot>) -> std::
         tunnel
     };
 
-    crate::proxy::proxy_request(reader, head, tunnel, slot).await
+    crate::proxy::proxy_request(reader, head, tunnel, slot, mirror_fallback).await
 }
 
 #[cfg(test)]
