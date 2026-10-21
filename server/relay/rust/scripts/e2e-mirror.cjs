@@ -239,6 +239,7 @@ async function main() {
     const unchanged = await rawRequest(`/api/mobile/v1/sessions?rev=${SESSIONS_REVISION}`, { 'x-dsh-device-credential': CREDENTIAL });
     const unchangedBody = (() => { try { return JSON.parse(unchanged.body); } catch { return {}; } })();
     check('指纹相同只回一句 unchanged', unchangedBody.unchanged === true && unchanged.body.length < 400, unchanged.body.slice(0, 120));
+    check('缓存答 unchanged 时同样标成 stale', unchangedBody.stale === true, unchanged.body.slice(0, 120));
 
     const stranger = await rawRequest('/api/mobile/v1/sessions', { 'x-dsh-device-credential': 'dshc_not_paired' });
     check('对不上凭据就照旧 503（不新增错误面）', stranger.status === 503, `${stranger.status} ${stranger.body}`);

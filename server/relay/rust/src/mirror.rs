@@ -195,11 +195,15 @@ pub fn lookup(
         return None;
     }
     if !rev.is_empty() && rev == revision {
+        // `stale` 必须跟着一起回：这句话是**缓存**在说「你手上那份和我这份一样」，
+        // 不是宿主在说。漏了它，手机收到的就是一句普通的「没变」，既不显示缓存
+        // 标记、也不知道自己正停在一份旧清单上（宿主重启后那几分钟就是这个形状）。
         let unchanged = serde_json::json!({
             "ok": true,
             "unchanged": true,
             "revision": revision,
             "generatedAt": generated_at,
+            "stale": true,
         });
         return Some(unchanged.to_string());
     }
@@ -418,6 +422,9 @@ mod tests {
         assert_eq!(parsed["unchanged"], serde_json::json!(true));
         assert_eq!(parsed["revision"], serde_json::json!("bbb"));
         assert_eq!(parsed["generatedAt"], serde_json::json!(222));
+        // 「一样」这句是**缓存**说的，必须跟着标旧：漏了它，手机就不知道自己在看缓存，
+        // 宿主重启后那几分钟里侧栏安静地停在旧清单上（真机就是这个形状）。
+        assert_eq!(parsed["stale"], serde_json::json!(true), "缓存答 unchanged 时也必须标旧");
         // 指纹对不上就回整份。
         let full = lookup(instance, ListKind::Workspaces, "zzz", Some("dshc_one")).unwrap();
         assert!(full.contains("\"items\""));
