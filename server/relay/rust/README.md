@@ -91,7 +91,7 @@ WantedBy=multi-user.target
 | `MAX_FRAME_BYTES` | 8 MB | 单帧上限 |
 | `MAX_BODY_BYTES` | 50 MB | 请求体上限 |
 | `MAX_PENDING` | 256 | 同时在途的请求数 |
-| `MAX_SSE_CONNECTIONS` | 16 | 同时开着的 SSE 条数 |
+| `MAX_SSE_CONNECTIONS` | 64 | 同时开着的 SSE 条数（**按隧道算**，即一台宿主电脑上所有设备共用一个数） |
 | `MAX_WS_CONNECTIONS` | 256 | 手机 WS 条数 |
 | `TUNNEL_HEARTBEAT_MS` | 15000 | 隧道 ping 周期 |
 | `TUNNEL_PONG_TIMEOUT_MS` | 60000 | 多久没 pong 算死链 |
@@ -104,6 +104,12 @@ WantedBy=multi-user.target
 
 越界的值**直接报错启动失败，不是 clamp**——手滑写个 0 被静默接受，表现是「限额关掉了」
 而不是「设错了」。
+
+名额满了回 `429`，正文是 `relay resource limit exceeded`（纯文本），带 `retry-after: 5`，
+同时打一行 `capacity rejected: sse=当前/上限 pending=当前/上限 accept-sse=…`。这一行是排
+「手机上突然一片 429」的唯一线索：`sse` 到顶说明长连接名额被占满（一台手机正常只占两条，
+会话流 + 设备级流；到顶多半是设备太多或者有被丢弃的连接没关），`pending` 到顶则是那一批
+短请求堆住了。
 
 ## 中转控制台
 

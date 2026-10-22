@@ -78,7 +78,21 @@ pub async fn proxy_request(
 
     let mut reader = reader;
     if !tunnel.has_capacity(&config, is_sse) {
-        respond_text(&mut reader, 429, "relay resource limit exceeded").await?;
+        // 拒绝要留痕：这条 429 过去一个字都不写，事后只能靠「响应长度 29」猜它是不是我们回的。
+        // 两个数一起打，才能分辨是「长连接名额被占满」还是「在途请求堆住了」。
+        let (pending, sse) = tunnel.capacity_snapshot();
+        log(format!(
+            "capacity rejected: sse={sse}/{} pending={pending}/{} accept-sse={is_sse}",
+            config.max_sse_connections, config.max_pending
+        ));
+        respond_with(
+            &mut reader,
+            429,
+            "text/plain; charset=utf-8",
+            b"relay resource limit exceeded",
+            &[("retry-after".to_string(), "5".to_string())],
+        )
+        .await?;
         return Ok(());
     }
 

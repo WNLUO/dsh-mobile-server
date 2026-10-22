@@ -160,6 +160,19 @@ impl Tunnel {
         sse_count < config.max_sse_connections
     }
 
+    /// 在途请求数与其中的 SSE 条数。
+    ///
+    /// 容量拒绝必须把这两个数写进日志：只回一句 429，事后完全看不出是哪个闸满了、被谁
+    /// 占着（真机现场就是「一片 429，唯一的线索是响应长度 29」）。
+    pub fn capacity_snapshot(&self) -> (usize, usize) {
+        let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        let sse = pending
+            .values()
+            .filter(|entry| matches!(entry, Pending::Http(http) if http.sse))
+            .count();
+        (pending.len(), sse)
+    }
+
     /// 当前挂着的手机 WS 条数。
     pub fn ws_count(&self) -> usize {
         self.pending

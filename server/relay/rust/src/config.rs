@@ -113,7 +113,10 @@ impl Config {
             max_frame_bytes: positive_int("MAX_FRAME_BYTES", 8 * 1024 * 1024, 64 * 1024 * 1024)?,
             max_body_bytes: positive_int("MAX_BODY_BYTES", 50 * 1024 * 1024, 256 * 1024 * 1024)?,
             max_pending: positive_int("MAX_PENDING", 256, 100_000)?,
-            max_sse_connections: positive_int("MAX_SSE_CONNECTIONS", 16, 10_000)?,
+            // 64：一台手机正常只开两条（会话流 + 设备级流），这个数是给「一台电脑上多台
+            // 设备同时在线」和重连抖动留的余量。它按**隧道**（也就是一台宿主电脑）计，不是
+            // 全站共享，所以调大不会让一台机器的风暴波及别人；真正的失控闸在宿主那侧。
+            max_sse_connections: positive_int("MAX_SSE_CONNECTIONS", 64, 10_000)?,
             max_ws_connections: positive_int("MAX_WS_CONNECTIONS", 256, 10_000)?,
             max_ws_message_bytes: positive_int("MAX_WS_MESSAGE_BYTES", 8 * 1024 * 1024, 64 * 1024 * 1024)?,
             max_ws_queue_bytes: positive_int("MAX_WS_QUEUE_BYTES", 16 * 1024 * 1024, 128 * 1024 * 1024)?,
@@ -208,7 +211,10 @@ mod tests {
         assert_eq!(config.port, 8700);
         assert_eq!(config.max_frame_bytes, 8 * 1024 * 1024);
         assert_eq!(config.max_pending, 256);
-        assert_eq!(config.max_sse_connections, 16);
+        // 64 与宿主那条直连闸（`lan-proxy` 的 MAX_UPSTREAM_SSE_CONNECTIONS）同一个数：
+        // 两条路通向同一台宿主、同一种资源。16 的时候一台手机的几条被丢弃的连接就能把
+        // 走中转的所有设备挡在 429 外面（真机现场见 README 的运维那节）。
+        assert_eq!(config.max_sse_connections, 64);
         assert_eq!(config.tunnel_heartbeat_ms, 15_000);
         assert_eq!(config.tunnel_pong_timeout_ms, 60_000);
         assert!(config.mirror_cache, "离线镜像兜底默认开");
