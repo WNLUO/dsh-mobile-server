@@ -1,8 +1,9 @@
 //! HTTP 转发与隧道帧分发。
 //!
 //! 两个方向都有背压，落点不同：
-//!   - 响应方向（宿主 → 手机）：手机读得慢时发 `httpPause` 请宿主停下，手机可写了再
-//!     `httpResume`。这里靠 `write()` 的返回值判断，等价于 Node 版 `res.write()` 的返回值。
+//!   - 响应方向（宿主 → 手机）：这里用有界 `mpsc` 把宿主帧接到写任务。写队列满（手机读得
+//!     慢）时**不再静默丢 chunk**，而是立即取消上游并结束这条响应，让客户端按 Last-Event-ID
+//!     重连补齐。丢一帧 SSE 等于在手机上留一个永远补不回来的洞，比断开重连糟得多。
 //!   - 请求方向（手机 → 宿主）：隧道积压到高水位就停读手机的请求体，回落到低水位再继续。
 //!     协议上不需要新帧，宿主只是暂时收不到 `httpBody`。
 
@@ -12,7 +13,7 @@ use std::time::Instant;
 use dsh_relay_protocol::{t, Payload};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::config::Config;
 use crate::headers::pick_forward_headers;
@@ -34,6 +35,20 @@ struct ResponseSink<'a> {
     writer: &'a mut (dyn tokio::io::AsyncWrite + Unpin + Send),
     started: bool,
     paused: bool,
+}
+
+
+/// 终局帧（End/Error）的投递：通道满时等一个槽位再送，绝不能像普通数据那样丢掉。
+/// 否则写任务永远等不到 End，SSE 会挂到空闲哨兵超时（甚至因为 pending 已摘除而永久挂住）。
+fn send_terminal(sender: mpsc::Sender<ResponseChunk>, chunk: ResponseChunk) {
+    match sender.try_send(chunk) {
+        Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
+        Err(mpsc::error::TrySendError::Full(chunk)) => {
+            tokio::spawn(async move {
+                let _ = sender.send(chunk).await;
+            });
+        }
+    }
 }
 
 /// 等宿主回响应头的三种结局。
@@ -224,7 +239,7 @@ pub async fn proxy_request(
                     };
                     tunnel.send_empty(t::HTTP_CANCEL, id);
                     if let Some(sender) = sender {
-                        let _ = sender.try_send(ResponseChunk::End);
+                        send_terminal(sender, ResponseChunk::End);
                     }
                     return;
                 }
@@ -539,20 +554,37 @@ pub fn handle_tunnel_frame(tunnel: &Arc<Tunnel>, instance_id: &str, frame_type: 
             }
         }
         t::HTTP_CHUNK => {
+            // 注意：**不要**在入队前刷新 idle_deadline。旧实现先刷新再 try_send，通道满、
+            // chunk 被丢掉时哨兵被喂饱，30s 空闲判定永远不触发，手机端就永久缺一段。
             let sender = {
-                let mut pending = tunnel.pending.lock().unwrap_or_else(|e| e.into_inner());
-                match pending.get_mut(&id) {
-                    Some(Pending::Http(entry)) => {
-                        entry.idle_deadline =
-                            Some(Instant::now() + std::time::Duration::from_millis(SSE_IDLE_TIMEOUT_MS));
-                        entry.chunk_tx.clone()
-                    }
+                let pending = tunnel.pending.lock().unwrap_or_else(|e| e.into_inner());
+                match pending.get(&id) {
+                    Some(Pending::Http(entry)) => entry.chunk_tx.clone(),
                     _ => None,
                 }
             };
             if let Some(sender) = sender {
-                if sender.try_send(ResponseChunk::Data(payload.to_vec())).is_err() {
-                    log(format!("response chunk dropped id={id}（通道满或已关闭）"));
+                match sender.try_send(ResponseChunk::Data(payload.to_vec())) {
+                    Ok(()) => {
+                        let mut pending = tunnel.pending.lock().unwrap_or_else(|e| e.into_inner());
+                        if let Some(Pending::Http(entry)) = pending.get_mut(&id) {
+                            entry.idle_deadline =
+                                Some(Instant::now() + std::time::Duration::from_millis(SSE_IDLE_TIMEOUT_MS));
+                        }
+                    }
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        // 手机读得慢：不能继续静默丢帧。停掉上游、结束响应，由客户端重连重放。
+                        log(format!("response backpressure id={id}: closing response"));
+                        let removed = {
+                            let mut pending = tunnel.pending.lock().unwrap_or_else(|e| e.into_inner());
+                            pending.remove(&id).is_some()
+                        };
+                        if removed {
+                            tunnel.send_empty(t::HTTP_CANCEL, id);
+                        }
+                        send_terminal(sender, ResponseChunk::End);
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {}
                 }
             }
         }
@@ -565,7 +597,7 @@ pub fn handle_tunnel_frame(tunnel: &Arc<Tunnel>, instance_id: &str, frame_type: 
                 }
             };
             if let Some(sender) = sender {
-                let _ = sender.try_send(ResponseChunk::End);
+                send_terminal(sender, ResponseChunk::End);
             }
         }
         t::HTTP_ERROR => {
@@ -583,7 +615,7 @@ pub fn handle_tunnel_frame(tunnel: &Arc<Tunnel>, instance_id: &str, frame_type: 
                 }
             };
             if let Some(sender) = sender {
-                let _ = sender.try_send(ResponseChunk::Error(message));
+                send_terminal(sender, ResponseChunk::Error(message));
             }
         }
         t::WS_OPEN => {
