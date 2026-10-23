@@ -13,4 +13,6 @@ plugin-ota/
 .DS_Store
 **/target/
 server/relay/rust/dist-console/
+# build-static.sh 的默认产物目录（静态包，8MB 一个，不进仓库）
+server/relay/rust/dist/
 server/relay/rust/console/node_modules/
