@@ -1,0 +1,13 @@
+# /etc/conf.d/dsh-relay —— 服务层参数。
+# 中转自己的运行配置（HOST/PORT/SELF_UPDATE 等）不在这里，在 /etc/dsh-relay.env（600）：
+# 那个文件以后可能放密钥，和服务脚本分开管。
+
+# 运行配置环境文件。
+#dsh_relay_env="/etc/dsh-relay.env"
+
+# stdout 与 stderr 都追加到这里。
+#dsh_relay_log="/opt/dsh-relay/logs/relay.log"
+
+# 退出后多久拉起、每个周期最多拉起多少次（0 = 不限次数）。
+#dsh_relay_respawn_delay="3"
+#dsh_relay_respawn_max="0"

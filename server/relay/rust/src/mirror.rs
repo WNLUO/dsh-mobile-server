@@ -215,8 +215,25 @@ pub fn lookup(
     serde_json::to_string(&value).ok()
 }
 
+/// 这台实例当前这份摘要清单能不能放行这个凭据。推送令牌上报（`http.rs` 的
+/// `/api/mobile/v1/push-token`）与镜像读用同一个判据，别另写一份校验。
+pub(crate) fn credential_ok(instance_id: &str, credential: Option<&str>) -> bool {
+    let now = now_ms();
+    let creds = {
+        let map = store().lock().unwrap_or_else(|e| e.into_inner());
+        match map.get(instance_id.trim()) {
+            Some(entry) if now.saturating_sub(entry.stored_at_ms) <= ENTRY_TTL_MS => entry.creds.clone(),
+            _ => Vec::new(),
+        }
+    };
+    creds_allow(&creds, credential, now as i64)
+}
+
 /// 这份凭据能不能读缓存。`creds` 为空（老插件还没推摘要）一律不放行。
-fn creds_allow(creds: &[(String, i64)], credential: Option<&str>, now_ms: i64) -> bool {
+///
+/// 推送令牌上报那条自有路径（`http.rs`）用同一个判据：同一套摘要、同一个「空摘要
+/// 不放行」的口径，别为它另写一份校验。
+pub(crate) fn creds_allow(creds: &[(String, i64)], credential: Option<&str>, now_ms: i64) -> bool {
     let Some(raw) = credential else { return false };
     if !raw.starts_with("dshc_") || creds.is_empty() {
         return false;

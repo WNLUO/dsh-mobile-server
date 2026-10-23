@@ -37,7 +37,9 @@
 | 0x17 | sync | 0 | JSON | 宿主把整份镜像推给中转（会话清单 + 工作区 + 已签发设备凭据的 sha256）。转发路径不用它；中转只在宿主那条隧道不在时拿它兜底，`MIRROR_CACHE=0` 时收到就丢 |
 | 0x18 | revokeAll | 0 | JSON | 保留编号 |
 | 0x19 | revokeAllAck | 0 | JSON | 保留编号 |
+| 0x1A | pushRegister | 0 | JSON | 宿主代 App 上报/删除 iOS 推送令牌（{deviceId, platform, token} 或 {deviceId, action:'delete'}）；中转按实例落表，控制台未开时忽略 |
+| 0x1B | pushSend | 0 | JSON | 宿主请求中转发一条 APNs 推送（{deviceId, title, body, sessionId?, kind}）；只发给该实例登记过的令牌，APNs 未配置时零开销返回 |
 
 帧编号的事实源是 `protocol-types.js`；保留编号仍要与插件一致，但 Rust 中转不会将这些旧业务帧当成配对或镜像指令处理。中转侧 60 秒收不到 pong 则断开隧道，宿主侧超时为 90 秒。
 
-宿主按 `instanceId` 登记隧道，手机请求按 `X-Dsh-Instance` 分发；不存在的实例回 503。没带实例头时，仅在恰好一台宿主在线时转发，不会在多台宿主间猜测。中转自答 `/healthz`、`/status` 和 `/api/mobile/v1/health`，其余路径按规则转发；控制台路由见中转服务文档。
+宿主按 `instanceId` 登记隧道，手机请求按 `X-Dsh-Instance` 分发；不存在的实例回 503。没带实例头时，仅在恰好一台宿主在线时转发，不会在多台宿主间猜测。中转自答 `/healthz`、`/status`、`/api/mobile/v1/health` 和 `/api/mobile/v1/push-token`（推送令牌上报，判据与镜像读同一套设备凭据摘要），其余路径按规则转发；控制台路由见中转服务文档。

@@ -86,7 +86,13 @@ impl RequestHead {
 }
 
 /// 中转自己认领的路径。判据只看**末尾**（见 `strip_deploy_prefix`）。
-const OWNED_PATHS: &[&str] = &["/healthz", "/status", "/api/mobile/v1/health", "/tunnel"];
+const OWNED_PATHS: &[&str] = &[
+    "/healthz",
+    "/status",
+    "/api/mobile/v1/health",
+    "/api/mobile/v1/push-token",
+    "/tunnel",
+];
 
 /// 手机 API 的固定前缀。与 `server/relay-core/protocol-types.js` 的 `MOBILE_PREFIX` 一致。
 const MOBILE_PREFIX: &str = "/api/mobile/v1/";
@@ -414,7 +420,83 @@ pub async fn handle_owned_path(
             respond_json(reader, 200, &body).await?;
             Ok(true)
         }
+        "/api/mobile/v1/push-token" => {
+            // iOS 推送令牌上报。**必须带设备凭据**：判据与镜像读同一个（mirror::credential_ok），
+            // 没配对过的手机报上来的令牌一律不收。控制台没开时也收——推送依赖的是 APNs
+            // 配置（APNS_*），不是控制台开关。
+            if head.method != "POST" {
+                respond_json(reader, 405, r#"{"ok":false,"error":"method not allowed"}"#).await?;
+                return Ok(true);
+            }
+            let instance_id = head
+                .header("x-dsh-instance")
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            let Some(credential) = presented_credential(head) else {
+                respond_json(reader, 401, r#"{"ok":false,"error":"device credential required"}"#).await?;
+                return Ok(true);
+            };
+            if instance_id.is_empty() {
+                respond_json(reader, 400, r#"{"ok":false,"error":"x-dsh-instance required"}"#).await?;
+                return Ok(true);
+            }
+            if !crate::mirror::credential_ok(&instance_id, Some(&credential)) {
+                respond_json(reader, 403, r#"{"ok":false,"error":"bad device credential"}"#).await?;
+                return Ok(true);
+            }
+            let body = match read_console_body(reader, head, MAX_CONSOLE_BODY).await {
+                Ok(body) => body,
+                Err(()) => {
+                    respond_json(reader, 413, r#"{"ok":false,"error":"body too large"}"#).await?;
+                    return Ok(true);
+                }
+            };
+            let request: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+            let device_id = request
+                .get("deviceId")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            let token = request
+                .get("token")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            let platform = request
+                .get("platform")
+                .and_then(|v| v.as_str())
+                .unwrap_or("ios")
+                .trim()
+                .to_string();
+            if device_id.is_empty() || token.is_empty() {
+                respond_json(reader, 400, r#"{"ok":false,"error":"deviceId and token are required"}"#).await?;
+                return Ok(true);
+            }
+            match crate::console() {
+                Some(console) => {
+                    console.store.upsert_push_token(&instance_id, &device_id, &platform, &token);
+                    respond_json(reader, 200, r#"{"ok":true}"#).await?;
+                }
+                None => respond_json(reader, 503, r#"{"ok":false,"error":"no store on this relay"}"#).await?,
+            }
+            Ok(true)
+        }
         other => {
+            // 宿主控制面（`/api/relay/**`）在中转上一律 404，**绝不转发**。
+            //
+            // 那个前缀下全是「管这台宿主」的接口：配对二维码、中转地址、注册密钥、
+            // 设备列表与吊销、插件更新。手机一条都不用（它只走 `/api/mobile/v1/**`），
+            // 所以没有功能代价；留着转发等于把宿主的控制面挂到公网上 —— 宿主那些
+            // 「是不是本机来的」判断在转发链路上本来就不可靠。宿主侧另有按转发标记
+            // 判远程的那一道，这里是第二道。
+            if other == "/api/relay" || other.starts_with("/api/relay/") {
+                respond_text(reader, 404, "not found").await?;
+                return Ok(true);
+            }
+
             // 插件 OTA 临时通道：`/api/desktop-plugins/ota/**`。它独立于控制台开关
             // （宿主可能没开控制台但仍在用这条救急通道），所以单独判。
             if let Some(rest) = other.strip_prefix("/api/desktop-plugins/ota/") {
@@ -626,6 +708,10 @@ mod tests {
             "/api/mobile/v1/health"
         );
         assert_eq!(strip_deploy_prefix("/relay/tunnel"), "/tunnel");
+        assert_eq!(
+            strip_deploy_prefix("/relay/api/mobile/v1/push-token"),
+            "/api/mobile/v1/push-token"
+        );
         // 末尾判定是刻意取舍：`/relay/status` 会命中 `/status`。但**手机 API 前缀下的
         // 路径绝不能被末尾匹配抢走**——见下面那条用例。
     }

@@ -23,8 +23,12 @@ async fn main() {
     };
 
     dsh_relay::install_config(config.clone());
+    // APNs 推送出口：默认关闭（APNS_KEY / APNS_KEY_ID / APNS_TEAM_ID 任一不配就是关）。
+    // 关闭时只打一条日志，转发路径一个字不变。
+    dsh_relay::apns::init_from_env();
     let slot = Arc::new(TunnelSlot::new());
     dsh_relay::install_slot(slot.clone());
+
     log(format!(
         "dsh-relay 启动 host={} port={} version={}",
         config.host,
