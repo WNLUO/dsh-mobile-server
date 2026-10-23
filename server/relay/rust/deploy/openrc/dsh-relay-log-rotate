@@ -1,0 +1,33 @@
+#!/bin/sh
+# 切分中转日志：超过 20MB 才切，最多留 3 份。
+#
+# 为什么是「复制 + 原地截断」，不是「改名 + 新建」：supervise-daemon 启动时把
+# relay.log 打开成一个 fd 就一直握着（实测 O_APPEND，截断后从 0 继续写），改名换新文件
+# 不会让它重新打开——新内容会继续写进被改名的那份，relay.log 永远空着。
+# 原地截断动的是同一个 inode，进程那边完全不用管。
+#
+# 装法：install -m 0755 dsh-relay-log-rotate /etc/periodic/daily/
+# 由 busybox crond 每天 02:00 跑 run-parts /etc/periodic/daily 触发（/etc/crontabs/root）。
+# 不用装 logrotate：Alpine 自带的这套够了，也不多一个包。
+set -eu
+
+LOG=${DSH_RELAY_LOG:-/opt/dsh-relay/logs/relay.log}
+MAX_BYTES=${DSH_RELAY_LOG_MAX_BYTES:-$((20 * 1024 * 1024))}
+KEEP=3
+
+[ -f "$LOG" ] || exit 0
+
+size=$(wc -c < "$LOG")
+[ "$size" -ge "$MAX_BYTES" ] || exit 0
+
+i=$KEEP
+while [ "$i" -gt 1 ]; do
+	prev=$((i - 1))
+	if [ -f "$LOG.$prev" ]; then
+		mv -f "$LOG.$prev" "$LOG.$i"
+	fi
+	i=$prev
+done
+cp "$LOG" "$LOG.1"
+: > "$LOG"
+echo "dsh-relay: relay.log 已切成 relay.log.1（切前 $size 字节，保留 $KEEP 份）"

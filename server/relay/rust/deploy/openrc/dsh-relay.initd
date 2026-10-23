@@ -1,0 +1,63 @@
+#!/sbin/openrc-run
+# DSH Mobile 中转（纯转发）的 OpenRC 服务。
+#
+# 装法（Alpine / OpenRC）：
+#   install -m 0755 dsh-relay.initd /etc/init.d/dsh-relay
+#   install -m 0644 dsh-relay.confd /etc/conf.d/dsh-relay
+#   install -m 0600 dsh-relay.env  /etc/dsh-relay.env   # 按需改 HOST/PORT/开关
+#   rc-update add dsh-relay default && rc-service dsh-relay start
+#
+# 「退出即拉起」由 supervise-daemon 负责：自动更新换完二进制会自己退出，下一次拉起就是
+# 新版本；新版本起不来时由二进制自己退回 .previous 并留下毒标记，服务这边保持一直拉起，
+# 不会出现「人不在机器上、服务彻底停住」的状态。
+
+name="dsh-relay"
+description="DSH Mobile relay (Rust, pure forwarding behind nginx)"
+
+command="/opt/dsh-relay/dsh-relay"
+command_args=""
+directory="/opt/dsh-relay"
+pidfile="/run/dsh-relay.pid"
+
+# 重启上限：0 = 不限次数，间隔 3 秒（2 核小机器别打满）。
+# **不能**沿用 rc.conf 里的全局 respawn_max（那里是 5）：那样 5 次崩溃之后
+# supervise-daemon 自己退出，服务就没人管了。所以这里用独立变量名给默认值。
+#
+# respawn_period 不传：supervise-daemon 把 "0" 判成非法值直接拒绝启动（--respawn-period 0
+# 实测报 Invalid respawn-period value）；respawn_max=0 是不限次数，这个周期本来也用不上。
+supervisor="supervise-daemon"
+respawn_delay="${dsh_relay_respawn_delay:-3}"
+respawn_max="${dsh_relay_respawn_max:-0}"
+
+# stdout 与 stderr 追加到同一个文件（supervise-daemon 以 O_APPEND 打开，切分时
+# 原地截断即可，不要改名换新文件，见 dsh-relay-log-rotate）。
+output_log="${dsh_relay_log:-/opt/dsh-relay/logs/relay.log}"
+error_log="${output_log}"
+
+# 长连接服务（SSE/WS 一条一条挂着）：软上限从 1024 抬到硬上限 4096。
+# 更大的值要先确认这台机器的 nofile 硬上限（ulimit -Hn），否则只会打一行
+# "unable to apply RC_ULIMIT" 且不生效。
+rc_ulimit="-n 4096"
+
+depend() {
+	need net
+	# 对外由 nginx 反代到 127.0.0.1:18788，先起中转再起 nginx。
+	before nginx
+}
+
+start_pre() {
+	mkdir -p /opt/dsh-relay/logs /opt/dsh-relay/data
+	if [ ! -x /opt/dsh-relay/dsh-relay ]; then
+		eerror "找不到可执行的中转二进制 /opt/dsh-relay/dsh-relay"
+		return 1
+	fi
+	if [ ! -r "${dsh_relay_env:-/etc/dsh-relay.env}" ]; then
+		eerror "缺少 ${dsh_relay_env:-/etc/dsh-relay.env}：HOST/PORT 等配置从这里读"
+		return 1
+	fi
+	# 导出到本 shell，supervise-daemon 会把它继承给子进程。
+	set -a
+	# shellcheck disable=SC1090
+	. "${dsh_relay_env:-/etc/dsh-relay.env}"
+	set +a
+}
