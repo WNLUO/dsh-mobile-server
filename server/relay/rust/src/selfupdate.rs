@@ -44,6 +44,17 @@
 //! （说明有人上来看过了）。状态记在数据目录的 `.update-state` 里，纯文本、不依赖
 //! 控制台的数据库——纯转发的机器（没开 `PLATFORM_ENABLED`）也要能用自动更新。
 //!
+//! ## 替换之前先试跑一遍
+//!
+//! 上面两道闸都建立在「新版本至少能跑起来、能读到状态文件」之上。如果那个二进制
+//! 在这台机器上根本起不来（动态链接的包放到 musl 系统上、架构不对、缺 shared lib），
+//! 它一行代码都执行不到，也就没机会记账或回滚——进程管理器只会无限重启一个哑文件。
+//! 这是自动更新最坏的形态，而且**已经真发生过一次**：给 Alpine 下发 glibc 包。
+//!
+//! 所以替换前先在暂存位置跑一次 `--version` 式的自检：能跑、能打印出**清单里声明的
+//! 那个版本号**，才允许换。跑不了就当作「这个包不适合这台机器」，本轮放弃升级并
+//! 记日志，继续用旧版本服务。试跑用独立的进程组与超时，跑完必杀，不留残留进程。
+//!
 //! ## 校验的边界
 //!
 //! 校验和与二进制放在同一份清单里，能挡住传输损坏（下载到一半、被中间设备改写），
@@ -72,9 +83,6 @@ const MAX_START_ATTEMPTS: u32 = 2;
 /// 「请再拉起我」的退出码。用非零码是为了让所有进程管理器都当它是异常退出而重试，
 /// 而不是「正常结束、不用管了」。
 pub const EXIT_RESTART: i32 = 75;
-
-/// 查新版本的默认间隔。默认一天一次，怎么算都够。
-const DEFAULT_INTERVAL: Duration = Duration::from_secs(24 * 3600);
 
 /// 当前编译出来的目标三元组里的架构段。只支持跑在 Linux 上的两种。
 fn asset_arch() -> Option<&'static str> {
@@ -515,6 +523,79 @@ async fn first_manifest(
     Ok((None, errors))
 }
 
+/// 试跑一遍候选二进制，确认它在这台机器上真能启动、而且自报的版本号对得上。
+///
+/// 为什么不信清单里的版本号：清单是发布方写的，二进制是另一份东西。这里要回答的是
+/// 「这个文件放到这台机器上，能不能跑」——只有真跑一次才知道。
+///
+/// 跑的是 `--version`：中转对未知参数的处理是打印版本后退出，不绑端口、不连隧道，
+/// 对线上没有任何副作用。超时 15 秒，杀掉整组进程。
+fn trial_run(staging: &Path, expected_version: &str) -> Result<(), String> {
+    use std::process::{Command, Stdio};
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let mut child = Command::new(staging)
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            // 自己一个进程组：超时的时候杀 -pid 能把它的子进程一起收掉。
+            .process_group(0)
+            .spawn()
+            .map_err(|e| format!("候选二进制起不来（{e}），这台机器跑不了它"))?;
+
+        let pid = child.id() as i32;
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    let mut text = String::new();
+                    if let Some(mut out) = child.stdout.take() {
+                        let _ = std::io::Read::read_to_string(&mut out, &mut text);
+                    }
+                    if let Some(mut err) = child.stderr.take() {
+                        let _ = std::io::Read::read_to_string(&mut err, &mut text);
+                    }
+                    if !status.success() {
+                        return Err(format!(
+                            "候选二进制退出码 {:?}，这台机器跑不了它：{}",
+                            status.code(),
+                            text.trim().lines().next().unwrap_or("（没有输出）")
+                        ));
+                    }
+                    if !text.contains(expected_version) {
+                        return Err(format!(
+                            "候选二进制没报出版本 {expected_version}（输出：{}）",
+                            text.trim().lines().next().unwrap_or("（没有输出）")
+                        ));
+                    }
+                    return Ok(());
+                }
+                Ok(None) => {
+                    if std::time::Instant::now() > deadline {
+                        let _ = Command::new("kill")
+                            .args(["-KILL", &format!("-{pid}")])
+                            .stdout(Stdio::null())
+                            .stderr(Stdio::null())
+                            .status();
+                        let _ = child.kill();
+                        return Err("候选二进制 15 秒内没有退出，放弃这次升级".into());
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                Err(error) => return Err(format!("等候选二进制结束失败：{error}")),
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (staging, expected_version);
+        Err("这个平台不支持试跑自检，放弃自动升级".into())
+    }
+}
+
 /// 下载、校验、替换。失败时**不留下任何半截状态**。
 async fn apply(
     ctx: &UpdateContext,
@@ -550,6 +631,12 @@ async fn apply(
         .data_dir
         .join(format!(".dsh-relay-{version}.new"));
     write_executable(&staging, &bytes)?;
+
+    // **替换之前**先试跑。起不来的包在这里就拦住，线上文件名一个字节都没动。
+    trial_run(&staging, version).inspect_err(|error| {
+        let _ = std::fs::remove_file(&staging);
+        crate::tunnel::log(format!("放弃升级到 {version}：{error}"));
+    })?;
 
     // 先把「待验证」落盘，再动文件。反过来的话，进程在两次 rename 之间被杀掉，
     // 盘上就是一个没人认领的新文件。
@@ -661,6 +748,15 @@ mod tests {
         Paths {
             exe: dir.join("dsh-relay"),
             data_dir: dir.join("data"),
+        }
+    }
+
+    /// 测试用：给脚本加上可执行位。
+    fn make_executable(path: &Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
     }
 
@@ -871,6 +967,36 @@ mod tests {
         assert!(!revert(&paths, "0.1.8", "没起来"));
         assert_eq!(std::fs::read(&paths.exe).unwrap(), b"only-one");
         assert!(!paths.load().rollback.is_empty(), "还是要停手，别再试");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 试跑自检的三条结局：跑得起来且版本对、跑起来但版本不对、根本跑不起来。
+    ///
+    /// 第三条是这个函数存在的理由：一个动态链接的包放到 musl 系统上，进程连 main
+    /// 都进不去，它自己没机会记账或回滚，只能靠这里在替换**之前**拦住。
+    #[test]
+    fn trial_run_rejects_what_cannot_start() {
+        let dir = temp_dir("trial");
+        let good = dir.join("good");
+        std::fs::write(&good, b"#!/bin/sh\necho \"dsh-relay 0.1.8\"\n").unwrap();
+        make_executable(&good);
+        assert!(trial_run(&good, "0.1.8").is_ok(), "能跑且版本对就该放行");
+
+        let wrong = dir.join("wrong");
+        std::fs::write(&wrong, b"#!/bin/sh\necho \"dsh-relay 0.1.7\"\n").unwrap();
+        make_executable(&wrong);
+        let err = trial_run(&wrong, "0.1.8").unwrap_err();
+        assert!(err.contains("0.1.8"), "版本对不上要说清楚：{err}");
+
+        let broken = dir.join("broken");
+        std::fs::write(&broken, b"#!/bin/sh\nexit 127\n").unwrap();
+        make_executable(&broken);
+        assert!(trial_run(&broken, "0.1.8").is_err(), "退出码非零必须拦下");
+
+        let notrun = dir.join("notrun");
+        std::fs::write(&notrun, b"no shebang here").unwrap();
+        make_executable(&notrun);
+        assert!(trial_run(&notrun, "0.1.8").is_err(), "根本执行不了必须拦下");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

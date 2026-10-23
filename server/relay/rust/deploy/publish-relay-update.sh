@@ -7,6 +7,15 @@
 # 例：
 #   ./publish-relay-update.sh 0.1.1 /opt/dsh-mobile/build/relay/rust/target/release/dsh-relay
 #
+# 发到多个更新源（国内一个、海外一个）：
+#   RELAY_UPDATE_ROOT=/opt/dsh-mobile/relay-updates \
+#   RELAY_UPDATE_PUBLIC_BASE=https://dsh-hub.wnluo.com/relay-updates \
+#   RELAY_UPDATE_EXTRA_ROOTS=/mnt/gh/relay-updates \
+#   RELAY_UPDATE_EXTRA_BASES=https://raw.githubusercontent.com/…/relay-updates \
+#   ./publish-relay-update.sh 0.1.8 /abs/path/dsh-relay-linux-x86_64
+# 两个列表按位置一一对应；只给一个就只发一处。海外那台的中转把海外源写在自己
+# SELF_UPDATE_SOURCE 里，它不会来国内取。
+#
 # 做了什么、为什么这么做：
 #   1. 先拷二进制、再写清单。反过来会让中转在「清单已更新、文件还没到」的窗口里
 #      下到一个 404 或半截文件——那个窗口哪怕只有一秒也不该有。
@@ -40,6 +49,8 @@ if [ -z "$PUBLIC_BASE" ]; then
     exit 2
 fi
 PUBLIC_BASE=${PUBLIC_BASE%/}
+EXTRA_ROOTS=${RELAY_UPDATE_EXTRA_ROOTS:-}
+EXTRA_BASES=${RELAY_UPDATE_EXTRA_BASES:-}
 mkdir -p "$ROOT"
 cd "$ROOT"
 
@@ -106,6 +117,51 @@ for arch in x86_64 aarch64; do
         exit 1
     fi
     echo "自检通过：$arch"
+done
+
+# 镜像到其它更新源。**先拷二进制、再拷清单**，顺序和主源一致；每个目标再单独自检
+# 一次——一个取不下来的海外源，等于海外那批机器静默停更。
+mirror_to() {
+    target_root=$1
+    target_base=$2
+    [ -d "$target_root" ] || mkdir -p "$target_root"
+    for arch in x86_64 aarch64; do
+        src="$ROOT/dsh-relay-linux-$arch"
+        [ -f "$src" ] || continue
+        cp -f "$src" "$target_root/dsh-relay-linux-$arch.tmp"
+        mv -f "$target_root/dsh-relay-linux-$arch.tmp" "$target_root/dsh-relay-linux-$arch"
+    done
+    sed "s#${PUBLIC_BASE}#${target_base}#g" latest.json > "$target_root/latest.json.tmp"
+    mv -f "$target_root/latest.json.tmp" "$target_root/latest.json"
+    for arch in x86_64 aarch64; do
+        url=$(sed -n "s/.*\"$arch\":{\"url\":\"\([^\"]*\)\".*/\1/p" "$target_root/latest.json")
+        [ -n "$url" ] || continue
+        actual=$(curl -fsS --max-time 120 "$url" | sha256sum | cut -d' ' -f1)
+        expect=$(sed -n "s/.*\"$arch\":{\"url\":\"[^\"]*\",\"sha256\":\"\([^\"]*\)\".*/\1/p" "$target_root/latest.json")
+        if [ "$actual" != "$expect" ]; then
+            echo "镜像自检失败：$target_base $arch 下载回来的哈希对不上" >&2
+            exit 1
+        fi
+        echo "镜像自检通过：$target_base $arch"
+    done
+}
+
+# 两个列表按位置配对。数量不一致是配置错误，直接拒绝——宁可发不出去，也不要
+# 「二进制发到 A、清单指向 B」。
+set -- $EXTRA_ROOTS
+extra_root_count=$#
+set -- $EXTRA_BASES
+extra_base_count=$#
+if [ "$extra_root_count" -ne "$extra_base_count" ]; then
+    echo "RELAY_UPDATE_EXTRA_ROOTS 与 RELAY_UPDATE_EXTRA_BASES 的数量必须相同" >&2
+    exit 2
+fi
+set -- $EXTRA_ROOTS
+for base in $EXTRA_BASES; do
+    root=$1
+    shift
+    echo "镜像到 $base（$root）"
+    mirror_to "$root" "${base%/}"
 done
 
 echo "已发布 $VERSION：$ROOT/latest.json"

@@ -99,7 +99,7 @@ WantedBy=multi-user.target
 | `WS_PONG_TIMEOUT_MS` | 60000 | 手机 WS 半开判定 |
 | `DEBUG_SSE` | 关 | 打 SSE 开/关日志 |
 | `SELF_UPDATE` | **关** | 打开后这台中转会自己升到更新源上的新版本 |
-| `SELF_UPDATE_SOURCE` | **空** | 更新源，下面要能取到 `latest.json`。`SELF_UPDATE=1` 时必填，不填启动报错 |
+| `SELF_UPDATE_SOURCE` | **空** | 更新源，下面要能取到 `latest.json`。`SELF_UPDATE=1` 时必填，不填启动报错。**多个源用逗号分隔，按顺序试** |
 | `SELF_UPDATE_INTERVAL_SECONDS` | 86400 | 查新版本的间隔，**下限一天** |
 
 越界的值**直接报错启动失败，不是 clamp**——手滑写个 0 被静默接受，表现是「限额关掉了」
@@ -266,6 +266,18 @@ SELF_UPDATE=1
 SELF_UPDATE_SOURCE=https://your-domain.example/relay-updates   # 必须写，指向你自己的静态目录
 ```
 
+**跟控制台无关**：纯转发的机器（没设 `PLATFORM_ENABLED`）一样能自己升级。升级状态记在
+数据目录的 `.update-state` 里，是个纯文本文件，不碰数据库。
+
+**可以给多个源，逗号分隔、按顺序试**：
+
+```sh
+SELF_UPDATE_SOURCE=https://dsh-hub.wnluo.com/relay-updates,https://raw.githubusercontent.com/WNLUO/dsh-mobile-server/main/relay-updates
+```
+
+国内机器把国内源放前面，海外机器把海外源放前面。单源的问题是它安静地变成单点：
+那个域名一挂（或被墙），这台机器就再也收不到新版本，而它只会每天往日志里写一行失败。
+
 只开 `SELF_UPDATE` 不给地址 → **启动直接报错退出**，不静默跳过。早先这里写死了我们自己
 的运营机，那意味着「开了自动更新但没改源」的用户会来别人的域名取二进制、校验通过、
 然后替换掉自己的程序——那不是更新，是把远程执行的口子交给了一个陌生人。
@@ -281,6 +293,23 @@ SELF_UPDATE_SOURCE=https://your-domain.example/relay-updates   # 必须写，指
 
 一句话：**这项能力的存在前提是「有一方在批量发布、有一方在批量消费」。** 不是那种前提时，
 直接重装。
+
+### 换上去之前先试跑，换上去之后自己验收
+
+自动更新最坏的形态不是「没升上去」，是「升上去之后起不来，而且没人知道」。所以从下载到
+定案有四道闸，任何一道不过就退回旧版本继续服务：
+
+1. **校验和**。清单里写着 sha256，对不上就连临时文件都不留。
+2. **试跑**。替换前先在数据目录里跑一次 `dsh-relay --version`，能起来、能报出清单声明的
+   版本号，才允许换。拦的是「这个包在这台机器上根本跑不了」——动态链接的包下发到 musl
+   系统上，进程连 `main` 都进不去，它自己没机会回滚。
+3. **自检**。换上去之后退出、由服务管理器拉起新版；新版绑上端口后自己打一次 `/healthz`，
+   拿到 200 才算这次升级成立。
+4. **数次数**。万一新版在自检之前就死了（panic、配置错），同一个版本连续两次启动都没验明，
+   第二次启动时直接把 `.previous` 换回来。
+
+换回之后写一条回滚记录，**之后不再自动升级**，直到人上去把 `.update-state` 删掉。状态文件
+里那几行就是现场：`pending` / `attempts` / `confirmed` / `rollback`。
 
 更新源是一个自己控制的静态目录：一个 `latest.json` 加若干二进制。
 
@@ -309,19 +338,44 @@ SELF_UPDATE_SOURCE=https://your-domain.example/relay-updates   # 必须写，指
 在「清单已更新、文件还没到」的窗口里下到 404），然后当场自检——把清单里的地址真的
 取一遍、比对哈希。自检不过就报错退出，不会留下一个你自己都下不来的版本。
 
+发到第二个更新源（国内一个、海外一个）加两个环境变量，按位置一一配对：
+
+```sh
+RELAY_UPDATE_EXTRA_ROOTS=/mnt/gh/relay-updates \
+RELAY_UPDATE_EXTRA_BASES=https://raw.githubusercontent.com/OWNER/REPO/main/relay-updates \
+./deploy/publish-relay-update.sh 0.1.8 /abs/path/dsh-relay-linux-x86_64
+```
+
+每个镜像目标都会单独自检一次。一个取不下来的海外源，等于海外那批机器静默停更。
+
+**发之前确认包里内置的版本号等于你要发的版本**：脚本会用 `strings` 读一遍并拦住不一致。
+忘了抬 `Cargo.toml` 就发布，机器升上去自报旧版本、下次又认为该升，于是每天下载替换重启
+一次、永远停不下来。
+
+### 跨发行版：发静态包
+
+Linux 上有 glibc（Rocky / Debian / Ubuntu）和 musl（Alpine）两套 C 库，动态链接的包
+不能混用——实测把 glibc 包放到 Alpine 上直接缺 `libgcc_s`，补 `gcompat` 也还缺
+`fcntl64` / `__res_init`。
+
+所以对外发布统一发**静态包**：`deploy/build-static.sh` 编 `x86_64-unknown-linux-musl`，
+RUSTFLAGS 里显式 `-C target-feature=+crt-static -C relocation-model=static`。少了后者
+编出来的是 static-pie（file 会显示 `interpreter /lib/ld-musl-x86_64.so.1`），在 Rocky 和
+Debian 上照样起不来。产物用 `file`（要 `statically linked`）和 `ldd`（要
+`not a dynamic executable`）验收。
+
 同一个版本号重复发布会直接拒绝：机器上跑的版本没变、问题却以为已经修了，是发布
 事故最常见的形态。
 
 ### 升级是怎么做的
 
-下载到临时文件 → 算 sha256 比对清单 → **对不上就放弃，什么都不动** → 当前二进制改名
-留成 `.previous` → 新文件原子换上去 → 退出，由 systemd 拉起来。
+下载到临时文件 → 算 sha256 比对清单（**对不上就放弃，什么都不动**）→ 试跑一次
+`--version` → 当前二进制改名留成 `.previous` → 新文件原子换上去 → 退出，由进程管理器
+拉起来 → 新版自打一次 `/healthz` → 成了记 `confirmed`，没成换回 `.previous`。
 
 **校验的边界**：能挡传输损坏、挡不住同时改了清单和二进制的人。真要防那个得上签名，
 那要引入密钥管理，对一台自发布的中转成本大于收益。
 
-**健康检查没通过会自动回滚**：新版本起来后由启动路径核对「待验证标记」，如果回来的是
-旧版本，就记一条回滚记录，**之后不再自动升级**，等人上来看。删掉数据目录下的标记再
-重启才会恢复。
-
-所以最坏情况是白折腾一轮，不会留下一台起不来的机器。
+**最坏情况是白折腾一轮，不会留下一台起不来的机器**：任何一道闸不过都会退回旧版本继续
+服务，并留下一条回滚记录停掉后续自动升级，等人来看。删掉数据目录下的 `.update-state`
+再重启才会恢复。

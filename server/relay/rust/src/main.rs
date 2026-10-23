@@ -20,6 +20,17 @@ use dsh_relay::tunnel::{log, TunnelSlot};
 
 #[tokio::main]
 async fn main() {
+    // `--version` 只打印版本就退出：**不读配置、不绑端口、不连隧道**。
+    //
+    // 自动更新要在替换文件之前「试跑一遍候选二进制」，靠的就是这条：一个起不来的
+    // 包（动态链接的、架构不对的）会在这里就暴露，而不是等真换上去之后无限重启。
+    // 早先这里什么参数都不认，`dsh-relay --version` 会老老实实把服务起起来——
+    // 探测一下版本就多出一个监听进程，那次是人工排查时才发现的。
+    if std::env::args().skip(1).any(|arg| arg == "--version" || arg == "-V") {
+        println!("dsh-relay {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+
     let config = match Config::from_env() {
         Ok(config) => Arc::new(config),
         Err(message) => {
