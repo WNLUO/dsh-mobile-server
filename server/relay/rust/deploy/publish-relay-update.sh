@@ -16,6 +16,13 @@
 # 两个列表按位置一一对应；只给一个就只发一处。海外那台的中转把海外源写在自己
 # SELF_UPDATE_SOURCE 里，它不会来国内取。
 #
+# 目标是 GitHub 时，ROOT 那一项写 `@github`（不是目录）：
+#   RELAY_UPDATE_EXTRA_ROOTS=/path/to/repo-checkout/relay-updates\ @github
+#   RELAY_UPDATE_EXTRA_BASES=<raw 前缀> <github 前缀>
+# 这一路**只写清单、不拷二进制**：二进制挂 Release 资产，清单里的地址直接指向
+# `releases/download/rust-v<版本>/<资产名>`。8MB 的包不进 git 历史——每次发布都在
+# 仓库里塞一个二进制，几年下来仓库就没法 clone 了。
+#
 # 做了什么、为什么这么做：
 #   1. 先拷二进制、再写清单。反过来会让中转在「清单已更新、文件还没到」的窗口里
 #      下到一个 404 或半截文件——那个窗口哪怕只有一秒也不该有。
@@ -121,6 +128,43 @@ done
 
 # 镜像到其它更新源。**先拷二进制、再拷清单**，顺序和主源一致；每个目标再单独自检
 # 一次——一个取不下来的海外源，等于海外那批机器静默停更。
+# GitHub 那一路：清单里的地址指向 Release 资产，不拷二进制。
+mirror_manifest_only() {
+    target_root=$1
+    target_base=$2
+    repo=$3
+    tag="rust-v$VERSION"
+    [ -d "$target_root" ] || mkdir -p "$target_root"
+    entries=""
+    for arch in x86_64 aarch64; do
+        # 资产名沿用已有约定：x86_64 就是 dsh-relay-<版本>，aarch64 加后缀区分。
+        if [ "$arch" = "x86_64" ]; then
+            asset="dsh-relay-$VERSION"
+        else
+            asset="dsh-relay-$VERSION-linux-$arch"
+        fi
+        hash=$(sha256sum "$ROOT/dsh-relay-linux-$arch" 2>/dev/null | cut -d' ' -f1)
+        [ -n "$hash" ] || continue
+        entry="\"$arch\":{\"url\":\"https://github.com/$repo/releases/download/$tag/$asset\",\"sha256\":\"$hash\"}"
+        if [ -z "$entries" ]; then entries="$entry"; else entries="$entries,$entry"; fi
+    done
+    printf '{\n  "version": "%s",\n  "binaries": {%s}\n}\n' "$VERSION" "$entries" > "$target_root/latest.json.tmp"
+    mv -f "$target_root/latest.json.tmp" "$target_root/latest.json"
+    # 自检只做「能取到、哈希对得上」；取不到说明 Release 资产还没挂上去或者名字不对。
+    for arch in x86_64 aarch64; do
+        url=$(sed -n "s/.*\"$arch\":{\"url\":\"\([^\"]*\)\".*/\1/p" "$target_root/latest.json")
+        [ -n "$url" ] || continue
+        actual=$(curl -fsSL --max-time 180 "$url" | sha256sum | cut -d' ' -f1)
+        expect=$(sed -n "s/.*\"$arch\":{\"url\":\"[^\"]*\",\"sha256\":\"\([^\"]*\)\".*/\1/p" "$target_root/latest.json")
+        if [ "$actual" != "$expect" ]; then
+            echo "GitHub 清单自检失败：$arch 取回来的哈希对不上（$url）" >&2
+            echo "先挂 Release 资产再发布清单，或检查资产名。" >&2
+            exit 1
+        fi
+        echo "GitHub 清单自检通过：$arch"
+    done
+}
+
 mirror_to() {
     target_root=$1
     target_base=$2
@@ -160,8 +204,15 @@ set -- $EXTRA_ROOTS
 for base in $EXTRA_BASES; do
     root=$1
     shift
-    echo "镜像到 $base（$root）"
-    mirror_to "$root" "${base%/}"
+    if [ "$root" = "@github" ]; then
+        echo "镜像清单到 GitHub（$base）"
+        mirror_manifest_only /tmp/dsh-relay-gh-manifest "${base%/}" "${RELAY_UPDATE_GITHUB_REPO:?目标为 @github 时必须设 RELAY_UPDATE_GITHUB_REPO（owner/repo）}"
+        # 清单本身交给调用方拷进仓库；脚本只管生成，不猜仓库在哪。
+        echo "清单已生成：/tmp/dsh-relay-gh-manifest/latest.json（要提交到仓库的 relay-updates/ 下）"
+    else
+        echo "镜像到 $base（$root）"
+        mirror_to "$root" "${base%/}"
+    fi
 done
 
 echo "已发布 $VERSION：$ROOT/latest.json"
