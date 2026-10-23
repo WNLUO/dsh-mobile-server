@@ -57,8 +57,13 @@ pub struct Config {
     pub self_update: bool,
     /// 查新版本的间隔（秒）。
     pub self_update_interval_seconds: u64,
-    /// 更新源基址，下面要能取到 `latest.json`。
-    pub self_update_source: String,
+    /// 更新源基址，按顺序试；每个下面要能取到 `latest.json`。
+    ///
+    /// `SELF_UPDATE_SOURCE` 支持逗号分隔的多条。它解决的是一个单点问题：一台机器的
+    /// 更新源写死成一个域名，那个域名倒了（或被墙了）这台机器就再也收不到更新，
+    /// 而它自己不会报错——只是日志里每天一条失败。国内与海外各放一个地址、按本机
+    /// 位置调整顺序，是这套东西唯一需要人做的判断。
+    pub self_update_sources: Vec<String>,
 }
 
 /// 读一个可以为 0 的整数环境变量；越界或非整数直接报错。
@@ -153,10 +158,13 @@ impl Config {
                 7 * 86_400,
             )?
             .max(86_400) as u64,
-            self_update_source: {
-                let value = env::var("SELF_UPDATE_SOURCE").unwrap_or_default();
-                value.trim().trim_end_matches('/').to_string()
-            },
+            // 逗号分隔，逐条去空白、去尾部斜杠、丢掉空项。顺序就是尝试顺序。
+            self_update_sources: env::var("SELF_UPDATE_SOURCE")
+                .unwrap_or_default()
+                .split(',')
+                .map(|part| part.trim().trim_end_matches('/').to_string())
+                .filter(|part| !part.is_empty())
+                .collect(),
         })
     }
 }
@@ -183,7 +191,7 @@ impl Default for Config {
             mirror_fallback_ms: 2_500,
             self_update: false,
             self_update_interval_seconds: 86_400,
-            self_update_source: String::new(),
+            self_update_sources: Vec::new(),
         }
     }
 }
@@ -199,9 +207,28 @@ mod tests {
     #[test]
     fn update_source_defaults_to_empty() {
         let config = Config::default();
-        assert_eq!(
-            config.self_update_source, "",
+        assert!(
+            config.self_update_sources.is_empty(),
             "更新源默认必须为空，不能指向任何真实域名"
+        );
+    }
+
+    /// 多个更新源：逗号分隔、按顺序、去空白与尾斜杠、丢空项。
+    #[test]
+    fn parses_multiple_update_sources_in_order() {
+        std::env::set_var(
+            "SELF_UPDATE_SOURCE",
+            " https://cn.example/relay-updates/ , ,https://us.example/relay-updates ",
+        );
+        let config = Config::from_env().expect("两条合法地址应该能读出来");
+        std::env::remove_var("SELF_UPDATE_SOURCE");
+        assert_eq!(
+            config.self_update_sources,
+            vec![
+                "https://cn.example/relay-updates".to_string(),
+                "https://us.example/relay-updates".to_string()
+            ],
+            "顺序必须保留：先国内后海外是部署方的决定"
         );
     }
 

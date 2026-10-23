@@ -1,7 +1,7 @@
 //! 中转自身的自动更新。
 //!
 //! 从一个**自己控制的静态地址**取新版本，下载对应架构的二进制，校验 sha256，
-//! 原子替换，然后退出让 systemd 拉起来。
+//! 原子替换，然后退出让服务管理器拉起来。
 //!
 //! ## 为什么不用 GitHub Release
 //!
@@ -13,27 +13,42 @@
 //! 代价照实说：这个地址是公开的，谁都能下载（校验和只防篡改，不防别人占用带宽）；
 //! 而且它得长期在——地址挂了，自动更新就只是日志里的一条失败，不影响转发。
 //!
+//! ## 多个更新源
+//!
+//! `SELF_UPDATE_SOURCE` 可以给一串地址（逗号分隔），按顺序试，第一个取到可用清单的
+//! 就算数。国内机器把国内源写前面、海外机器把海外源写前面，一台机器上同时配着两边
+//! 的地址——主源倒了不会变成「从此收不到更新」。海外走 GitHub 那条是实测过的：
+//! 法兰克福那台取 GitHub 资产比取国内更新源快一个数量级。
+//!
 //! ## 为什么是「替换文件 + 退出」，不是自己重启自己
 //!
 //! 进程没办法在保持监听的同时把自己的可执行文件换成新的。能做到的做法只有两种：
 //! 要么设 `PR_SET_PTRACER` 之后再 exec，要么让外部进程来管。这台中转的生产形态是
-//! `Restart=always` 的 systemd 服务，**退出就是重启**——把这件事交给已经存在的机制，
-//! 比自己实现一套 `exec` 简单得多，也不会因为 `exec` 失败留下一台僵尸进程。
+//! 一个进程管理器（systemd 的 `Restart=always` / OpenRC 的 `supervise-daemon`），
+//! **退出就是要它再拉一次**——把这件事交给已经存在的机制，比自己实现一套 `exec`
+//! 简单得多，也不会因为 `exec` 失败留下一台僵尸进程。重启请求用退出码 75
+//! （`EX_TEMPFAIL`，意思是「不是出错，请再拉起我」）。
 //!
-//! ## 回滚
+//! ## 回滚：判据是「新进程真能回答」，不是「文件写成功了」
 //!
-//! 替换前把旧文件改名留一份。新版本起来之后若 `/health` 拿不到 200，就换回旧文件
-//! 再退出一次。**判据是「新进程真的能回答」，不是「文件写成功了」**——写成功但起不来
-//! 才是自动更新最坏的形态：机器上没人，服务死了。
+//! 写成功但起不来才是自动更新最坏的形态：机器上没人，服务死了，而且管理器会把那个
+//! 坏文件无限重启下去。所以这里有两道闸：
 //!
-//! 回滚状态记录在 `数据目录/.update-state` 里：新版起不来时它会留下一条记录，
-//! 下一次启动读到这里就**不再尝试升级**，直到那个文件被删掉（说明人已经上去看过了）。
+//!   1. **自己验**。换上新文件后退出，新版起来、绑上端口、再自己打一次 `/healthz`
+//!      拿到 200，才算这次升级成立。拿不到就当场把上一版换回来并退出。
+//!   2. **数次数**。新版如果在「验明」之前就死了（panic、配置错、缺依赖），这次启动
+//!      根本走不到上面那步。所以每次启动都会先把「我已经试过一次」记在盘上：
+//!      同一份新版本连续两次没验明，第二次启动时直接把上一版换回来。
+//!
+//! 换回上一版之后写一条回滚记录，**之后不再自动升级**，直到那个状态文件被人删掉
+//! （说明有人上来看过了）。状态记在数据目录的 `.update-state` 里，纯文本、不依赖
+//! 控制台的数据库——纯转发的机器（没开 `PLATFORM_ENABLED`）也要能用自动更新。
 //!
 //! ## 校验的边界
 //!
-//! `checksums.txt` 和二进制放在同一个 Release 里，能挡住传输损坏（下载到一半、
-//! 被中间设备改写），**挡不住同时改了这两个文件的人**。真要防那个得上签名，
-//! 那要引入密钥管理与轮换，对一台自发布的中转来说成本远大于收益。
+//! 校验和与二进制放在同一份清单里，能挡住传输损坏（下载到一半、被中间设备改写），
+//! **挡不住同时改了这两个文件的人**。真要防那个得上签名，那要引入密钥管理与轮换，
+//! 对一台自发布的中转来说成本远大于收益。
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -45,10 +60,20 @@ use serde::Deserialize;
 // 这里曾经留着一个指向我们自己运营机的常量，虽然没人引用，但它出现在对外发布的代码里
 // 就是一句误导——跟着抄的人会把自己的中转配到别人的域名上。
 
-/// 回滚记录的键。有值＝上一次升级之后没健康起来，别再自动升级。
-const POISON_KEY: &str = "self_update_rollback";
+/// 升级状态文件，放在数据目录里。
+const STATE_FILE: &str = ".update-state";
 
-/// GitHub 的匿名接口限制每小时 60 次/IP。默认一天一次，怎么算都够。
+/// 同一份新版本连续起不到这个次数还没验明，就认为它在这台机器上不能用。
+///
+/// 2 是刻意的：给一次「第一次起得慢/被系统杀」的容错，又不至于让一台起不来的机器
+/// 被重启几十次之后才恢复。
+const MAX_START_ATTEMPTS: u32 = 2;
+
+/// 「请再拉起我」的退出码。用非零码是为了让所有进程管理器都当它是异常退出而重试，
+/// 而不是「正常结束、不用管了」。
+pub const EXIT_RESTART: i32 = 75;
+
+/// 查新版本的默认间隔。默认一天一次，怎么算都够。
 const DEFAULT_INTERVAL: Duration = Duration::from_secs(24 * 3600);
 
 /// 当前编译出来的目标三元组里的架构段。只支持跑在 Linux 上的两种。
@@ -142,6 +167,226 @@ pub fn plan(current: &str, manifest_text: &str, arch: &str) -> Result<Plan, Stri
     })
 }
 
+// ── 升级状态：纯文本，落在数据目录 ────────────────────────────────
+
+/// 升级状态。字段都是短字符串，直接写成 `key=value` 一行一条。
+///
+/// 为什么不放数据库：纯转发的中转没有控制台、没有 sqlite，而自动更新跟转发一样是
+/// 基础能力。早先它依赖控制台的库，结果「没开控制台的机器打开自动更新只会打一行
+/// 日志然后跳过」——能力写在文档里，实际不生效。
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct UpdateState {
+    /// 已经换上去、但还没验证过的新版本号。空＝没有待验证的升级。
+    pub pending: String,
+    /// 这个待验证版本已经启动过几次。
+    pub attempts: u32,
+    /// 最后一个「验明」成功的版本号。
+    pub confirmed: String,
+    /// 非空＝上一次升级失败过，别再自动升级，等人来看。
+    pub rollback: String,
+}
+
+impl UpdateState {
+    pub fn parse(text: &str) -> Self {
+        let mut state = UpdateState::default();
+        for line in text.lines() {
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            let value = value.trim();
+            match key.trim() {
+                "pending" => state.pending = value.to_string(),
+                "attempts" => state.attempts = value.parse().unwrap_or(0),
+                "confirmed" => state.confirmed = value.to_string(),
+                "rollback" => state.rollback = value.to_string(),
+                _ => {}
+            }
+        }
+        state
+    }
+
+    pub fn render(&self) -> String {
+        format!(
+            "pending={}\nattempts={}\nconfirmed={}\nrollback={}\n",
+            self.pending, self.attempts, self.confirmed, self.rollback
+        )
+    }
+}
+
+/// 升级用到的那两个路径。分开传是为了让下面那些纯函数能被单测直接钉。
+#[derive(Debug, Clone)]
+pub struct Paths {
+    /// 正在运行的那个可执行文件。上一版就放在它边上的 `.previous`。
+    pub exe: PathBuf,
+    /// 数据目录，状态文件与下载的临时文件都放这里。
+    pub data_dir: PathBuf,
+}
+
+impl Paths {
+    pub fn state_path(&self) -> PathBuf {
+        self.data_dir.join(STATE_FILE)
+    }
+
+    pub fn previous(&self) -> PathBuf {
+        self.exe.with_extension("previous")
+    }
+
+    pub fn load(&self) -> UpdateState {
+        std::fs::read_to_string(self.state_path())
+            .map(|text| UpdateState::parse(&text))
+            .unwrap_or_default()
+    }
+
+    pub fn save(&self, state: &UpdateState) -> Result<(), String> {
+        std::fs::create_dir_all(&self.data_dir)
+            .map_err(|e| format!("建数据目录失败 {}: {e}", self.data_dir.display()))?;
+        let path = self.state_path();
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, state.render())
+            .map_err(|e| format!("写升级状态失败 {}: {e}", tmp.display()))?;
+        // 先落盘再换名：这个文件是回滚判据，写到一半比没有更糟。
+        if let Ok(file) = std::fs::File::open(&tmp) {
+            let _ = file.sync_all();
+        }
+        std::fs::rename(&tmp, &path)
+            .map_err(|e| format!("换上升级状态失败 {}: {e}", path.display()))
+    }
+}
+
+/// 启动时该做什么。纯函数，只看「盘上的状态 + 我现在是哪个版本」。
+#[derive(Debug, PartialEq)]
+pub enum Startup {
+    /// 干净启动，没有待验证的升级。
+    Idle,
+    /// 我就是那个待验证的新版本，第一次启动。起得来之后要调 `confirm`。
+    Verify,
+    /// 这个版本已经验明过了。
+    Confirmed,
+    /// 这个版本已经准备好被接受——但它是上一轮留下的、验明了的版本。
+    Stranded { pending: String },
+    /// 新版本连续起不来：把上一版换回来。
+    Revert { pending: String },
+    /// 上一轮已经失败过，停手。
+    Stopped { reason: String },
+}
+
+/// 决定这次启动该怎么走。
+pub fn decide(state: &UpdateState, current: &str) -> Startup {
+    if !state.rollback.is_empty() {
+        return Startup::Stopped {
+            reason: state.rollback.clone(),
+        };
+    }
+    if state.pending.is_empty() {
+        return Startup::Idle;
+    }
+    if state.pending != current {
+        // 盘上说该跑 X，可我是 Y。正常流程里只会出现在「人手动把旧文件换回来了」，
+        // 或者替换之后管理器拿到的是一个不相干的文件。不碰文件，留一条记录停手。
+        return Startup::Stranded {
+            pending: state.pending.clone(),
+        };
+    }
+    if state.confirmed == current {
+        return Startup::Confirmed;
+    }
+    if state.attempts + 1 >= MAX_START_ATTEMPTS {
+        return Startup::Revert {
+            pending: state.pending.clone(),
+        };
+    }
+    Startup::Verify
+}
+
+/// 启动时调一次，把「这次启动」记到盘上，并返回该怎么走。
+///
+/// 真正的判定在 `decide` 里；这里只负责记账（attempts 必须**在绑定端口之前**落盘，
+/// 否则一个绑不上端口就死的版本永远轮不到「第二次」）。
+pub fn note_start(paths: &Paths, current: &str) -> Startup {
+    let mut state = paths.load();
+    let decision = decide(&state, current);
+    match &decision {
+        Startup::Verify => {
+            state.attempts += 1;
+            if let Err(error) = paths.save(&state) {
+                // 记不上账就没法保证回滚判据成立。宁可这轮不升级，也不要在
+                // 「不知道自己试过几次」的状态下替换生产文件。
+                crate::tunnel::log(format!("升级状态写不进去，跳过验证：{error}"));
+                return Startup::Idle;
+            }
+        }
+        Startup::Stranded { pending } => {
+            state.rollback = format!("升级到 {pending} 后起来的是 {current}");
+            state.pending = String::new();
+            state.attempts = 0;
+            if let Err(error) = paths.save(&state) {
+                crate::tunnel::log(format!("回滚记录写不进去：{error}"));
+            }
+        }
+        _ => {}
+    }
+    decision
+}
+
+/// 新版验明成功：记下它，清掉待验证标记。
+pub fn confirm(paths: &Paths, version: &str) {
+    let mut state = paths.load();
+    state.pending = String::new();
+    state.attempts = 0;
+    state.confirmed = version.to_string();
+    if let Err(error) = paths.save(&state) {
+        crate::tunnel::log(format!("升级确认写不进去：{error}"));
+    }
+}
+
+/// 把上一版换回来，并留下「别再自动升级」的记录。
+///
+/// 返回 true 表示文件已经换好（调用方应当退出，让管理器拉起上一版）。
+///
+/// 换名不会撞上 `Text file busy`：Linux 允许 rename 一个正在被执行的文件，只有写它
+/// 才会被拒。这点是这个方案能成立的前提。
+pub fn revert(paths: &Paths, pending: &str, reason: &str) -> bool {
+    let previous = paths.previous();
+    let mut state = paths.load();
+    state.pending = String::new();
+    state.attempts = 0;
+    state.rollback = format!("{pending} 在这台机器上没起来（{reason}）");
+
+    if !previous.exists() {
+        // 没有上一版可换。那就别动文件，只把停手的记录留下——继续跑当前这个
+        // 至少还有个能服务的进程。
+        crate::tunnel::log(format!(
+            "升级失败（{reason}），但 {} 不存在，没有可回滚的版本；已停止后续自动更新",
+            previous.display()
+        ));
+        let _ = paths.save(&state);
+        return false;
+    }
+
+    let failed = paths.exe.with_extension("failed");
+    let _ = std::fs::remove_file(&failed);
+    if let Err(error) = std::fs::rename(&paths.exe, &failed) {
+        crate::tunnel::log(format!("把坏版本挪开失败：{error}；已停止后续自动更新"));
+        let _ = paths.save(&state);
+        return false;
+    }
+    if let Err(error) = std::fs::rename(&previous, &paths.exe) {
+        // 换不回来就赶紧把坏版本放回原位，至少文件还在（虽然它起不来）。
+        let _ = std::fs::rename(&failed, &paths.exe);
+        crate::tunnel::log(format!("回滚失败：{error}；已停止后续自动更新"));
+        let _ = paths.save(&state);
+        return false;
+    }
+
+    crate::tunnel::log(format!(
+        "已把失败的新版本（{pending}）换回上一版（{reason}）。服务会重启成旧版本；\
+         查清楚后删掉 {} 再重启，自动更新才会恢复",
+        paths.state_path().display()
+    ));
+    let _ = paths.save(&state);
+    true
+}
+
 /// 升级任务。由 `main` 在启动时 spawn，默认不启用。
 pub fn spawn_self_update(ctx: UpdateContext) {
     if !ctx.enabled {
@@ -149,10 +394,12 @@ pub fn spawn_self_update(ctx: UpdateContext) {
     }
     tokio::spawn(async move {
         // 先看是不是上次升级没起来。是的话**这轮直接不升**，等人上来看。
-        if let Some(reason) = ctx.store.get_setting(POISON_KEY) {
+        let state = ctx.paths.load();
+        if !state.rollback.is_empty() {
             crate::tunnel::log(format!(
-                "上一次自动更新没有成功启动（{reason}），本轮不再自动升级。查清楚后删掉 {} 再重启",
-                ctx.state_path().display()
+                "上一次自动更新没有成功（{}），本轮不再自动升级。查清楚后删掉 {} 再重启",
+                state.rollback,
+                ctx.paths.state_path().display()
             ));
             return;
         }
@@ -176,17 +423,9 @@ pub fn spawn_self_update(ctx: UpdateContext) {
 pub struct UpdateContext {
     pub enabled: bool,
     pub interval: Duration,
-    /// 更新源基址：下面要能取到 `latest.json`。末尾斜杠无所谓。
-    pub source: String,
-    pub store: crate::store::Store,
-    /// 数据目录；回滚记录与下载的临时文件都放这里。
-    pub data_dir: PathBuf,
-}
-
-impl UpdateContext {
-    fn state_path(&self) -> PathBuf {
-        self.data_dir.join(".update-state")
-    }
+    /// 更新源基址，按顺序试。每个下面都要能取到 `latest.json`。末尾斜杠无所谓。
+    pub sources: Vec<String>,
+    pub paths: Paths,
 }
 
 /// 查一次、能升就升。返回升级到的版本（调用前已经把文件换好并准备退出）。
@@ -205,33 +444,75 @@ pub async fn check_and_apply(ctx: &UpdateContext) -> Result<Option<String>, Stri
         .build()
         .map_err(|e| e.to_string())?;
 
-    let manifest_url = format!("{}/latest.json", ctx.source.trim_end_matches('/'));
-    let manifest_text = client
-        .get(&manifest_url)
-        .send()
-        .await
-        .map_err(|e| format!("问 {manifest_url} 失败：{e}"))?
-        .error_for_status()
-        .map_err(|e| format!("latest.json HTTP 错误：{e}"))?
-        .text()
-        .await
-        .map_err(|e| format!("latest.json 读取失败：{e}"))?;
-
     let current = env!("CARGO_PKG_VERSION");
-    match plan(current, &manifest_text, arch)? {
-        Plan::UpToDate => Ok(None),
-        Plan::Upgrade {
-            version,
-            url,
-            sha256,
-        } => {
+    let (upgrade, errors) = first_manifest(&client, &ctx.sources, current, arch).await?;
+    match upgrade {
+        Some((version, url, sha256)) => {
             crate::tunnel::log(format!(
                 "发现新版本 {version}（当前 {current}），开始下载"
             ));
             apply(ctx, &client, &version, &url, &sha256).await?;
             Ok(Some(version))
         }
+        None => {
+            if !errors.is_empty() {
+                // 每个源都试过了、都没成。把原因一并打出来：只有一个源的时候这条
+                // 日志就是唯一线索。
+                return Err(errors.join("；"));
+            }
+            Ok(None)
+        }
     }
+}
+
+/// 依次问各个更新源，返回第一个能用的升级计划。
+///
+/// 全部失败时返回 `Ok((None, 原因列表))` 而不是 Err：多个源里有一个挂了不代表这台
+/// 机器出了问题，调用方只记日志就够了。
+async fn first_manifest(
+    client: &reqwest::Client,
+    sources: &[String],
+    current: &str,
+    arch: &str,
+) -> Result<(Option<(String, String, String)>, Vec<String>), String> {
+    if sources.is_empty() {
+        return Err("没有配置更新源（SELF_UPDATE_SOURCE 为空）".into());
+    }
+    let mut errors = Vec::new();
+    for source in sources {
+        let manifest_url = format!("{}/latest.json", source.trim_end_matches('/'));
+        let text = match client.get(&manifest_url).send().await {
+            Ok(response) => match response.error_for_status() {
+                Ok(response) => match response.text().await {
+                    Ok(text) => text,
+                    Err(error) => {
+                        errors.push(format!("{manifest_url} 读取失败：{error}"));
+                        continue;
+                    }
+                },
+                Err(error) => {
+                    errors.push(format!("{manifest_url} HTTP 错误：{error}"));
+                    continue;
+                }
+            },
+            Err(error) => {
+                errors.push(format!("{manifest_url} 连不上：{error}"));
+                continue;
+            }
+        };
+        match plan(current, &text, arch) {
+            Ok(Plan::UpToDate) => return Ok((None, Vec::new())),
+            Ok(Plan::Upgrade {
+                version,
+                url,
+                sha256,
+            }) => return Ok((Some((version, url, sha256)), Vec::new())),
+            Err(error) => {
+                errors.push(format!("{manifest_url}：{error}"));
+            }
+        }
+    }
+    Ok((None, errors))
 }
 
 /// 下载、校验、替换。失败时**不留下任何半截状态**。
@@ -242,7 +523,8 @@ async fn apply(
     url: &str,
     expected: &str,
 ) -> Result<(), String> {
-    std::fs::create_dir_all(&ctx.data_dir).map_err(|e| format!("建数据目录失败：{e}"))?;
+    std::fs::create_dir_all(&ctx.paths.data_dir)
+        .map_err(|e| format!("建数据目录失败：{e}"))?;
 
     let bytes = client
         .get(url)
@@ -263,30 +545,41 @@ async fn apply(
         ));
     }
 
-    let staging = ctx.data_dir.join(format!(".dsh-relay-{version}.new"));
+    let staging = ctx
+        .paths
+        .data_dir
+        .join(format!(".dsh-relay-{version}.new"));
     write_executable(&staging, &bytes)?;
 
-    let exe = std::env::current_exe().map_err(|e| format!("拿不到当前程序路径：{e}"))?;
-    let backup = exe.with_extension("previous");
+    // 先把「待验证」落盘，再动文件。反过来的话，进程在两次 rename 之间被杀掉，
+    // 盘上就是一个没人认领的新文件。
+    let mut state = ctx.paths.load();
+    state.pending = version.to_string();
+    state.attempts = 0;
+    state.confirmed = String::new();
+    state.rollback = String::new();
+    ctx.paths.save(&state)?;
+
+    let exe = &ctx.paths.exe;
+    let backup = ctx.paths.previous();
     // 旧文件改名留一份：这是回滚的唯一依据。
     if backup.exists() {
         let _ = std::fs::remove_file(&backup);
     }
-    std::fs::rename(&exe, &backup).map_err(|e| format!("备份旧版本失败：{e}"))?;
-    if let Err(error) = std::fs::rename(&staging, &exe) {
+    std::fs::rename(exe, &backup).map_err(|e| format!("备份旧版本失败：{e}"))?;
+    if let Err(error) = std::fs::rename(&staging, exe) {
         // 换不上去就把旧的放回原位，别留下一台没有可执行文件的中转。
-        let _ = std::fs::rename(&backup, &exe);
+        let _ = std::fs::rename(&backup, exe);
+        state.pending = String::new();
+        let _ = ctx.paths.save(&state);
         return Err(format!("替换失败，已回滚：{error}"));
     }
 
-    // 记下「这次升级还没被验证过」。新版本如果健健康康起来，启动时会清掉这条。
-    ctx.store
-        .set_setting("self_update_pending", version);
     crate::tunnel::log(format!(
-        "已替换为 {version}，退出后由 systemd 拉起新版"
+        "已替换为 {version}，退出后由服务管理器拉起新版并自检"
     ));
-    // 直接退出：`Restart=always` 的服务管理器会立刻再拉一次。
-    std::process::exit(0);
+    // 直接退出：管理器立刻再拉一次。用 75 是为了让「正常结束不重启」的管理器也重试。
+    std::process::exit(EXIT_RESTART);
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -312,36 +605,44 @@ fn write_executable(path: &Path, bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-/// 启动时调一次：处理「上次替换上去的新版本到底起没起来」。
+/// 自己问自己一句 `/healthz`。
 ///
-/// 约定：
-///   - `self_update_pending` 有值、且这次启动的是**那个新版本** → 说明它起来了，
-///     清掉待验证标记，升级成功。
-///   - `self_update_pending` 有值、但当前版本**不是**它 → 说明新版本没起来，
-///     systemd 拉起来的是回滚后的旧文件（或人手动换回来了）。留一条回滚记录，
-///     以后的自动更新一律停手，等人上来看。
-///
-/// 必须在那之后调用 `verify_health`：光「进程起来了」不等于「服务能用」。
-pub fn finish_pending_update(store: &crate::store::Store, current: &str) -> Option<String> {
-    // 空值＝没有待验证的升级。**必须先判这个**：早先的写法拿到空串就往下走，
-    // 拿空版本号跟自己比，必然不等，于是把一次成功的升级误判成失败、还去改
-    // 「不再自动升级」的标记。上线前的测试里撞到过（同一份库被两个进程用，
-    // 一个刚把标记清掉、另一个立刻把它读成失败）。
-    let pending = store.get_setting("self_update_pending")?;
-    let pending = pending.trim().to_string();
-    if pending.is_empty() {
-        return None;
+/// 这是「新进程真的能回答」那个判据的落地：绑上端口还不算，真发一个请求、真拿到
+/// `ok` 才算。连不上就重试几次——刚 bind 完到 accept 循环开跑之间有毫秒级窗口，
+/// 那不叫起不来。
+pub async fn probe_health(host: &str, port: u16) -> bool {
+    let target = if host == "0.0.0.0" || host == "::" || host.trim().is_empty() {
+        "127.0.0.1".to_string()
+    } else {
+        host.to_string()
+    };
+    for _ in 0..10 {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let Ok(mut stream) = tokio::net::TcpStream::connect((target.as_str(), port)).await else {
+            continue;
+        };
+        let request = format!(
+            "GET /healthz HTTP/1.1\r\nHost: {target}\r\nConnection: close\r\n\r\n"
+        );
+        if tokio::io::AsyncWriteExt::write_all(&mut stream, request.as_bytes())
+            .await
+            .is_err()
+        {
+            continue;
+        }
+        let mut response = Vec::new();
+        if tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut response)
+            .await
+            .is_err()
+        {
+            continue;
+        }
+        let text = String::from_utf8_lossy(&response);
+        if text.starts_with("HTTP/1.1 200") && text.trim_end().ends_with("ok") {
+            return true;
+        }
     }
-    store.set_setting("self_update_pending", "");
-    if pending == current {
-        crate::tunnel::log(format!("自动更新到 {current} 成功"));
-        return None;
-    }
-    store.set_setting(POISON_KEY, &format!("升级到 {pending} 后回来的是 {current}"));
-    crate::tunnel::log(format!(
-        "自动更新到 {pending} 没有成功启动（现在是 {current}），已停止后续自动更新"
-    ));
-    Some(pending)
+    false
 }
 
 #[cfg(test)]
@@ -354,6 +655,24 @@ mod tests {
         format!(
             r#"{{"version":"{version}","binaries":{{"{arch}":{{"url":"https://example.com/dsh-relay-linux-{arch}","sha256":"{HASH}"}}}}}}"#
         )
+    }
+
+    fn paths_at(dir: &Path) -> Paths {
+        Paths {
+            exe: dir.join("dsh-relay"),
+            data_dir: dir.join("data"),
+        }
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "dsh-relay-selfupdate-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 
     #[test]
@@ -409,31 +728,160 @@ mod tests {
         let _ = asset_name();
     }
 
-    /// 升级没起来：记一条，之后不再自动升级，直到人处理。
     #[test]
-    fn failed_upgrade_poisons_future_attempts() {
-        let store = crate::store::Store::in_memory().unwrap();
-        store.set_setting("self_update_pending", "0.2.0");
-        let failed = finish_pending_update(&store, "0.1.0");
-        assert_eq!(failed.as_deref(), Some("0.2.0"));
-        assert!(store.get_setting(POISON_KEY).is_some(), "必须留下回滚记录");
-        assert_eq!(store.get_setting("self_update_pending").as_deref(), Some(""), "待验证标记要清掉");
+    fn state_round_trips() {
+        let state = UpdateState {
+            pending: "0.2.0".into(),
+            attempts: 3,
+            confirmed: "0.1.9".into(),
+            rollback: "坏的".into(),
+        };
+        assert_eq!(UpdateState::parse(&state.render()), state);
+        // 空文件与垃圾行都退化成默认值，不 panic。
+        assert_eq!(UpdateState::parse(""), UpdateState::default());
+        assert_eq!(UpdateState::parse("garbage\nx=\n"), UpdateState::default());
     }
 
-    /// 空标记＝没有待验证的升级，**不能**被当成失败。
+    /// 干净的四条路：没升级、第一次验、验明过、上一轮崩了要回滚。
     #[test]
-    fn empty_pending_is_not_a_failure() {
-        let store = crate::store::Store::in_memory().unwrap();
-        store.set_setting("self_update_pending", "");
-        assert_eq!(finish_pending_update(&store, "0.1.1"), None);
-        assert!(store.get_setting(POISON_KEY).is_none(), "空值绝不能写回滚标记");
+    fn decide_covers_the_four_states() {
+        let clean = UpdateState::default();
+        assert_eq!(decide(&clean, "0.1.7"), Startup::Idle);
+
+        let first = UpdateState {
+            pending: "0.1.8".into(),
+            ..Default::default()
+        };
+        assert_eq!(decide(&first, "0.1.8"), Startup::Verify);
+
+        let confirmed = UpdateState {
+            pending: "0.1.8".into(),
+            confirmed: "0.1.8".into(),
+            ..Default::default()
+        };
+        assert_eq!(decide(&confirmed, "0.1.8"), Startup::Confirmed);
+
+        // 第一次启动时 attempts 已经记成 1（进程随后就死了），这是第二次。
+        let died_once = UpdateState {
+            pending: "0.1.8".into(),
+            attempts: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            decide(&died_once, "0.1.8"),
+            Startup::Revert { pending: "0.1.8".into() },
+            "同一版本连续两次没验明就必须回滚"
+        );
+    }
+
+    /// 盘上说该跑 0.1.8，可起来的是 0.1.7：不碰文件，留记录停手。
+    #[test]
+    fn wrong_version_marks_rollback_without_touching_files() {
+        let state = UpdateState {
+            pending: "0.1.8".into(),
+            attempts: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            decide(&state, "0.1.7"),
+            Startup::Stranded { pending: "0.1.8".into() }
+        );
     }
 
     #[test]
-    fn successful_upgrade_clears_pending() {
-        let store = crate::store::Store::in_memory().unwrap();
-        store.set_setting("self_update_pending", "0.2.0");
-        assert_eq!(finish_pending_update(&store, "0.2.0"), None);
-        assert!(store.get_setting(POISON_KEY).is_none(), "成功就不该有毒标记");
+    fn started_attempts_are_recorded_before_binding() {
+        let dir = temp_dir("attempts");
+        let paths = paths_at(&dir);
+        std::fs::create_dir_all(&paths.data_dir).unwrap();
+        paths
+            .save(&UpdateState {
+                pending: "0.1.8".into(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        assert_eq!(note_start(&paths, "0.1.8"), Startup::Verify);
+        assert_eq!(paths.load().attempts, 1, "第一次启动要落盘记一次");
+
+        // 第二次启动：这时候上一次已经死了，得判定为回滚。
+        assert_eq!(
+            note_start(&paths, "0.1.8"),
+            Startup::Revert { pending: "0.1.8".into() }
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn confirm_clears_pending_and_keeps_version() {
+        let dir = temp_dir("confirm");
+        let paths = paths_at(&dir);
+        std::fs::create_dir_all(&paths.data_dir).unwrap();
+        paths
+            .save(&UpdateState {
+                pending: "0.1.8".into(),
+                attempts: 1,
+                ..Default::default()
+            })
+            .unwrap();
+        confirm(&paths, "0.1.8");
+        let state = paths.load();
+        assert_eq!(state.pending, "");
+        assert_eq!(state.attempts, 0);
+        assert_eq!(state.confirmed, "0.1.8");
+        assert!(state.rollback.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 回滚必须真的把 `.previous` 换回去，并且留下「别再升级」的记录。
+    #[test]
+    fn revert_restores_previous_and_poisons_future_attempts() {
+        let dir = temp_dir("revert");
+        let paths = paths_at(&dir);
+        std::fs::create_dir_all(&paths.data_dir).unwrap();
+        std::fs::write(&paths.exe, b"new-broken").unwrap();
+        std::fs::write(paths.previous(), b"old-good").unwrap();
+        paths
+            .save(&UpdateState {
+                pending: "0.1.8".into(),
+                attempts: 1,
+                ..Default::default()
+            })
+            .unwrap();
+
+        assert!(revert(&paths, "0.1.8", "健康检查没过"));
+        assert_eq!(std::fs::read(&paths.exe).unwrap(), b"old-good", "盘上必须是旧版本");
+        assert_eq!(std::fs::read(paths.exe.with_extension("failed")).unwrap(), b"new-broken");
+
+        let state = paths.load();
+        assert_eq!(state.pending, "");
+        assert!(state.rollback.contains("0.1.8"), "{:?}", state.rollback);
+        // 之后就再也不动了。
+        assert!(matches!(decide(&state, "0.1.7"), Startup::Stopped { .. }));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 没有 `.previous` 时不能把正在跑的文件挪走——挪走就真没程序了。
+    #[test]
+    fn revert_without_previous_leaves_files_alone() {
+        let dir = temp_dir("noprev");
+        let paths = paths_at(&dir);
+        std::fs::create_dir_all(&paths.data_dir).unwrap();
+        std::fs::write(&paths.exe, b"only-one").unwrap();
+
+        assert!(!revert(&paths, "0.1.8", "没起来"));
+        assert_eq!(std::fs::read(&paths.exe).unwrap(), b"only-one");
+        assert!(!paths.load().rollback.is_empty(), "还是要停手，别再试");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 多个更新源：第一个连不上就往下试，不能因为主源挂了就收不到更新。
+    #[test]
+    fn sources_are_tried_in_order() {
+        // 这里只钉「空源要报错」这条——真正的网络失败顺序由集成测试兜。
+        let _ = temp_dir("sources");
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let client = reqwest::Client::new();
+        let result = runtime.block_on(first_manifest(&client, &[], "0.1.7", "x86_64"));
+        assert!(result.unwrap_err().contains("SELF_UPDATE_SOURCE"));
     }
 }

@@ -3,13 +3,19 @@
 //! 控制台（`PLATFORM_ENABLED=1`）是可选的：打开时它接管 `/api/platform/v1/**` 与
 //! `/platform/**`，并提供隧道准入；关着的时候就是纯转发。
 //!
-//! 自动更新（`SELF_UPDATE=1`）也是可选的，而且**默认关**。
+//! 自动更新（`SELF_UPDATE=1`）也是可选的，而且**默认关**。它跟控制台无关：纯转发的
+//! 机器一样能自己升级——状态记在数据目录的一个纯文本文件里，不碰数据库。
+//!
+//! 启动顺序里有一件事是「先绑端口、再自检」：如果上一次升级换上去的新版本需要被验证，
+//! 得先把服务跑起来、自己问自己一句 `/healthz`，才谈得上「它到底行不行」。绑不上端口
+//! 的版本会自己死掉，那由下一轮启动的记账兜住（见 `selfupdate`）。
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use dsh_relay::config::Config;
 use dsh_relay::console::config::ConsoleConfig;
+use dsh_relay::selfupdate::{self, Paths, Startup};
 use dsh_relay::tunnel::{log, TunnelSlot};
 
 #[tokio::main]
@@ -35,7 +41,8 @@ async fn main() {
     // 控制台：默认关闭。配置不全时只打警告、不挡转发——中转的首要职责是转发，
     // 登录配置缺了不该让整台服务起不来。
     let console_config = ConsoleConfig::from_env();
-    let mut update_store = None;
+    // 升级状态与下载的临时文件放数据目录。跟着控制台的库路径走，这样老部署
+    // （`PLATFORM_DB_PATH` 指到 /opt/.../data）不用改一行配置。
     let data_dir = std::path::PathBuf::from(&console_config.db_path)
         .parent()
         .map(|p| p.to_path_buf())
@@ -57,7 +64,6 @@ async fn main() {
                 }
                 // 每天清一次过期会话与过期登录事务，别让它无限长。
                 dsh_relay::console::node::spawn_housekeeping(console.store.clone());
-                update_store = Some(console.store.clone());
                 dsh_relay::install_console(console);
                 log(format!(
                     "控制台已开启 api={} web={}",
@@ -68,12 +74,14 @@ async fn main() {
         }
     }
 
-    // 上一次升级到底成没成：进程活了就算成了一半，另一半要看端口能不能答。
-    // 判定放在监听成功之后做，见下面。
-    let pending_after_bind = update_store
-        .as_ref()
-        .map(|store| dsh_relay::selfupdate::finish_pending_update(store, env!("CARGO_PKG_VERSION")))
-        .unwrap_or(None);
+    // 升级状态：是不是有一个换了上去、还没验证过的新版本在等这次启动。
+    // 记账必须在绑定端口**之前**落盘：一个绑不上端口就死的版本，要靠这一次记账
+    // 才能在下一次启动时被认出来。
+    let paths = Paths {
+        exe: std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("dsh-relay")),
+        data_dir: data_dir.clone(),
+    };
+    let startup = selfupdate::note_start(&paths, env!("CARGO_PKG_VERSION"));
 
     let listener = match tokio::net::TcpListener::bind((config.host.as_str(), config.port)).await {
         Ok(listener) => listener,
@@ -83,56 +91,88 @@ async fn main() {
         }
     };
 
-    // 绑上端口 = 这台服务真的能用了。到这一步才敢说上次那次升级是成功的。
-    if let Some(previous) = pending_after_bind {
-        // 能走到这里说明**没**被判定为失败，只是留个记录方便排查。
-        log(format!("上次自动更新（{previous}）已经正常接管"));
+    // 接受连接的循环先跑起来，后面的健康自检要真的打一个请求进来。
+    {
+        let slot = slot.clone();
+        tokio::spawn(async move {
+            loop {
+                let (stream, _peer) = match listener.accept().await {
+                    Ok(pair) => pair,
+                    Err(error) => {
+                        log(format!("accept 失败：{error}"));
+                        continue;
+                    }
+                };
+                let slot = slot.clone();
+                tokio::spawn(async move {
+                    let _ = dsh_relay::serve_connection(stream, slot).await;
+                });
+            }
+        });
+    }
+
+    match startup {
+        Startup::Verify => {
+            // 换上去的新版本第一次起来。**能不能答**才叫起来了，绑上端口不算。
+            let ok = selfupdate::probe_health(&config.host, config.port).await;
+            if ok {
+                selfupdate::confirm(&paths, env!("CARGO_PKG_VERSION"));
+                log(format!(
+                    "自动更新到 {} 成功（/healthz 已能应答）",
+                    env!("CARGO_PKG_VERSION")
+                ));
+            } else {
+                let pending = env!("CARGO_PKG_VERSION").to_string();
+                selfupdate::revert(&paths, &pending, "启动后 /healthz 拿不到 200");
+                std::process::exit(selfupdate::EXIT_RESTART);
+            }
+        }
+        Startup::Confirmed => {}
+        Startup::Stranded { pending } => {
+            log(format!(
+                "盘上记着待验证的升级 {pending}，但这次起来的是 {}；已停止后续自动更新",
+                env!("CARGO_PKG_VERSION")
+            ));
+        }
+        Startup::Revert { pending } => {
+            selfupdate::revert(&paths, &pending, "同一版本连续两次启动都没验明");
+            std::process::exit(selfupdate::EXIT_RESTART);
+        }
+        Startup::Stopped { reason } => {
+            log(format!("上一次自动更新失败过（{reason}），本轮不再自动升级"));
+        }
+        Startup::Idle => {}
     }
 
     if config.self_update {
         // 开了自动更新却没给更新源：**拒绝启动**，不静默跳过。
         // 静默跳过会让人以为「开着」，真出事时才发现从没生效过；更早的版本还会默认去
-        // 别人的域名拉包（见 config.rs 里 DEFAULT_SELF_UPDATE_SOURCE 的注释）。这两种都
-        // 比一句启动报错糟得多。
-        if config.self_update_source.trim().is_empty() {
+        // 别人的域名拉包（见 config.rs 里更新源默认值为空的注释）。这两种都比一句
+        // 启动报错糟得多。
+        if config.self_update_sources.is_empty() {
             eprintln!(
                 "错误：SELF_UPDATE=1 但没设 SELF_UPDATE_SOURCE。自动更新要从一个你控制的\
                  静态目录取 latest.json，不设就不知道去哪取。\
                  \n  例：SELF_UPDATE_SOURCE=https://your-domain.example/relay-updates\
+                 \n  多个源用逗号分隔，按顺序试。\
                  \n  不想用自动更新就别设 SELF_UPDATE。"
             );
             std::process::exit(1);
         }
-        match update_store.clone() {
-            Some(store) => {
-                log(format!(
-                    "自动更新已开启：每 {} 小时检查一次",
-                    config.self_update_interval_seconds / 3600
-                ));
-                dsh_relay::selfupdate::spawn_self_update(dsh_relay::selfupdate::UpdateContext {
-                    enabled: true,
-                    interval: Duration::from_secs(config.self_update_interval_seconds),
-                    source: config.self_update_source.clone(),
-                    store,
-                    data_dir,
-                });
-            }
-            // 没有退出标记的存储。宁可不动，也不要在不确定的状态下替换生产文件。
-            None => log("自动更新已开启但没有可用的数据目录，已跳过".to_string()),
-        }
-    }
-
-    loop {
-        let (stream, _peer) = match listener.accept().await {
-            Ok(pair) => pair,
-            Err(error) => {
-                log(format!("accept 失败：{error}"));
-                continue;
-            }
-        };
-        let slot = slot.clone();
-        tokio::spawn(async move {
-            let _ = dsh_relay::serve_connection(stream, slot).await;
+        log(format!(
+            "自动更新已开启：每 {} 小时检查一次，源 {}",
+            config.self_update_interval_seconds / 3600,
+            config.self_update_sources.join(" → ")
+        ));
+        selfupdate::spawn_self_update(selfupdate::UpdateContext {
+            enabled: true,
+            interval: Duration::from_secs(config.self_update_interval_seconds),
+            sources: config.self_update_sources.clone(),
+            paths,
         });
     }
+
+    // HTTP 服务已经在上面那个任务里跑了。这里只等着被信号结束。
+    tokio::signal::ctrl_c().await.ok();
+    log("收到退出信号".to_string());
 }
