@@ -1,0 +1,4 @@
+{
+  "version": "0.1.9",
+  "binaries": {"x86_64":{"url":"https://github.com/WNLUO/dsh-mobile-server/releases/download/rust-v0.1.9/dsh-relay-0.1.9","sha256":"5ad0161c13bac423438715ebf7ada297a952ae1ca335e1af5f1ac2d90da95619"}}
+}
