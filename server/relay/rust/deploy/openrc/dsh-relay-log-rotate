@@ -7,7 +7,16 @@
 # 原地截断动的是同一个 inode，进程那边完全不用管。
 #
 # 装法：install -m 0755 dsh-relay-log-rotate /etc/periodic/daily/
-# 由 busybox crond 每天 02:00 跑 run-parts /etc/periodic/daily 触发（/etc/crontabs/root）。
+#       ln -s ../daily/dsh-relay-log-rotate /etc/periodic/hourly/
+# 由 busybox crond 跑 run-parts 触发（/etc/crontabs/root）：daily 02:00、hourly 每小时 0 分。
+#
+# **必须同时挂 hourly**：只挂 daily 的话，20MB 这个上限只是「每天至少查一次」，
+# 两次检查之间的增量不受控。中转待机时日志几乎不涨（只有隧道注册、心跳超时才写），
+# 所以一小时的增量可以忽略，但「几乎不涨」不是零。
+#
+# 它**不看磁盘余量**：只按 relay.log 自己的大小判断。盘被别的进程写满时它一个字节
+# 都不会动。它的职责是「保证日志不会长成吞掉整块盘的东西」，不是磁盘告急时救场。
+#
 # 不用装 logrotate：Alpine 自带的这套够了，也不多一个包。
 set -eu
 

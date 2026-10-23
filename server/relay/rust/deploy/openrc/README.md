@@ -6,6 +6,9 @@
 #   dsh-relay.confd         → /etc/conf.d/dsh-relay        (0644)
 #   dsh-relay.env           → /etc/dsh-relay.env          (0600)
 #   dsh-relay-log-rotate    → /etc/periodic/daily/         (0755)
+#                             同时软链到 /etc/periodic/hourly/：只挂 daily 的话
+#                             20MB 只是「每天至少查一次」的下限，两次检查之间日志
+#                             能涨到任意大小。挂 hourly 之后最坏是 20MB + 一小时增量。
 #
 # 二进制与数据目录（不在这个目录里，由部署方放）：
 #
