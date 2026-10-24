@@ -89,7 +89,7 @@ WantedBy=multi-user.target
 | `HOST` | `0.0.0.0` | 监听地址 |
 | `PORT` | `8700` | 监听端口 |
 | `MAX_FRAME_BYTES` | 8 MB | 单帧上限 |
-| `MAX_BODY_BYTES` | 50 MB | 请求体上限 |
+| `MAX_BODY_BYTES` | 67 MB | 请求体上限（信封让线上字节按 4/3 变大，总闸跟着抬） |
 | `MAX_PENDING` | 256 | 同时在途的请求数 |
 | `MAX_SSE_CONNECTIONS` | 64 | 同时开着的 SSE 条数（**按隧道算**，即一台宿主电脑上所有设备共用一个数） |
 | `MAX_WS_CONNECTIONS` | 256 | 手机 WS 条数 |

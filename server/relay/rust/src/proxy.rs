@@ -543,7 +543,7 @@ pub fn handle_tunnel_frame(tunnel: &Arc<Tunnel>, instance_id: &str, frame_type: 
         }
         t::PUSH_REGISTER => {
             // 宿主代 App 上报 / 删除 iOS 推送令牌。宿主已经按自己的设备凭据库核过
-            // 身份（dshc_ 是它签的），中转不再二次校验；直接落表。控制台没开（没有
+            // 身份（凭据库在它那儿），中转不再二次校验；直接落表。控制台没开（没有
             // store）就静默丢弃：这台中转连推送的存储都没有，宿主重试也无用。
             let value = parse_json_value(payload);
             let device_id = value

@@ -22,7 +22,9 @@ const { T } = require(path.join(ROOT, '..', '..', 'relay-core', 'protocol-types.
 const RELAY_PORT = 18710;
 const UPSTREAM_PORT = 18711;
 const INSTANCE = 'e2e-mirror-a';
-const CREDENTIAL = 'dshc_e2e_mirror_live';
+// T1 形状：每设备凭据本身就是一段任意 Bearer（`<instanceId>.<exp>.<random>`），
+// 没有 `dshc_` 前缀。中转只按原文的 sha256 认，e2e 用这个形状才盖得住「不看前缀」。
+const CREDENTIAL = 'e2e0m1rr.1800000000.bG9jYWwtcmFuZG9t';
 
 const sha256 = (value) => crypto.createHash('sha256').update(String(value)).digest('hex');
 

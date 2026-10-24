@@ -97,6 +97,26 @@ const OWNED_PATHS: &[&str] = &[
 /// 手机 API 的固定前缀。与 `server/relay-core/protocol-types.js` 的 `MOBILE_PREFIX` 一致。
 const MOBILE_PREFIX: &str = "/api/mobile/v1/";
 
+/// 宿主控制面的前缀。这个前缀下全是「管这台宿主」的接口：配对二维码、中转地址、
+/// 注册密钥、设备列表与吊销、插件更新。手机一条都不用（它只走 `/api/mobile/v1/**`）。
+const CONTROL_PLANE_PREFIX: &str = "/api/relay";
+
+/// 这条路径是不是宿主控制面（`/api/relay` 与 `/api/relay/**`）。
+///
+/// 判据要能穿透部署前缀：中转挂成 `https://host/relay` 时，请求路径长成
+/// `/relay/api/relay/config`。`strip_deploy_prefix` 剥不掉它——那条规则只认「以某个
+/// 中转认领路径结尾」，控制面路径不在认领表里，剥不了。所以这里按整段出现判：路径里
+/// 有独立的 `/api/relay` 段就是控制面，前面有几段部署前缀都不影响。段尾卡边界，
+/// `/api/relayx` 这种不误伤。
+fn is_control_plane_path(pathname: &str) -> bool {
+    pathname
+        .match_indices(CONTROL_PLANE_PREFIX)
+        .any(|(at, _)| match pathname[at + CONTROL_PLANE_PREFIX.len()..].chars().next() {
+            None => true,
+            Some(next) => next == '/',
+        })
+}
+
 /// 剥掉部署前缀，只给中转自己判路由用（`/healthz`、`/status`、`/tunnel` 那几条）。
 ///
 /// 判据看**末尾**：路径以某个认领路径结尾就算那个路径。其余路径原样返回。
@@ -303,24 +323,36 @@ pub async fn respond_json(
     .await
 }
 
-/// 手机带来的设备凭据（`dshc_…`）。
+/// 手机这次出示的设备凭据原文，按「先算谁」排好：`X-Dsh-Device-Credential` 在前，
+/// `Authorization` 的 Bearer 原文在后。
 ///
-/// App 把它单独放在 `X-Dsh-Device-Credential` 头里，`Authorization` 那份留给宿主 token；
-/// 只有很早的客户端会把 `dshc_` 塞在 Bearer 位上，两条都认（与 `mobile/auth.js` 同一口径）。
-/// 中转拿它算 sha256 去对宿主推上来的摘要，既看不到凭据原文，也不持有任何签名密钥。
-fn presented_credential(head: &RequestHead) -> Option<String> {
+/// App 把设备凭据单独放在 `X-Dsh-Device-Credential` 头里，`Authorization` 那份通常留给
+/// 宿主 token；两处都带和只带一处都收，调用方依次试，任一命中即可（见
+/// `mirror::creds_allow`）。
+///
+/// **不看前缀、不看形状**：每设备凭据本身就是一段任意 Bearer
+/// （`<instanceId>.<exp>.<random>`），按 `dshc_` 筛会把新配对之后的镜像读整片挡住。
+/// 中转只把原文算 sha256 去对宿主推上来的摘要，既看不到凭据原文，也不持有任何签名密钥。
+fn presented_credentials(head: &RequestHead) -> Vec<String> {
+    let mut presented: Vec<String> = Vec::new();
     if let Some(raw) = head.header("x-dsh-device-credential") {
         let value = raw.trim();
-        if value.starts_with("dshc_") {
-            return Some(value.to_string());
+        if !value.is_empty() {
+            presented.push(value.to_string());
         }
     }
-    let authorization = head.header("authorization")?.trim();
-    let token = authorization
-        .strip_prefix("Bearer ")
-        .or_else(|| authorization.strip_prefix("bearer "))?
-        .trim();
-    token.starts_with("dshc_").then(|| token.to_string())
+    if let Some(raw) = head.header("authorization") {
+        let authorization = raw.trim();
+        let token = authorization
+            .strip_prefix("Bearer ")
+            .or_else(|| authorization.strip_prefix("bearer "))
+            .unwrap_or_default()
+            .trim();
+        if !token.is_empty() {
+            presented.push(token.to_string());
+        }
+    }
+    presented
 }
 
 /// 控制台自己的请求体上限。控制台只有被控端上报那条带体，内容是个小 JSON。
@@ -433,15 +465,16 @@ pub async fn handle_owned_path(
                 .unwrap_or_default()
                 .trim()
                 .to_string();
-            let Some(credential) = presented_credential(head) else {
+            let credentials = presented_credentials(head);
+            if credentials.is_empty() {
                 respond_json(reader, 401, r#"{"ok":false,"error":"device credential required"}"#).await?;
                 return Ok(true);
-            };
+            }
             if instance_id.is_empty() {
                 respond_json(reader, 400, r#"{"ok":false,"error":"x-dsh-instance required"}"#).await?;
                 return Ok(true);
             }
-            if !crate::mirror::credential_ok(&instance_id, Some(&credential)) {
+            if !crate::mirror::credential_ok(&instance_id, &credentials) {
                 respond_json(reader, 403, r#"{"ok":false,"error":"bad device credential"}"#).await?;
                 return Ok(true);
             }
@@ -485,18 +518,6 @@ pub async fn handle_owned_path(
             Ok(true)
         }
         other => {
-            // 宿主控制面（`/api/relay/**`）在中转上一律 404，**绝不转发**。
-            //
-            // 那个前缀下全是「管这台宿主」的接口：配对二维码、中转地址、注册密钥、
-            // 设备列表与吊销、插件更新。手机一条都不用（它只走 `/api/mobile/v1/**`），
-            // 所以没有功能代价；留着转发等于把宿主的控制面挂到公网上 —— 宿主那些
-            // 「是不是本机来的」判断在转发链路上本来就不可靠。宿主侧另有按转发标记
-            // 判远程的那一道，这里是第二道。
-            if other == "/api/relay" || other.starts_with("/api/relay/") {
-                respond_text(reader, 404, "not found").await?;
-                return Ok(true);
-            }
-
             // 插件 OTA 临时通道：`/api/desktop-plugins/ota/**`。它独立于控制台开关
             // （宿主可能没开控制台但仍在用这条救急通道），所以单独判。
             if let Some(rest) = other.strip_prefix("/api/desktop-plugins/ota/") {
@@ -594,6 +615,19 @@ pub async fn serve_connection(stream: TcpStream, slot: Arc<TunnelSlot>) -> std::
         }
     };
 
+    // 宿主控制面在中转上一律 404，**绝不转发**。留着转发等于把宿主的控制面挂到公网上
+    // —— 宿主那些「是不是本机来的」判断在转发链路上本来就不可靠；宿主侧按转发标记判
+    // 远程的那一道之外，这里是第二道。
+    //
+    // 必须判在 WebSocket 升级分支**之前**：升级分支一旦先返回，`/api/relay/**` 的 WS
+    // 请求就绕过这道判断直接进宿主。也必须判在认领路径之前：`/api/relay/status`、
+    // `/api/relay/healthz` 以中转自己的路径结尾，会被 `strip_deploy_prefix` 的末尾
+    // 判定抢答成 200，那就不是 404 了。
+    if is_control_plane_path(&head.normalized_pathname()) {
+        respond_text(&mut reader, 404, "not found").await?;
+        return Ok(());
+    }
+
     // 升级请求先判：`/tunnel` 是宿主，其余一律当作手机 WS 桥接。
     if head.is_websocket_upgrade() {
         if strip_deploy_prefix(&head.normalized_pathname()) == "/tunnel" {
@@ -617,12 +651,12 @@ pub async fn serve_connection(stream: TcpStream, slot: Arc<TunnelSlot>) -> std::
     if !instance_id.is_empty() && crate::config().mirror_cache {
         let routed = strip_forward_prefix(&head.normalized_pathname()).to_string();
         if let Some((kind, rev)) = crate::mirror::parse_read(&head.method, &routed, &head.query) {
-            let credential = presented_credential(&head);
+            let credentials = presented_credentials(&head);
             let unreachable = slot
                 .get_for(&instance_id)
                 .map(|tunnel| tunnel.is_closed())
                 .unwrap_or(true);
-            let fallback = crate::mirror::Fallback::new(instance_id.clone(), kind, rev, credential);
+            let fallback = crate::mirror::Fallback::new(instance_id.clone(), kind, rev, credentials);
             if unreachable {
                 if let Some(body) = fallback.serve() {
                     respond_with(
@@ -792,6 +826,114 @@ mod tests {
         assert_eq!(
             head("/relay/whatever/thing").routed_path(),
             "/relay/whatever/thing"
+        );
+    }
+
+    #[test]
+    fn presented_credentials_lists_the_header_before_the_bearer() {
+        // 两份都在：header 那份排前面，判据先算它、未命中再算 Bearer。两份都不看前缀
+        // ——T1 之后设备凭据本身就是一段任意 Bearer。
+        let mut both = head("/api/mobile/v1/sessions");
+        both.headers = vec![
+            (
+                "authorization".into(),
+                "Bearer 99d9d3ee.1800000000.bearer".into(),
+            ),
+            (
+                "x-dsh-device-credential".into(),
+                " 99d9d3ee.1800000000.header ".into(),
+            ),
+        ];
+        assert_eq!(
+            presented_credentials(&both),
+            vec![
+                "99d9d3ee.1800000000.header".to_string(),
+                "99d9d3ee.1800000000.bearer".to_string(),
+            ]
+        );
+
+        // 只带 Bearer 的那一版（很早的客户端把凭据塞在 Bearer 位上）照旧认。
+        let mut bearer_only = head("/api/mobile/v1/sessions");
+        bearer_only.headers = vec![(
+            "authorization".into(),
+            "Bearer 99d9d3ee.1800000000.bearer".into(),
+        )];
+        assert_eq!(
+            presented_credentials(&bearer_only),
+            vec!["99d9d3ee.1800000000.bearer".to_string()]
+        );
+
+        // 两头都没有、或者 Bearer 是空的：空列表，调用方据此回 401。
+        assert!(presented_credentials(&head("/api/mobile/v1/sessions")).is_empty());
+        let mut empty_bearer = head("/api/mobile/v1/sessions");
+        empty_bearer.headers = vec![("authorization".into(), "Bearer   ".into())];
+        assert!(presented_credentials(&empty_bearer).is_empty());
+    }
+
+    /// 起一条真连接跑一遍 `serve_connection`，把响应原样拿回来。
+    ///
+    /// 控制面那几条必须由中转**自己**当场写完，所以这条路径上不会有等待宿主的部分；
+    /// 跑不通会撞到下面那个超时，而不是把用例挂死。
+    async fn respond_to(raw_request: &str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let slot = Arc::new(TunnelSlot::new());
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            serve_connection(stream, slot).await.unwrap();
+        });
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        client.write_all(raw_request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::io::AsyncReadExt::read_to_end(&mut client, &mut response),
+        )
+        .await
+        .expect("控制面路径必须当场应答，不能挂在转发或等宿主上")
+        .unwrap();
+        server.await.unwrap();
+        String::from_utf8_lossy(&response).to_string()
+    }
+
+    /// 宿主控制面在中转上一律 404，裸路径与带部署前缀的形态都要覆盖。
+    ///
+    /// 最后两条单列，是因为它们以中转自己的认领路径结尾（`/status`、`/healthz`）：
+    /// 只判控制面字符串而不抢在认领路径之前，会被末尾判定答成 200。
+    #[tokio::test]
+    async fn control_plane_paths_are_404_in_both_forms() {
+        for path in [
+            "/api/relay",
+            "/api/relay/config",
+            "/api/relay/config?x=1",
+            "/relay/api/relay/config",
+            "/relay/api/relay/status",
+            "/api/relay/healthz",
+        ] {
+            let response = respond_to(&format!("GET {path} HTTP/1.1\r\nhost: relay\r\n\r\n")).await;
+            assert!(
+                response.starts_with("HTTP/1.1 404 "),
+                "{path} 必须 404，实际是 {response}"
+            );
+        }
+    }
+
+    /// WebSocket 升级请求走同一道判断：升级分支若排在控制面判断之前，控制面的 WS
+    /// 请求就绕过 404 直接进宿主。
+    #[tokio::test]
+    async fn control_plane_websocket_upgrades_are_404_too() {
+        let response = respond_to(
+            "GET /relay/api/relay/ws HTTP/1.1\r\n\
+             host: relay\r\n\
+             upgrade: websocket\r\n\
+             connection: Upgrade\r\n\
+             sec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+             sec-websocket-version: 13\r\n\r\n",
+        )
+        .await;
+        assert!(
+            response.starts_with("HTTP/1.1 404 "),
+            "控制面的升级请求必须 404，实际是 {response}"
         );
     }
 }

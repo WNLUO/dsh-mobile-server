@@ -120,7 +120,7 @@ CREATE TABLE IF NOT EXISTS ota_releases (
 CREATE INDEX IF NOT EXISTS idx_ota_lookup ON ota_releases(platform, channel, created_at DESC);
 
 -- iOS 推送令牌：一台手机（instance + deviceId）一条。App 直接经中转的自有路径上报，
--- 判据与镜像读同一套（设备凭据摘要，见 http.rs 的 presented_credential）；令牌本身
+-- 判据与镜像读同一套（设备凭据摘要，见 http.rs 的 presented_credentials）；令牌本身
 -- 只属于 App 与 APNs 之间，中转只负责转交，不解释内容。
 CREATE TABLE IF NOT EXISTS push_tokens (
   instance_id  TEXT NOT NULL,
