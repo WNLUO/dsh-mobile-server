@@ -40,13 +40,27 @@ where
         .collect()
 }
 
-/// 响应头走同一套规则。
+/// 响应头与请求头只差一处：**`content-length` 不是逐跳头，要留着**。
+///
+/// 它描述的是这条响应自己的体积，转发它不会把连接语义带过去；丢掉它的唯一后果是
+/// 每一发响应都退化成 `transfer-encoding: chunked` —— 客户端拿不到长度（进度条、
+/// 断点续传都无从下手），中间的 nginx 也没法定长转发（只能攒批）。宿主侧每发响应
+/// 本来就带这个头（`sendJson` 的定长 JSON），所以这里几乎总能拿到。
+fn forwardable_response_header(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    if lower == "content-length" {
+        return true;
+    }
+    forwardable_header(&lower)
+}
+
+/// 响应头走同一套规则（+ `content-length`，见上）。
 pub fn sanitize_resp_headers(headers: Vec<(String, String)>) -> Vec<(String, String)> {
     headers
         .into_iter()
         .filter_map(|(name, value)| {
             let lower = name.to_ascii_lowercase();
-            forwardable_header(&lower).then(|| (lower, value))
+            forwardable_response_header(&lower).then(|| (lower, value))
         })
         .collect()
 }
@@ -102,5 +116,17 @@ mod tests {
             ("Transfer-Encoding".to_string(), "chunked".to_string()),
         ]);
         assert_eq!(cleaned, vec![("content-type".to_string(), "text/plain".to_string())]);
+    }
+
+    /// 响应侧的 `content-length` 要留着，请求侧照旧丢掉。
+    ///
+    /// 响应侧的它只描述这条响应自己的体积，不是逐跳头；丢掉只会让每发响应退化成
+    /// chunked，客户端拿不到长度、中间的 nginx 也只能攒批转发。请求侧留着它没有意义
+    /// ——宿主读的是转发过来的 body，长度由中转这条连接自己定。
+    #[test]
+    fn content_length_survives_on_responses_only() {
+        let kept = sanitize_resp_headers(vec![("Content-Length".to_string(), "42".to_string())]);
+        assert_eq!(kept, vec![("content-length".to_string(), "42".to_string())]);
+        assert!(!forwardable_header("content-length"));
     }
 }
