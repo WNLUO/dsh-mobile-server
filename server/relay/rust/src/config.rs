@@ -27,6 +27,12 @@ pub struct Config {
     pub max_body_bytes: usize,
     pub max_pending: usize,
     pub max_sse_connections: usize,
+    /// 同一台设备最多同时占几条 SSE。
+    ///
+    /// 它和 `max_sse_connections` 是两道不同的闸：那个管「一台宿主电脑总共开多少条」，
+    /// 这个管「其中一台手机能占几条」。只有总量那道闸时，一台陷在重连风暴里的设备会把
+    /// 所有人的名额吃光，其余手机一起 429。超了不是拒绝，而是把它自己最早那条顶掉。
+    pub max_sse_per_device: usize,
     pub max_ws_connections: usize,
     pub max_ws_message_bytes: usize,
     pub max_ws_queue_bytes: usize,
@@ -122,6 +128,9 @@ impl Config {
             // 设备同时在线」和重连抖动留的余量。它按**隧道**（也就是一台宿主电脑）计，不是
             // 全站共享，所以调大不会让一台机器的风暴波及别人；真正的失控闸在宿主那侧。
             max_sse_connections: positive_int("MAX_SSE_CONNECTIONS", 64, 10_000)?,
+            // 3：一台手机正常只开两条（会话流 + 设备级流），第三条是切会话时新旧交替的
+            // 余量。给到 3 以上只会让陷在重连里的设备多占一会儿名额。
+            max_sse_per_device: positive_int("MAX_SSE_PER_DEVICE", 3, 64)?,
             max_ws_connections: positive_int("MAX_WS_CONNECTIONS", 256, 10_000)?,
             max_ws_message_bytes: positive_int("MAX_WS_MESSAGE_BYTES", 8 * 1024 * 1024, 64 * 1024 * 1024)?,
             max_ws_queue_bytes: positive_int("MAX_WS_QUEUE_BYTES", 16 * 1024 * 1024, 128 * 1024 * 1024)?,
@@ -178,6 +187,7 @@ impl Default for Config {
             max_body_bytes: 50 * 1024 * 1024,
             max_pending: 256,
             max_sse_connections: 16,
+            max_sse_per_device: 3,
             max_ws_connections: 256,
             max_ws_message_bytes: 8 * 1024 * 1024,
             max_ws_queue_bytes: 16 * 1024 * 1024,
@@ -242,6 +252,7 @@ mod tests {
         // 两条路通向同一台宿主、同一种资源。16 的时候一台手机的几条被丢弃的连接就能把
         // 走中转的所有设备挡在 429 外面（真机现场见 README 的运维那节）。
         assert_eq!(config.max_sse_connections, 64);
+        assert_eq!(config.max_sse_per_device, 3);
         assert_eq!(config.tunnel_heartbeat_ms, 15_000);
         assert_eq!(config.tunnel_pong_timeout_ms, 60_000);
         assert!(config.mirror_cache, "离线镜像兜底默认开");

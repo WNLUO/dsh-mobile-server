@@ -26,6 +26,16 @@ const UPSTREAM_PORT = 18801;
 function startUpstream() {
   return new Promise((resolve) => {
     const server = http.createServer((req, res) => {
+      if (req.url.startsWith('/sse-hold')) {
+        // 挂住不结束：用来占住 SSE 名额，验「新流顶旧流」。
+        res.writeHead(200, {
+          'content-type': 'text/event-stream',
+          'cache-control': 'no-cache',
+          connection: 'keep-alive',
+        });
+        res.write('data: hold\n\n');
+        return;
+      }
       if (req.url.startsWith('/sse')) {
         res.writeHead(200, {
           'content-type': 'text/event-stream',
@@ -81,6 +91,25 @@ function collectSse(urlPath) {
     req.on('error', reject);
     req.setTimeout(15_000, () => reject(new Error('SSE 请求超时')));
   });
+}
+
+/**
+ * 开一条挂住不结束的 SSE，返回 `closed`：一个在服务端把这条响应收掉时 resolve 的 promise。
+ * `MAX_SSE_PER_DEVICE` 的「新流顶旧流」就靠它观察——被顶掉的那条会先收到 End。
+ */
+function openHeldSse(device) {
+  let markClosed;
+  const closed = new Promise((resolve) => { markClosed = resolve; });
+  const headers = { accept: 'text/event-stream', 'x-dsh-instance': INSTANCE };
+  if (device) headers['x-dsh-device'] = device;
+  const req = http.get(`http://127.0.0.1:${RELAY_PORT}/sse-hold`, { headers }, (res) => {
+    res.on('data', () => {});
+    res.on('end', () => markClosed(true));
+    res.on('close', () => markClosed(true));
+    res.on('error', () => markClosed(true));
+  });
+  req.on('error', () => markClosed(true));
+  return { req, closed };
 }
 
 /** 通过中转打开一条手机 WS，返回它和收到的消息队列。 */
@@ -182,6 +211,46 @@ async function main() {
     const spread = sse.events.length >= 2 ? sse.events[sse.events.length - 1].at - sse.events[0].at : 0;
     check('SSE 是边推边到，不是攒完一次发', spread >= 100, `首尾间隔 ${spread}ms`);
     check('SSE 的 content-type 原样带回', /text\/event-stream/.test(sse.headers['content-type'] || ''), sse.headers['content-type']);
+
+    // ── 同一台设备的新流顶掉它自己的旧流 ────────────────────────────
+    // 默认 MAX_SSE_PER_DEVICE=3。同一台设备开满 3 条之后，第 4 条必须把最早那条顶掉，
+    // 而不是让它排队或直接 429——一台陷在重连风暴里的设备只该饿死自己。
+    const held = [];
+    for (let i = 0; i < 3; i += 1) {
+      held.push(openHeldSse('phone-storm'));
+      await new Promise((r) => setTimeout(r, 120));
+    }
+    await new Promise((r) => setTimeout(r, 200));
+    const heldAll = await Promise.race([
+      Promise.all(held.map((h) => h.closed.then(() => true))).then(() => true).catch(() => false),
+      new Promise((r) => setTimeout(() => r(false), 400)),
+    ]);
+    check('同一设备的三条流可以同时挂着', !heldAll, '前三条不该被提前收掉');
+
+    const fourth = openHeldSse('phone-storm');
+    const evicted = await Promise.race([
+      held[0].closed.then(() => true),
+      new Promise((r) => setTimeout(() => r(false), 3000)),
+    ]);
+    check('同一设备开第 4 条时，最早那条被顶掉', evicted, '第一条没被收掉，说明新流在排队而不是顶旧流');
+    const othersAlive = await Promise.race([
+      Promise.all([held[1].closed, held[2].closed]).then(() => true),
+      new Promise((r) => setTimeout(() => r(false), 400)),
+    ]);
+    check('被顶掉的是最早那条，后两条还活着', !othersAlive, '不该连带把别的流一起收掉');
+
+    // 别的设备完全不受这台风暴设备影响：这条是「一台坏设备只饿死自己」的核心。
+    const bystander = openHeldSse('phone-calm');
+    const bystanderEvicted = await Promise.race([
+      bystander.closed.then(() => true),
+      new Promise((r) => setTimeout(() => r(false), 400)),
+    ]);
+    check('另一台设备的流不受影响', !bystanderEvicted);
+
+    for (const h of [...held, fourth, bystander]) {
+      try { h.req.destroy(); } catch { /* ignore */ }
+    }
+    await new Promise((r) => setTimeout(r, 200));
 
     // ── 手机 WebSocket 桥接 ───────────────────────────────────────
     const phone = await openPhoneWs('/ws-echo');

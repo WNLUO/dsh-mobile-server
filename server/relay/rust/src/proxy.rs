@@ -27,6 +27,52 @@ use crate::ws;
 /// 上游既不产出也不会终止。
 const SSE_IDLE_TIMEOUT_MS: u64 = 30_000;
 
+/// 往回写手机时，一次写操作最多等多久。
+///
+/// 空闲哨兵管的是「上游不说话」，管不了「下游塞不进去」：手机把 socket 攥着却不再读
+/// （被判死却没关的那一代连接就是这样），内核发送缓冲一满，写就挂在那里不动，而上游
+/// 心跳还在源源不断地来，这条流于是既不算空闲也不会结束。给它一个上限，写不动就断，
+/// 让客户端自己重连。
+const SSE_WRITE_STALL_MS: u64 = 60_000;
+
+/// 名额满时叫客户端多久再来。
+///
+/// 5 秒太短：真机上旧客户端根本不看这个头，0～1 秒就重拨；看得见的客户端也值得等过
+/// 一轮用户操作，而不是在一个必然失败的窗口里空转。
+const CAPACITY_RETRY_AFTER_SECONDS: &str = "25";
+
+/// 容量拒绝的日志间隔：这段时间内的同类拒绝只累加计数，不再逐条写盘。
+///
+/// 真机一天七万条「名额满了」，每一条都是一次写盘，而它们说的是同一件事。
+const CAPACITY_LOG_INTERVAL_MS: u128 = 60_000;
+
+static CAPACITY_LOG: std::sync::Mutex<Option<(Instant, u64)>> = std::sync::Mutex::new(None);
+
+/// 按分钟聚合地记一次容量拒绝。
+fn log_capacity_rejected(line: String) {
+    let now = Instant::now();
+    let mut slot = CAPACITY_LOG.lock().unwrap_or_else(|e| e.into_inner());
+    match slot.as_mut() {
+        Some((at, suppressed)) if now.duration_since(*at).as_millis() < CAPACITY_LOG_INTERVAL_MS => {
+            *suppressed += 1;
+        }
+        _ => {
+            let carried = slot.as_ref().map(|(_, count)| *count).unwrap_or(0);
+            if carried > 0 {
+                log(format!("{line}（此前一分钟内另有 {carried} 次同类拒绝未逐条记录）"));
+            } else {
+                log(line);
+            }
+            *slot = Some((now, 0));
+        }
+    }
+}
+
+/// 日志里只留设备标识的头几位：它可能是一段凭据，不该整段落到日志文件里。
+fn short_device(device: &str) -> String {
+    device.chars().take(8).collect()
+}
+
 /// 隧道积压回落到低水位之后恢复读的轮询间隔。
 const FEED_RESUME_POLL_MS: u64 = 25;
 
@@ -77,11 +123,47 @@ pub async fn proxy_request(
         .unwrap_or(false);
 
     let mut reader = reader;
+    // 这台流是哪台设备开的：`X-Dsh-Device` 是 App 一直就带的路由标识（非秘密），
+    // 它缺了就退回设备凭据原文当键。两者都没有的老客户端统一落进同一个「未知设备」,
+    // 于是它们之间也会互相顶——宁可让未知那堆彼此顶，也不让一台失控设备吃光全场名额。
+    let device_key = if is_sse {
+        head.header("x-dsh-device")
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .or_else(|| {
+                head.header("x-dsh-device-credential")
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty())
+            })
+            .or_else(|| Some(String::from("<unknown>")))
+    } else {
+        None
+    };
+
+    // 先按设备顶掉它自己的旧流，再看总量闸：顺序反过来会出现「风暴里的设备把名额吃满，
+    // 新流先被 429 拒掉、旧流还占着」——正是真机上那种越滚越大的形态。
+    if let Some(device) = device_key.as_deref() {
+        let limit = config.max_sse_per_device;
+        if tunnel.sse_count_of_device(device) >= limit {
+            if let Some((victim, chunk, head)) = tunnel.take_oldest_sse_of_device(device) {
+                tunnel.send_empty(t::HTTP_CANCEL, victim);
+                if let Some(sender) = chunk {
+                    send_terminal(sender, ResponseChunk::End);
+                }
+                drop(head);
+                log(format!(
+                    "sse superseded: device={} victim={victim} limit={limit}",
+                    short_device(device)
+                ));
+            }
+        }
+    }
+
     if !tunnel.has_capacity(&config, is_sse) {
         // 拒绝要留痕：这条 429 过去一个字都不写，事后只能靠「响应长度 29」猜它是不是我们回的。
         // 两个数一起打，才能分辨是「长连接名额被占满」还是「在途请求堆住了」。
         let (pending, sse) = tunnel.capacity_snapshot();
-        log(format!(
+        log_capacity_rejected(format!(
             "capacity rejected: sse={sse}/{} pending={pending}/{} accept-sse={is_sse}",
             config.max_sse_connections, config.max_pending
         ));
@@ -90,7 +172,10 @@ pub async fn proxy_request(
             429,
             "text/plain; charset=utf-8",
             b"relay resource limit exceeded",
-            &[("retry-after".to_string(), "5".to_string())],
+            &[(
+                "retry-after".to_string(),
+                CAPACITY_RETRY_AFTER_SECONDS.to_string(),
+            )],
         )
         .await?;
         return Ok(());
@@ -108,6 +193,7 @@ pub async fn proxy_request(
             id,
             Pending::Http(HttpPending {
                 sse: is_sse,
+                device: device_key.clone(),
                 head_tx: Some(head_tx),
                 header_deadline: Some(
                     Instant::now() + std::time::Duration::from_millis(config.upstream_header_timeout_ms),
@@ -266,11 +352,27 @@ pub async fn proxy_request(
         match chunk {
             ResponseChunk::Data(bytes) => {
                 let wire = if chunked { encode_chunk(&bytes) } else { bytes.clone() };
-                if stream.write_all(&wire).await.is_err() {
-                    tunnel.send_empty(t::HTTP_CANCEL, id);
-                    break;
-                }
-                if stream.flush().await.is_err() {
+                // 一次写最多等 `SSE_WRITE_STALL_MS`：手机手里攥着 socket 却不再读的时候，
+                // 内核发送缓冲一满，`write_all` 就不动了；上游心跳照样在来，空闲哨兵永远
+                // 不会判它死。超时即视为这条流已经没人要了，取消上游、放手。
+                let stalled = tokio::time::timeout(
+                    std::time::Duration::from_millis(SSE_WRITE_STALL_MS),
+                    async {
+                        stream.write_all(&wire).await?;
+                        stream.flush().await
+                    },
+                )
+                .await;
+                let failed = match stalled {
+                    Ok(result) => result.is_err(),
+                    Err(_) => {
+                        log(format!(
+                            "write stall: id={id} (>{SSE_WRITE_STALL_MS}ms)，下游不再读，主动收尾"
+                        ));
+                        true
+                    }
+                };
+                if failed {
                     tunnel.send_empty(t::HTTP_CANCEL, id);
                     break;
                 }

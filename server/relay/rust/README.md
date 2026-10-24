@@ -92,6 +92,7 @@ WantedBy=multi-user.target
 | `MAX_BODY_BYTES` | 50 MB | 请求体上限 |
 | `MAX_PENDING` | 256 | 同时在途的请求数 |
 | `MAX_SSE_CONNECTIONS` | 64 | 同时开着的 SSE 条数（**按隧道算**，即一台宿主电脑上所有设备共用一个数） |
+| `MAX_SSE_PER_DEVICE` | 3 | 同一台设备最多同时占几条 SSE。超了不是拒绝，而是把它自己最早那条顶掉 |
 | `MAX_WS_CONNECTIONS` | 256 | 手机 WS 条数 |
 | `TUNNEL_HEARTBEAT_MS` | 15000 | 隧道 ping 周期 |
 | `TUNNEL_PONG_TIMEOUT_MS` | 60000 | 多久没 pong 算死链 |
@@ -105,11 +106,17 @@ WantedBy=multi-user.target
 越界的值**直接报错启动失败，不是 clamp**——手滑写个 0 被静默接受，表现是「限额关掉了」
 而不是「设错了」。
 
-名额满了回 `429`，正文是 `relay resource limit exceeded`（纯文本），带 `retry-after: 5`，
-同时打一行 `capacity rejected: sse=当前/上限 pending=当前/上限 accept-sse=…`。这一行是排
+名额满了回 `429`，正文是 `relay resource limit exceeded`（纯文本），带 `retry-after: 25`，
+同时打一行 `capacity rejected: sse=当前/上限 pending=当前/上限 accept-sse=…`（一分钟内同类
+拒绝只逐条记第一行，其余累加成计数）。这一行是排
 「手机上突然一片 429」的唯一线索：`sse` 到顶说明长连接名额被占满（一台手机正常只占两条，
 会话流 + 设备级流；到顶多半是设备太多或者有被丢弃的连接没关），`pending` 到顶则是那一批
 短请求堆住了。
+
+同一台设备开新的 SSE 时，如果它已经占满 `MAX_SSE_PER_DEVICE` 条，最早那条会被顶掉
+（打一行 `sse superseded`），而不是让新连接排队——一台陷在重连风暴里的设备只该饿死自己。
+写回手机时一次写最多等 60 秒，超时就收尾（`write stall`）：手机把 socket 攥着不再读的
+时候，光看上游有没有数据是判不出来的，因为心跳会一直喂着。
 
 ## 中转控制台
 

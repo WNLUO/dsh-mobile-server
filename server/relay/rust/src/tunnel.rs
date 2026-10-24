@@ -33,6 +33,12 @@ pub enum Pending {
 #[derive(Debug)]
 pub struct HttpPending {
     pub sse: bool,
+    /// 这条流是哪台设备开的（`X-Dsh-Device`，缺了就退回设备凭据原文）。
+    ///
+    /// 只用来数「同一台设备占了几条」和顶掉它自己的旧流，不参与任何鉴权：中转照旧把
+    /// 请求原样转给宿主，认不认由宿主决定。没有这个头的老客户端一律算作「同一个未知设备」，
+    /// 于是它们之间也会互相顶——这比让一台失控设备吃光全场名额要好。
+    pub device: Option<String>,
     /// 宿主已经发过 httpHead 之后，响应数据从这里流回手机。
     pub head_tx: Option<oneshot::Sender<HttpHead>>,
     /// 头超时的截止时间（没有收到 httpHead 之前有效）。
@@ -171,6 +177,48 @@ impl Tunnel {
             .filter(|entry| matches!(entry, Pending::Http(http) if http.sse))
             .count();
         (pending.len(), sse)
+    }
+
+    /// 这台设备当前占着的 SSE 条数。
+    pub fn sse_count_of_device(&self, device: &str) -> usize {
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .filter(|entry| matches!(entry, Pending::Http(http) if http.sse && http.device.as_deref() == Some(device)))
+            .count()
+    }
+
+    /// 顶掉这台设备**最早**占着的那条 SSE，把它的出口交还给调用方去收尾。
+    ///
+    /// 「新流顶旧流」的取舍：一台设备上同时开两条 SSE 本来就不正常（正常是会话流 +
+    /// 设备级流各一条），它到底是「旧的那条已经死了但没人知道」还是「两个页面在看不同的
+    /// 会话」，中转分辨不出来。选顶掉旧的，是因为留下来的那条能立刻拿到最新数据，
+    /// 而被顶掉的那条客户端会带 lastSeq 重连——代价是一次重放，比让全场 429 便宜。
+    ///
+    /// 返回 `(id, 响应出口, 头出口)`：两个出口最多有一个是 Some。响应已经开始写的走
+    /// chunk 通道收尾；还没等到 httpHead 的，drop 掉 head_tx 就能让那条请求就地失败。
+    #[allow(clippy::type_complexity)]
+    pub fn take_oldest_sse_of_device(
+        &self,
+        device: &str,
+    ) -> Option<(
+        u64,
+        Option<mpsc::Sender<crate::proxy::ResponseChunk>>,
+        Option<oneshot::Sender<HttpHead>>,
+    )> {
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        let victim = pending
+            .iter()
+            .filter(|(_, entry)| matches!(entry, Pending::Http(http) if http.sse && http.device.as_deref() == Some(device)))
+            .map(|(id, _)| *id)
+            .min()?;
+        match pending.remove(&victim) {
+            Some(Pending::Http(mut http)) => {
+                Some((victim, http.chunk_tx.take(), http.head_tx.take()))
+            }
+            _ => None,
+        }
     }
 
     /// 当前挂着的手机 WS 条数。
@@ -564,6 +612,57 @@ mod tests {
             "同一条连接重报家门不该返回「被取代」"
         );
         assert!(slot.get_for("inst-x").is_some());
+    }
+
+    /// 插一条 SSE 占位，模拟「某台设备开了一条流」。
+    fn push_sse(tunnel: &Arc<Tunnel>, id: u64, device: &str) -> mpsc::Receiver<crate::proxy::ResponseChunk> {
+        let (chunk_tx, chunk_rx) = mpsc::channel(4);
+        let (head_tx, _head_rx) = oneshot::channel::<HttpHead>();
+        let mut pending = tunnel.pending.lock().unwrap();
+        pending.insert(
+            id,
+            Pending::Http(HttpPending {
+                sse: true,
+                device: Some(device.to_string()),
+                head_tx: Some(head_tx),
+                header_deadline: None,
+                idle_deadline: None,
+                chunk_tx: Some(chunk_tx),
+            }),
+        );
+        chunk_rx
+    }
+
+    /// 按设备计数只数自己那台：别的设备、以及非 SSE 的请求都不算进来。
+    #[test]
+    fn sse_count_of_device_counts_only_that_device() {
+        let tunnel = tunnel();
+        push_sse(&tunnel, 1, "phone-a");
+        push_sse(&tunnel, 2, "phone-a");
+        push_sse(&tunnel, 3, "phone-b");
+        assert_eq!(tunnel.sse_count_of_device("phone-a"), 2);
+        assert_eq!(tunnel.sse_count_of_device("phone-b"), 1);
+        assert_eq!(tunnel.sse_count_of_device("phone-c"), 0);
+    }
+
+    /// 新流顶旧流：顶掉的是这台设备**最早**那条，别人的一条都不动。
+    #[test]
+    fn take_oldest_sse_of_device_evicts_only_its_earliest() {
+        let tunnel = tunnel();
+        let _old_a = push_sse(&tunnel, 1, "phone-a");
+        let _mid_a = push_sse(&tunnel, 2, "phone-a");
+        let _b = push_sse(&tunnel, 3, "phone-b");
+
+        let (victim, chunk, head) = tunnel
+            .take_oldest_sse_of_device("phone-a")
+            .expect("占满之后必须能顶掉一条");
+        assert_eq!(victim, 1, "顶掉的是最早那条");
+        assert!(chunk.is_some(), "已经开始写的流要把出口交出来收尾");
+        assert!(head.is_some(), "还没等到 httpHead 的流同样要能就地失败");
+
+        assert_eq!(tunnel.sse_count_of_device("phone-a"), 1, "只少了自己那一条");
+        assert_eq!(tunnel.sse_count_of_device("phone-b"), 1, "别人那条原样在");
+        assert!(tunnel.take_oldest_sse_of_device("phone-c").is_none(), "没占过的设备无可顶");
     }
 
     #[test]
