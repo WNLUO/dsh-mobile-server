@@ -43,6 +43,8 @@ pub mod t {
     pub const SYNC: u8 = 0x17;
     pub const REVOKE_ALL: u8 = 0x18;
     pub const REVOKE_ALL_ACK: u8 = 0x19;
+    pub const PUSH_REGISTER: u8 = 0x1A;
+    pub const PUSH_SEND: u8 = 0x1B;
 
     /// 编号 → 名字，用于日志与排错。与 JS 侧 `TYPE_NAME` 对应。
     pub fn name(code: u8) -> Option<&'static str> {
@@ -72,6 +74,8 @@ pub mod t {
             SYNC => "sync",
             REVOKE_ALL => "revokeAll",
             REVOKE_ALL_ACK => "revokeAllAck",
+            PUSH_REGISTER => "pushRegister",
+            PUSH_SEND => "pushSend",
             _ => return None,
         })
     }
@@ -344,7 +348,7 @@ mod tests {
 
     #[test]
     fn every_type_has_a_name() {
-        for code in 0x01..=0x19u8 {
+        for code in 0x01..=0x1Bu8 {
             assert!(t::name(code).is_some(), "{code:#04x} 没有名字");
         }
     }

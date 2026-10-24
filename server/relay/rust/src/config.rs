@@ -122,7 +122,10 @@ impl Config {
                 .unwrap_or(8700),
 
             max_frame_bytes: positive_int("MAX_FRAME_BYTES", 8 * 1024 * 1024, 64 * 1024 * 1024)?,
-            max_body_bytes: positive_int("MAX_BODY_BYTES", 50 * 1024 * 1024, 256 * 1024 * 1024)?,
+            // 总闸要比各路由自己的上限宽一截。信封让同样的内容上线时大 4/3，宿主那边
+            // 每条路由的上限都跟着放大了；总闸停在 50MB，最大的那条上传会先撞中转，
+            // 宿主放大过的上限就白设了。67 ≈ 50 × 4/3。
+            max_body_bytes: positive_int("MAX_BODY_BYTES", 67 * 1024 * 1024, 256 * 1024 * 1024)?,
             max_pending: positive_int("MAX_PENDING", 256, 100_000)?,
             // 64：一台手机正常只开两条（会话流 + 设备级流），这个数是给「一台电脑上多台
             // 设备同时在线」和重连抖动留的余量。它按**隧道**（也就是一台宿主电脑）计，不是
@@ -184,7 +187,7 @@ impl Default for Config {
             host: "0.0.0.0".to_string(),
             port: 8700,
             max_frame_bytes: 8 * 1024 * 1024,
-            max_body_bytes: 50 * 1024 * 1024,
+            max_body_bytes: 67 * 1024 * 1024,
             max_pending: 256,
             max_sse_connections: 16,
             max_sse_per_device: 3,
@@ -247,6 +250,9 @@ mod tests {
         let config = Config::from_env().expect("默认配置应该能读出来");
         assert_eq!(config.port, 8700);
         assert_eq!(config.max_frame_bytes, 8 * 1024 * 1024);
+        // 按明文上限的 4/3 放大：信封让线上字节变多，总闸不跟着抬，宿主的每路由上限
+        // 就会被中转先撞掉。
+        assert_eq!(config.max_body_bytes, 67 * 1024 * 1024);
         assert_eq!(config.max_pending, 256);
         // 64 与宿主那条直连闸（`lan-proxy` 的 MAX_UPSTREAM_SSE_CONNECTIONS）同一个数：
         // 两条路通向同一台宿主、同一种资源。16 的时候一台手机的几条被丢弃的连接就能把

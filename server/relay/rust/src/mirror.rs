@@ -11,8 +11,10 @@
 //!     `beforeSeq`）、写后刷新（`fresh=1`）一律不走缓存：拿默认列表答归档请求会把已归档
 //!     的会话漏掉，拿旧副本答「我刚写完要看结果」会让刚删掉的东西复活。
 //!   - **只认配对过的手机**。宿主在镜像帧里带上本实例已签发设备凭据的 sha256，中转拿
-//!     手机带来的凭据算一遍哈希去对。中转看不到凭据原文，也没有自己的账号体系；对不上
-//!     就什么都不给，退回今天那句 503（不新增错误面，老客户端行为一个字不变）。
+//!     手机带来的凭据（`X-Dsh-Device-Credential` 或 `Authorization` 的 Bearer 原文）算
+//!     一遍哈希去对，任一处命中即可，不看凭据形状。中转看不到凭据原文，也没有自己的
+//!     账号体系；对不上就什么都不给，退回今天那句 503（不新增错误面，老客户端行为一个
+//!     字不变）。
 //!   - **老插件不供缓存**。没收到摘要（字段缺席 = 那时候还没有这回事）时宁可什么都不给，
 //!     也不要把「谁都能读」当默认。
 //!   - **不落盘**。进程重启就没了；宿主那边隧道一连上就会全量重推一份，几秒内自己长回来。
@@ -30,9 +32,16 @@ use sha2::{Digest, Sha256};
 /// 也就这么多；超了淘汰最旧的那份，别让一张表长到吃光内存。
 const MAX_INSTANCES: usize = 16;
 /// 单份镜像（会话清单 + 工作区两份 body）的字节上限。
-const MAX_ENTRY_BYTES: usize = 3 * 1024 * 1024;
+///
+/// 4MB 而不是 3MB：宿主把业务正文封进信封之后，base64 让同样的内容大 4/3。上限卡在
+/// 3MB，本来装得下的清单会提前退化成「这份镜像存不下」，宿主离线时手机就什么都看不到
+/// ——那不是省内存，是把这条兜底功能关掉一半。
+const MAX_ENTRY_BYTES: usize = 4 * 1024 * 1024;
 /// 一次 sync 帧的字节上限。超过就不收、保留上一份——畸形或超大的帧不该把好镜像顶掉。
-const MAX_SYNC_BYTES: usize = 12 * 1024 * 1024;
+///
+/// 跟着条目上限一起放宽：一帧里装的是两份封过信封的 body 加上其余字段，12MB 的余量在
+/// 条目上限抬到 4MB 之后会先于条目上限触发，等于上限白抬。
+const MAX_SYNC_BYTES: usize = 16 * 1024 * 1024;
 /// 一份镜像最多留多久。宿主七天没正常连上来，这份缓存就该当它不存在了。
 const ENTRY_TTL_MS: u64 = 7 * 24 * 3600 * 1000;
 /// 一份镜像最多认多少条设备凭据摘要。
@@ -173,7 +182,7 @@ pub fn lookup(
     instance_id: &str,
     kind: ListKind,
     rev: &str,
-    credential: Option<&str>,
+    credentials: &[String],
 ) -> Option<String> {
     let now = now_ms();
     // 出锁只带走要用的那几段：不掐着全局锁做 JSON 解析。
@@ -191,7 +200,7 @@ pub fn lookup(
             entry.creds.clone(),
         )
     };
-    if !creds_allow(&creds, credential, now as i64) {
+    if !creds_allow(&creds, credentials, now as i64) {
         return None;
     }
     if !rev.is_empty() && rev == revision {
@@ -215,22 +224,55 @@ pub fn lookup(
     serde_json::to_string(&value).ok()
 }
 
-/// 这份凭据能不能读缓存。`creds` 为空（老插件还没推摘要）一律不放行。
-fn creds_allow(creds: &[(String, i64)], credential: Option<&str>, now_ms: i64) -> bool {
-    let Some(raw) = credential else { return false };
-    if !raw.starts_with("dshc_") || creds.is_empty() {
+/// 这台实例当前这份摘要清单能不能放行这次出示的凭据。推送令牌上报（`http.rs` 的
+/// `/api/mobile/v1/push-token`）与镜像读用同一个判据，别另写一份校验。
+pub(crate) fn credential_ok(instance_id: &str, credentials: &[String]) -> bool {
+    let now = now_ms();
+    let creds = {
+        let map = store().lock().unwrap_or_else(|e| e.into_inner());
+        match map.get(instance_id.trim()) {
+            Some(entry) if now.saturating_sub(entry.stored_at_ms) <= ENTRY_TTL_MS => entry.creds.clone(),
+            _ => Vec::new(),
+        }
+    };
+    creds_allow(&creds, credentials, now as i64)
+}
+
+/// 这些出示的凭据里有没有一个能读缓存。`creds` 为空（老插件还没推摘要）一律不放行。
+///
+/// 逐个按 `credentials` 的顺序试，第一个命中就放行——调用方把
+/// `X-Dsh-Device-Credential` 排在 `Authorization` 的 Bearer 前面，所以是「header 先算、
+/// 未命中再算 Bearer」。**只看原文的 sha256，不看前缀、不看形状**：每设备凭据本身就是
+/// 一段任意 Bearer（`<instanceId>.<exp>.<random>`），按 `dshc_` 筛会把新配对之后的镜像
+/// 读整片挡住；旧 HMAC token 的哈希不在宿主推上来的表里，本来就会被这条判据拒掉。
+///
+/// 推送令牌上报那条自有路径（`http.rs`）用同一个判据：同一套摘要、同一个「空摘要
+/// 不放行」的口径，别为它另写一份校验。
+pub(crate) fn creds_allow(creds: &[(String, i64)], credentials: &[String], now_ms: i64) -> bool {
+    if creds.is_empty() || credentials.is_empty() {
         return false;
     }
+    for raw in credentials {
+        let digest = sha256_hex(raw);
+        let hit = creds
+            .iter()
+            .any(|(hash, expires_at)| (*expires_at == 0 || *expires_at > now_ms) && *hash == digest);
+        if hit {
+            return true;
+        }
+    }
+    false
+}
+
+/// 凭据原文的 sha256（小写十六进制）。与宿主推上来的摘要同一个算法、同一种写法。
+fn sha256_hex(raw: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(raw.as_bytes());
-    let digest: String = hasher
+    hasher
         .finalize()
         .iter()
         .map(|byte| format!("{byte:02x}"))
-        .collect();
-    creds
-        .iter()
-        .any(|(hash, expires_at)| (*expires_at == 0 || *expires_at > now_ms) && *hash == digest)
+        .collect()
 }
 
 /// 一次「已经问出去了、但可能来不及」的缓存读。
@@ -243,17 +285,17 @@ pub struct Fallback {
     instance: String,
     kind: ListKind,
     rev: String,
-    credential: Option<String>,
+    credentials: Vec<String>,
 }
 
 impl Fallback {
-    pub fn new(instance: String, kind: ListKind, rev: String, credential: Option<String>) -> Self {
-        Self { instance, kind, rev, credential }
+    pub fn new(instance: String, kind: ListKind, rev: String, credentials: Vec<String>) -> Self {
+        Self { instance, kind, rev, credentials }
     }
 
     /// 现在能拿得出东西吗。拿不出（凭据对不上、没这份清单）就当没备过。
     pub fn serve(&self) -> Option<String> {
-        lookup(&self.instance, self.kind, &self.rev, self.credential.as_deref())
+        lookup(&self.instance, self.kind, &self.rev, &self.credentials)
     }
 }
 
@@ -331,14 +373,10 @@ mod tests {
         LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn digest_of(credential: &str) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(credential.as_bytes());
-        hasher
-            .finalize()
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect()
+    /// 一次请求可能同时带 `X-Dsh-Device-Credential` 与 Bearer 两份凭据，判据拿到的是
+    /// 一个有序列表（header 在前），所以断言也按列表写。
+    fn presented(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| value.to_string()).collect()
     }
 
     fn payload(creds: serde_json::Value) -> Vec<u8> {
@@ -363,28 +401,87 @@ mod tests {
         let instance = "mirror-keep";
         assert!(remember(
             instance,
-            &payload(serde_json::json!([{ "hash": digest_of("dshc_live") }]))
+            &payload(serde_json::json!([{ "hash": sha256_hex("cred_live") }]))
         ));
-        let body = lookup(instance, ListKind::Sessions, "", Some("dshc_live")).expect("cached body");
+        let body = lookup(instance, ListKind::Sessions, "", &presented(&["cred_live"])).expect("cached body");
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(parsed["stale"], serde_json::json!(true));
         assert_eq!(parsed["revision"], serde_json::json!("aaa"));
         assert_eq!(parsed["items"].as_array().unwrap().len(), 1);
     }
 
+    /// 信封的外层（`env`）中转不认识，但必须原样存、原样回。
+    ///
+    /// 手机端先看外层有没有 `env`，有就解出来再和内层合并。中转在这中间要做一次
+    /// `Value` 的反序列化与再序列化，任何外层字段被丢掉，手机就永远解不出正文——宿主
+    /// 离线时更只剩这一份。这条用例钉的是「多出来的外层字段保住」，不是业务语义。
     #[test]
-    fn serves_only_to_a_known_device_credential() {
+    fn keeps_unknown_outer_fields_such_as_the_envelope() {
+        let _guard = serial();
+        let instance = "mirror-env";
+        let frame = serde_json::json!({
+            "kind": "sync",
+            "sessions": {
+                "ok": true,
+                "revision": "aaa",
+                "generatedAt": 111,
+                "env": { "v": 2, "z": 0, "n": "bm9uY2U", "c": "Y2lwaGVy" },
+            },
+            "workspaces": {
+                "ok": true,
+                "revision": "bbb",
+                "generatedAt": 222,
+                "env": { "v": 2, "z": 0, "n": "bm9uY2Uy", "c": "Y2lwaGVyMg" },
+            },
+            "creds": [{ "hash": sha256_hex("cred_env") }],
+        })
+        .to_string()
+        .into_bytes();
+        assert!(remember(instance, &frame));
+
+        let body = lookup(instance, ListKind::Sessions, "", &presented(&["cred_env"]))
+            .expect("cached body");
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            parsed["env"],
+            serde_json::json!({ "v": 2, "z": 0, "n": "bm9uY2U", "c": "Y2lwaGVy" }),
+            "信封外层必须原样回，丢了手机就解不出正文"
+        );
+        // 镜像自己读的那几个外层键与注入的 `stale` 同时还在。
+        assert_eq!(parsed["ok"], serde_json::json!(true));
+        assert_eq!(parsed["revision"], serde_json::json!("aaa"));
+        assert_eq!(parsed["stale"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn serves_to_any_credential_whose_digest_is_known() {
         let _guard = serial();
         let instance = "mirror-cred";
+        // T1 形状：每设备凭据本身就是一段 Bearer，没有 `dshc_` 那种前缀。
+        let t1 = "99d9d3ee.1800000000.bG9jYWwtcmFuZG9t";
         assert!(remember(
             instance,
-            &payload(serde_json::json!([{ "hash": digest_of("dshc_live") }]))
+            &payload(serde_json::json!([{ "hash": sha256_hex(t1) }]))
         ));
-        assert!(lookup(instance, ListKind::Sessions, "", Some("dshc_live")).is_some());
-        // 别台设备的凭据、非 dshc_ 的东西、没带凭据都不认。
-        assert_eq!(lookup(instance, ListKind::Sessions, "", Some("dshc_other")), None);
-        assert_eq!(lookup(instance, ListKind::Sessions, "", Some("Bearer x")), None);
-        assert_eq!(lookup(instance, ListKind::Sessions, "", None), None);
+        // 哈希在表里就认，不看形状。
+        assert!(lookup(instance, ListKind::Sessions, "", &presented(&[t1])).is_some());
+        // header 那份对不上、Bearer 那份对上：一样放行（header 先算，未命中再算 Bearer）。
+        assert!(
+            lookup(instance, ListKind::Sessions, "", &presented(&["stale-header", t1])).is_some()
+        );
+        // 别台设备的凭据、摘要表外的任意串、没带凭据都不认。
+        assert_eq!(lookup(instance, ListKind::Sessions, "", &presented(&["cred_other"])), None);
+        assert_eq!(lookup(instance, ListKind::Sessions, "", &presented(&["Bearer x"])), None);
+        assert_eq!(lookup(instance, ListKind::Sessions, "", &[]), None);
+    }
+
+    /// 摘要表为空 = 老插件还没推摘要。这时候「谁都能读」不能当默认。
+    #[test]
+    fn an_empty_digest_table_lets_nobody_in() {
+        let empty: Vec<(String, i64)> = Vec::new();
+        assert!(!creds_allow(&empty, &presented(&["99d9d3ee.1.abc"]), 1));
+        let known = vec![(sha256_hex("99d9d3ee.1.abc"), 0)];
+        assert!(creds_allow(&known, &presented(&["99d9d3ee.1.abc"]), 1));
     }
 
     #[test]
@@ -392,10 +489,10 @@ mod tests {
         let _guard = serial();
         let instance = "mirror-nocreds";
         assert!(remember(instance, &payload(serde_json::json!([]))));
-        assert_eq!(lookup(instance, ListKind::Sessions, "", Some("dshc_live")), None);
+        assert_eq!(lookup(instance, ListKind::Sessions, "", &presented(&["cred_live"])), None);
         // 连字段都不带的那一版同样不给。
         assert!(remember(instance, &payload(serde_json::Value::Null)));
-        assert_eq!(lookup(instance, ListKind::Sessions, "", Some("dshc_live")), None);
+        assert_eq!(lookup(instance, ListKind::Sessions, "", &presented(&["cred_live"])), None);
     }
 
     #[test]
@@ -404,9 +501,9 @@ mod tests {
         let instance = "mirror-expiry";
         assert!(remember(
             instance,
-            &payload(serde_json::json!([{ "hash": digest_of("dshc_old"), "expiresAt": 1 }]))
+            &payload(serde_json::json!([{ "hash": sha256_hex("cred_old"), "expiresAt": 1 }]))
         ));
-        assert_eq!(lookup(instance, ListKind::Sessions, "", Some("dshc_old")), None);
+        assert_eq!(lookup(instance, ListKind::Sessions, "", &presented(&["cred_old"])), None);
     }
 
     #[test]
@@ -415,9 +512,9 @@ mod tests {
         let instance = "mirror-rev";
         assert!(remember(
             instance,
-            &payload(serde_json::json!([{ "hash": digest_of("dshc_one") }]))
+            &payload(serde_json::json!([{ "hash": sha256_hex("cred_one") }]))
         ));
-        let body = lookup(instance, ListKind::Workspaces, "bbb", Some("dshc_one")).expect("unchanged");
+        let body = lookup(instance, ListKind::Workspaces, "bbb", &presented(&["cred_one"])).expect("unchanged");
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(parsed["unchanged"], serde_json::json!(true));
         assert_eq!(parsed["revision"], serde_json::json!("bbb"));
@@ -426,7 +523,7 @@ mod tests {
         // 宿主重启后那几分钟里侧栏安静地停在旧清单上（真机就是这个形状）。
         assert_eq!(parsed["stale"], serde_json::json!(true), "缓存答 unchanged 时也必须标旧");
         // 指纹对不上就回整份。
-        let full = lookup(instance, ListKind::Workspaces, "zzz", Some("dshc_one")).unwrap();
+        let full = lookup(instance, ListKind::Workspaces, "zzz", &presented(&["cred_one"])).unwrap();
         assert!(full.contains("\"items\""));
     }
 
@@ -450,7 +547,7 @@ mod tests {
             .to_string()
             .as_bytes()
         ));
-        assert_eq!(lookup(instance, ListKind::Sessions, "", Some("dshc_any")), None);
+        assert_eq!(lookup(instance, ListKind::Sessions, "", &presented(&["cred_any"])), None);
     }
 
     #[test]
@@ -459,7 +556,7 @@ mod tests {
         let instance = "mirror-keep-good";
         assert!(remember(
             instance,
-            &payload(serde_json::json!([{ "hash": digest_of("dshc_live") }]))
+            &payload(serde_json::json!([{ "hash": sha256_hex("cred_live") }]))
         ));
         assert!(!remember(
             instance,
@@ -467,7 +564,7 @@ mod tests {
                 .to_string()
                 .as_bytes()
         ));
-        let body = lookup(instance, ListKind::Sessions, "", Some("dshc_live")).expect("still there");
+        let body = lookup(instance, ListKind::Sessions, "", &presented(&["cred_live"])).expect("still there");
         assert!(body.contains("\"revision\":\"aaa\""));
     }
 
@@ -499,13 +596,13 @@ mod tests {
         let instance = "mirror-fallback";
         assert!(remember(
             instance,
-            &payload(serde_json::json!([{ "hash": digest_of("dshc_live") }]))
+            &payload(serde_json::json!([{ "hash": sha256_hex("cred_live") }]))
         ));
         let good = Fallback::new(
             instance.to_string(),
             ListKind::Sessions,
             String::new(),
-            Some("dshc_live".to_string()),
+            presented(&["cred_live"]),
         );
         assert!(good.serve().is_some());
         // 凭据对不上、实例没见过：一样是「拿不出」，转发路径据此继续等宿主。
@@ -513,14 +610,14 @@ mod tests {
             instance.to_string(),
             ListKind::Sessions,
             String::new(),
-            Some("dshc_other".to_string()),
+            presented(&["cred_other"]),
         );
         assert!(stranger.serve().is_none());
         let unknown = Fallback::new(
             "mirror-never-pushed".to_string(),
             ListKind::Sessions,
             String::new(),
-            Some("dshc_live".to_string()),
+            presented(&["cred_live"]),
         );
         assert!(unknown.serve().is_none());
     }
@@ -532,12 +629,12 @@ mod tests {
             let instance = format!("mirror-cap-{index}");
             assert!(remember(
                 &instance,
-                &payload(serde_json::json!([{ "hash": digest_of("dshc_live") }]))
+                &payload(serde_json::json!([{ "hash": sha256_hex("cred_live") }]))
             ));
         }
         // 最早那份被淘汰，最新的还在。
-        assert_eq!(lookup("mirror-cap-0", ListKind::Sessions, "", Some("dshc_live")), None);
+        assert_eq!(lookup("mirror-cap-0", ListKind::Sessions, "", &presented(&["cred_live"])), None);
         let newest = format!("mirror-cap-{}", MAX_INSTANCES + 3);
-        assert!(lookup(&newest, ListKind::Sessions, "", Some("dshc_live")).is_some());
+        assert!(lookup(&newest, ListKind::Sessions, "", &presented(&["cred_live"])).is_some());
     }
 }

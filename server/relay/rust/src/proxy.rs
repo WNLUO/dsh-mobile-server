@@ -643,6 +643,79 @@ pub fn handle_tunnel_frame(tunnel: &Arc<Tunnel>, instance_id: &str, frame_type: 
             // 存不下、格式不对都只是这一次不更新，绝不回执也不会断开隧道。
             crate::mirror::remember(instance_id, payload);
         }
+        t::PUSH_REGISTER => {
+            // 宿主代 App 上报 / 删除 iOS 推送令牌。宿主已经按自己的设备凭据库核过
+            // 身份（凭据库在它那儿），中转不再二次校验；直接落表。控制台没开（没有
+            // store）就静默丢弃：这台中转连推送的存储都没有，宿主重试也无用。
+            let value = parse_json_value(payload);
+            let device_id = value
+                .get("deviceId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let action = value.get("action").and_then(|v| v.as_str()).unwrap_or("upsert");
+            if device_id.is_empty() {
+                return;
+            }
+            let Some(console) = crate::console() else { return };
+            if action == "delete" {
+                console.store.delete_push_token(instance_id, &device_id);
+            } else {
+                let platform = value
+                    .get("platform")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("ios")
+                    .to_string();
+                let token = value
+                    .get("token")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if token.is_empty() {
+                    return;
+                }
+                console
+                    .store
+                    .upsert_push_token(instance_id, &device_id, &platform, &token);
+            }
+        }
+        t::PUSH_SEND => {
+            // 宿主请求中转发一条 APNs 推送。只发给这台实例登记过的设备；APNs 没配置
+            // 时 send_completion 内部直接返回，这条路径零开销。
+            let value = parse_json_value(payload);
+            let device_id = value
+                .get("deviceId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let title = value
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let body = value
+                .get("body")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let session_id = value
+                .get("sessionId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if device_id.is_empty() || title.is_empty() {
+                return;
+            }
+            let Some(console) = crate::console() else { return };
+            let instance = instance_id.to_string();
+            let tokens = console.store.push_tokens_of(&instance);
+            tokio::spawn(async move {
+                crate::apns::send_completion(&instance, &device_id, &tokens, &title, &body, &session_id)
+                    .await;
+            });
+        }
         t::HTTP_HEAD => {
             let value = parse_json_value(payload);
             let status = value

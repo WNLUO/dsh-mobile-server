@@ -94,6 +94,8 @@ fn encode_frame_matches_js_byte_for_byte() {
         ("sync", t::SYNC),
         ("revokeAll", t::REVOKE_ALL),
         ("revokeAllAck", t::REVOKE_ALL_ACK),
+        ("pushRegister", t::PUSH_REGISTER),
+        ("pushSend", t::PUSH_SEND),
     ];
 
     for (name, code) in cases {
@@ -188,6 +190,8 @@ fn type_table_matches_js() {
         ("sync", t::SYNC),
         ("revokeAll", t::REVOKE_ALL),
         ("revokeAllAck", t::REVOKE_ALL_ACK),
+        ("pushRegister", t::PUSH_REGISTER),
+        ("pushSend", t::PUSH_SEND),
     ];
     for (name, code) in pairs {
         assert!(

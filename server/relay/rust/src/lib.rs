@@ -21,6 +21,7 @@
 //! 隧道帧格式见 `../../relay-core/PROTOCOL.md`；编解码与类型表在
 //! `../../relay-core/rust`，与 JS 实现由逐字节对撞测试钉住。
 
+pub mod apns;
 pub mod config;
 pub mod console;
 pub mod headers;

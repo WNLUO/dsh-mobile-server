@@ -119,6 +119,18 @@ CREATE TABLE IF NOT EXISTS ota_releases (
 );
 CREATE INDEX IF NOT EXISTS idx_ota_lookup ON ota_releases(platform, channel, created_at DESC);
 
+-- iOS 推送令牌：一台手机（instance + deviceId）一条。App 直接经中转的自有路径上报，
+-- 判据与镜像读同一套（设备凭据摘要，见 http.rs 的 presented_credentials）；令牌本身
+-- 只属于 App 与 APNs 之间，中转只负责转交，不解释内容。
+CREATE TABLE IF NOT EXISTS push_tokens (
+  instance_id  TEXT NOT NULL,
+  device_id    TEXT NOT NULL,
+  platform     TEXT NOT NULL DEFAULT 'ios',
+  token        TEXT NOT NULL,
+  updated_at   TEXT NOT NULL,
+  PRIMARY KEY (instance_id, device_id)
+);
+
 -- 主控端侧的「我管着谁」。被控端拿认领码来报到，主控端记下它。
 -- 只在主控端用得到；被控端自己的库里这张表是空的。
 CREATE TABLE IF NOT EXISTS nodes (
@@ -942,6 +954,64 @@ impl Store {
             Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
             Err(_) => Vec::new(),
         }
+    }
+
+    // ── push tokens（iOS 推送令牌）────────────────────────────────
+    //
+    // 令牌的上报走中转自有路径（App 直接打过来，判据与镜像读同一套设备凭据摘要），
+    // 删除由隧道帧（宿主吊销凭据时连带清）与 upsert 覆盖共同维护。中转只存与转交，
+    // 不解释令牌。
+
+    /// 记录 / 更新一台设备的推送令牌。同一台设备重复上报就覆盖（APNs 令牌会轮换）。
+    pub fn upsert_push_token(&self, instance_id: &str, device_id: &str, platform: &str, token: &str) {
+        let _ = self.lock().execute(
+            "INSERT INTO push_tokens (instance_id, device_id, platform, token, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT (instance_id, device_id)
+             DO UPDATE SET platform = ?3, token = ?4, updated_at = ?5",
+            params![instance_id, device_id, platform, token, now_iso()],
+        );
+    }
+
+    /// 删掉一台设备的令牌（设备被删 / 凭据吊销时调用；不存在也算删成）。
+    pub fn delete_push_token(&self, instance_id: &str, device_id: &str) {
+        let _ = self.lock().execute(
+            "DELETE FROM push_tokens WHERE instance_id = ?1 AND device_id = ?2",
+            params![instance_id, device_id],
+        );
+    }
+
+    /// 这台实例上「哪些设备还没看过这一轮」要推谁：把整台实例的令牌都取出来。
+    ///
+    /// 完成事件不带设备粒度（completion 状态机按设备记账的那份在宿主侧，中转只有
+    /// 「instance 上有哪些令牌」），所以推给**全部**已登记设备；App 收到后自己按
+    /// 已读水位去重（本地通知那条路本来就有同样的账）。
+    pub fn push_tokens_of(&self, instance_id: &str) -> Vec<(String, String)> {
+        let conn = self.lock();
+        let mut stmt = match conn
+            .prepare("SELECT device_id, token FROM push_tokens WHERE instance_id = ?1")
+        {
+            Ok(stmt) => stmt,
+            Err(_) => return Vec::new(),
+        };
+        let rows = stmt.query_map(params![instance_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        });
+        match rows {
+            Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// 这台实例上还挂着令牌的设备数（诊断用）。
+    pub fn push_token_count(&self, instance_id: &str) -> i64 {
+        self.lock()
+            .query_row(
+                "SELECT COUNT(*) FROM push_tokens WHERE instance_id = ?1",
+                params![instance_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(0)
     }
 
     // ── audit ─────────────────────────────────────────────────────

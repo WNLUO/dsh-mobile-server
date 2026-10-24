@@ -30,6 +30,8 @@ base64 = "0.22"
 # 控制台要跟登录系统打交道（换 token / 取 userinfo）。rustls 编进二进制，
 # 服务器上不用装 OpenSSL 开发包。
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "charset"] }
+# APNs 令牌鉴权（ES256）：给 provider JWT 签名用。纯 Rust 实现，只在配了推送密钥时走。
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
