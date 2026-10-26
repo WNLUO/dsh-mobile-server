@@ -42,6 +42,7 @@ const T = {
   revokeAllAck: 0x19,  // id=0  JSON {ok, revoked}；中转确认已清空
   pushRegister: 0x1A,  // id=0  JSON {deviceId, platform, token}；宿主代 App 上报 iOS 推送令牌（本实例）
   pushSend: 0x1B,      // id=0  JSON {deviceId, title, body, sessionId?, kind}；宿主请求中转发一条 APNs 推送
+  migrate: 0x1C,       // id=0  JSON {to, at}；宿主换中转地址前在旧隧道上登记「这台搬到 to」，to 空串 = 撤销
 };
 
 /** 编号 → 名字的反查表。 */

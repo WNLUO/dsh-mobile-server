@@ -81,6 +81,11 @@ pub struct Tunnel {
     pub backlog: std::sync::Arc<AtomicI64>,
     pub connected_at: Instant,
     pub last_seen: std::sync::Mutex<Instant>,
+    /// 这条隧道在 `register` 帧里自报的 instanceId。空串 = 还没自报家门。
+    ///
+    /// 只给「按实例记账」的地方用（迁移台账就是一处）：记录键必须是这条隧道自己的
+    /// 身份，不能是调用方手里那个字符串——否则一条隧道就能替别家登记。
+    instance_id: std::sync::Mutex<String>,
     /// 隧道被取代或断开时置位，后续帧一律丢弃。
     pub closed: std::sync::atomic::AtomicBool,
     /// 与 `backlog` 同一个计数的另一个句柄。
@@ -114,8 +119,31 @@ impl Tunnel {
             backlog_arc,
             connected_at: Instant::now(),
             last_seen: std::sync::Mutex::new(Instant::now()),
+            instance_id: std::sync::Mutex::new(String::new()),
             closed: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// 记下这条隧道在 `register` 帧里自报的 instanceId（每次注册都覆盖，最新为准）。
+    pub fn bind_instance(&self, instance_id: &str) {
+        let key = instance_id.trim();
+        if key.is_empty() {
+            return;
+        }
+        let mut current = self.instance_id.lock().unwrap_or_else(|e| e.into_inner());
+        if current.as_str() != key {
+            *current = key.to_string();
+        }
+    }
+
+    /// 这条隧道自己登的 instanceId。还没自报家门时是 `None`。
+    pub fn instance_id(&self) -> Option<String> {
+        let current = self.instance_id.lock().unwrap_or_else(|e| e.into_inner());
+        if current.is_empty() {
+            None
+        } else {
+            Some(current.clone())
+        }
     }
 
     /// 这条隧道上的下一个帧 id。
@@ -551,6 +579,24 @@ mod tests {
         let tunnel = Tunnel::new(tx);
         assert_eq!(tunnel.alloc_id(), 1);
         assert_eq!(tunnel.alloc_id(), 2);
+    }
+
+    /// instanceId 挂在隧道自己身上：没自报家门前是 None，登记了就按最新一次算。
+    #[test]
+    fn tunnel_remembers_its_own_instance_id() {
+        let (tx, _rx) = mpsc::channel(8);
+        let tunnel = Tunnel::new(tx);
+        assert_eq!(tunnel.instance_id(), None, "还没 register 就没有身份");
+        tunnel.bind_instance("   ");
+        assert_eq!(tunnel.instance_id(), None, "空 id 等于没登记");
+        tunnel.bind_instance("inst-a");
+        assert_eq!(tunnel.instance_id().as_deref(), Some("inst-a"));
+        tunnel.bind_instance(" inst-b ");
+        assert_eq!(
+            tunnel.instance_id().as_deref(),
+            Some("inst-b"),
+            "重报家门以最新一次为准（前后空白不算）"
+        );
     }
 
     #[test]

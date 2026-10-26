@@ -347,6 +347,9 @@ pub async fn accept_tunnel(
                 if instance_id.is_empty() {
                     log("tunnel registered without instanceId; it will receive no requests");
                 } else {
+                    // 身份也挂到隧道自己身上：按实例记账的地方（迁移台账）只认它，
+                    // 免得一条隧道替别家登记。这里**每次都覆盖**，跟表里的绑定一致。
+                    tunnel.bind_instance(&instance_id);
                     // 重报注册（同一个实例、同一条连接）也会走到这里，所以只在第一次
                     // 自报家门时改标签：收尾日志里要的是这条连接的身份，不是最后一次的。
                     if instance_label == "unregistered" {
@@ -397,8 +400,16 @@ pub async fn accept_phone_ws(
     let instance = head.header("x-dsh-instance").unwrap_or_default();
     let Some(tunnel) = slot.get_for(instance) else {
         let mut reader = reader;
+        // 这台实例要是搬到别的中转去了，503 里要把新地址带上，手机才知道往哪切。
+        // 没有迁移记录时**原样**回今天这句（空体、connection: close），老客户端一个字节不变。
+        let response = match crate::migrate::migrated_response(instance) {
+            Some((body, to)) => format!(
+                "HTTP/1.1 503 Service Unavailable\r\ncontent-type: application/json; charset=utf-8\r\ncontent-length: {}\r\nx-dsh-migrated-to: {to}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            ),
+            None => "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n".to_string(),
+        };
         let stream = reader.get_mut();
-        let response = "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n";
         let _ = tokio::io::AsyncWriteExt::write_all(stream, response.as_bytes()).await;
         return Ok(());
     };

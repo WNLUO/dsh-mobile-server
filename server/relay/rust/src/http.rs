@@ -646,6 +646,30 @@ pub async fn serve_connection(stream: TcpStream, slot: Arc<TunnelSlot>) -> std::
     // 顶掉新数据。给不出去（没有缓存、凭据对不上、这次读的是归档/翻页/写后刷新）就
     // 原样往下走，回到今天那句「那台宿主不在线」——不新增错误面。
     let instance_id = head.header("x-dsh-instance").unwrap_or_default().trim().to_string();
+    // 这台实例已经不在本中转上了，而它走之前留了「我搬到 X 了」：直接 503 指路。
+    //
+    // **排在镜像兜底之前**：让镜像先答一份 200 的话，手机拿到旧清单就满足了，永远
+    // 学不到新地址——那正是这条迁移记录要解决的那个问题。判据与镜像那条「不可用」同一
+    // 口径（找不到，或者表里那条已经关了）；没有迁移记录就什么都不做，往下照旧。
+    if !instance_id.is_empty() {
+        let unreachable = slot
+            .get_for(&instance_id)
+            .map(|tunnel| tunnel.is_closed())
+            .unwrap_or(true);
+        if unreachable {
+            if let Some((body, to)) = crate::migrate::migrated_response(&instance_id) {
+                respond_with(
+                    &mut reader,
+                    503,
+                    "application/json; charset=utf-8",
+                    body.as_bytes(),
+                    &[("x-dsh-migrated-to".to_string(), to)],
+                )
+                .await?;
+                return Ok(());
+            }
+        }
+    }
     // 这一次读能不能用镜像兜底：隧道不在就直接给，隧道在就带着它去转发（弱网阈值到点才用）。
     let mut mirror_fallback: Option<crate::mirror::Fallback> = None;
     if !instance_id.is_empty() && crate::config().mirror_cache {
@@ -935,5 +959,133 @@ mod tests {
             response.starts_with("HTTP/1.1 404 "),
             "控制面的升级请求必须 404，实际是 {response}"
         );
+    }
+
+    /// 迁移记录里那份凭据摘要的算法（与 `mirror` 内部同一判据）。
+    fn sha256_hex(text: &str) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(text.as_bytes());
+        hasher.finalize().iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// 实例搬走了：503 里带上新地址与响应头，手机据此自己切过去。
+    ///
+    /// 这条是这项功能的主用例——没有它，拿旧地址的手机只会看到「那台宿主不在线」。
+    #[tokio::test]
+    async fn moved_instance_points_the_phone_at_the_new_relay() {
+        let _guard = crate::migrate::test_lock();
+        assert!(crate::migrate::remember(
+            "http-moved",
+            br#"{"to":"https://new.example.com","at":1700000000000}"#
+        ));
+        let response = respond_to(
+            "GET /api/mobile/v1/sessions HTTP/1.1\r\n\
+             host: relay\r\n\
+             x-dsh-instance: http-moved\r\n\r\n",
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 503 "), "要 503，实际是 {response}");
+        assert!(
+            response.contains("x-dsh-migrated-to: https://new.example.com"),
+            "响应头必须带新地址：{response}"
+        );
+        assert!(response.contains(r#""code":"migrated""#), "{response}");
+        assert!(
+            response.contains(r#""to":"https://new.example.com""#),
+            "响应体里的 to 必须是同一个地址：{response}"
+        );
+        assert!(
+            response.contains(r#""error":"that host moved to another relay""#),
+            "{response}"
+        );
+    }
+
+    /// 没有迁移记录时**仍是原来那句 503**：老客户端靠它判断「那台不在线」，
+    /// 一个字节都不许变，也不许凭空多一个头。
+    #[tokio::test]
+    async fn instance_without_a_migration_keeps_the_plain_503() {
+        let _guard = crate::migrate::test_lock();
+        let response = respond_to(
+            "GET /api/mobile/v1/sessions HTTP/1.1\r\n\
+             host: relay\r\n\
+             x-dsh-instance: http-absent\r\n\r\n",
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 503 "), "实际是 {response}");
+        assert!(
+            !response.contains("x-dsh-migrated-to"),
+            "没有记录就不该带这个头：{response}"
+        );
+        assert!(
+            response.ends_with(r#"{"ok":false,"error":"that host is not connected to this relay"}"#),
+            "那句 503 必须原样：{response}"
+        );
+    }
+
+    /// 手机 WS 桥接与 HTTP 走同一条判据：握手阶段就把新地址交出去。
+    #[tokio::test]
+    async fn moved_instance_also_points_the_phone_ws_at_the_new_relay() {
+        let _guard = crate::migrate::test_lock();
+        assert!(crate::migrate::remember(
+            "ws-moved",
+            br#"{"to":"https://new.example.com","at":1}"#
+        ));
+        let response = respond_to(
+            "GET /api/mobile/v1/ws HTTP/1.1\r\n\
+             host: relay\r\n\
+             x-dsh-instance: ws-moved\r\n\
+             upgrade: websocket\r\n\
+             connection: Upgrade\r\n\
+             sec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+             sec-websocket-version: 13\r\n\r\n",
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 503 "), "实际是 {response}");
+        assert!(
+            response.contains("x-dsh-migrated-to: https://new.example.com"),
+            "{response}"
+        );
+    }
+
+    /// 迁移记录**压过镜像兜底**。
+    ///
+    /// 反过来的话，手机拿到一份 200 的旧清单就满足了，永远学不到新地址——那正是这条
+    /// 记录要解决的那个问题（`mirror` 的缓存命中不改变「这台实例已经不在这儿了」）。
+    #[tokio::test]
+    async fn migration_beats_the_mirror_cache() {
+        let _guard = crate::migrate::test_lock();
+        let instance = "http-moved-with-mirror";
+        let credential = "http-moved-with-mirror.1800000000.cred";
+        let sync = serde_json::json!({
+            "kind": "sync",
+            "at": 1,
+            "sessions": { "ok": true, "items": [], "revision": "aaa", "generatedAt": 111 },
+            "workspaces": { "ok": true, "items": [], "revision": "bbb", "generatedAt": 222 },
+            "creds": [{ "hash": sha256_hex(credential) }],
+        })
+        .to_string();
+        assert!(crate::mirror::remember(instance, sync.as_bytes()));
+        assert!(crate::migrate::remember(
+            instance,
+            br#"{"to":"https://new.example.com","at":1}"#
+        ));
+
+        let response = respond_to(&format!(
+            "GET /api/mobile/v1/sessions HTTP/1.1\r\n\
+             host: relay\r\n\
+             x-dsh-instance: {instance}\r\n\
+             x-dsh-device-credential: {credential}\r\n\r\n"
+        ))
+        .await;
+        assert!(
+            response.starts_with("HTTP/1.1 503 "),
+            "有迁移记录时不该回镜像的 200：{response}"
+        );
+        assert!(
+            response.contains("x-dsh-migrated-to: https://new.example.com"),
+            "{response}"
+        );
+        assert!(!response.contains("x-dsh-relay-mirror"), "{response}");
     }
 }

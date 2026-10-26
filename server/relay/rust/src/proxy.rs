@@ -716,6 +716,22 @@ pub fn handle_tunnel_frame(tunnel: &Arc<Tunnel>, instance_id: &str, frame_type: 
                     .await;
             });
         }
+        t::MIGRATE => {
+            // 宿主在断开旧隧道之前报「我搬到 X 了」，让拿旧地址的手机自己跟过去。
+            //
+            // 记录键是**这条隧道自己登的那个 instanceId**（`Tunnel::instance_id`），
+            // 不是上面传下来的标签：payload 里没有「替谁登记」这个字段，所以一条隧道
+            // 结构上替不了别家登记。还没自报家门的隧道什么都记不了——它连自己是谁
+            // 都还没说，记下去就成了一条指向不明实例的指路牌。
+            match tunnel.instance_id() {
+                Some(own) => {
+                    if !crate::migrate::remember(&own, payload) {
+                        log(format!("ignored malformed migrate frame instance={own}"));
+                    }
+                }
+                None => log("ignored migrate frame from a tunnel with no instanceId"),
+            }
+        }
         t::HTTP_HEAD => {
             let value = parse_json_value(payload);
             let status = value
@@ -897,4 +913,49 @@ pub async fn respond_no_tunnel(reader: &mut BufReader<TcpStream>) -> std::io::Re
         r#"{"ok":false,"error":"no host tunnel connected"}"#,
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tunnel() -> Arc<Tunnel> {
+        let (tx, _rx) = mpsc::channel(8);
+        Tunnel::new(tx)
+    }
+
+    /// 迁移帧只按**这条隧道自己登的** instanceId 记账。
+    ///
+    /// payload 里没有「替谁登记」这个字段，所以一条隧道结构上替不了别家登记；而还没
+    /// 自报家门的隧道什么都记不了——它连自己是谁都还没说，记下去就是一条指向不明
+    /// 实例的指路牌。
+    #[test]
+    fn migrate_is_recorded_under_the_tunnels_own_instance_id() {
+        let _guard = crate::migrate::test_lock();
+        let tunnel = tunnel();
+        let payload = br#"{"to":"https://new.example.com","at":1}"#;
+
+        // 还没 register：不记。
+        handle_tunnel_frame(&tunnel, "whatever", t::MIGRATE, 0, payload);
+        assert!(
+            crate::migrate::lookup("whatever").is_none(),
+            "没自报家门的隧道不许登记迁移"
+        );
+
+        // 登记之后：键是它自己的 id，调用方传进来的那个字符串不算数。
+        tunnel.bind_instance("inst-own");
+        handle_tunnel_frame(&tunnel, "someone-else", t::MIGRATE, 0, payload);
+        assert_eq!(
+            crate::migrate::lookup("inst-own").as_deref(),
+            Some("https://new.example.com")
+        );
+        assert!(
+            crate::migrate::lookup("someone-else").is_none(),
+            "一条隧道不能替别家登记"
+        );
+
+        // `to` 为空串 = 撤销这条记录。
+        handle_tunnel_frame(&tunnel, "someone-else", t::MIGRATE, 0, br#"{"to":"","at":2}"#);
+        assert!(crate::migrate::lookup("inst-own").is_none());
+    }
 }

@@ -45,6 +45,8 @@ pub mod t {
     pub const REVOKE_ALL_ACK: u8 = 0x19;
     pub const PUSH_REGISTER: u8 = 0x1A;
     pub const PUSH_SEND: u8 = 0x1B;
+    /// 宿主断开旧隧道之前报「我搬到 `to` 了」；`to` 为空串撤销这条记录。
+    pub const MIGRATE: u8 = 0x1C;
 
     /// 编号 → 名字，用于日志与排错。与 JS 侧 `TYPE_NAME` 对应。
     pub fn name(code: u8) -> Option<&'static str> {
@@ -76,6 +78,7 @@ pub mod t {
             REVOKE_ALL_ACK => "revokeAllAck",
             PUSH_REGISTER => "pushRegister",
             PUSH_SEND => "pushSend",
+            MIGRATE => "migrate",
             _ => return None,
         })
     }
@@ -348,8 +351,15 @@ mod tests {
 
     #[test]
     fn every_type_has_a_name() {
-        for code in 0x01..=0x1Bu8 {
+        for code in 0x01..=0x1Cu8 {
             assert!(t::name(code).is_some(), "{code:#04x} 没有名字");
         }
+    }
+
+    /// 迁移帧的编号是三端钉死的，插件那份内联副本按同一个数写。
+    #[test]
+    fn migrate_is_the_pinned_number() {
+        assert_eq!(t::MIGRATE, 0x1C);
+        assert_eq!(t::name(t::MIGRATE), Some("migrate"));
     }
 }

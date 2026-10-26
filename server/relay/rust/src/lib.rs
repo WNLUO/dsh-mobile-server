@@ -11,6 +11,10 @@
 //! 不在时**回给手机（标成 stale，只对默认视图、只对配对过的设备凭据）。它是离线兜底，
 //! 不是缓存层——隧道活着的时候一个字节都不从它出。`MIRROR_CACHE=0` 可以退回纯转发。
 //!
+//! 还有一本 `migrate`：宿主换中转之前在旧中转上留一条「我搬到 X 了」，本进程按实例
+//! 记 30 天。实例不在线时优先回 503 + `x-dsh-migrated-to`（排在镜像兜底之前——让镜像
+//! 先答 200 的话，手机拿到旧清单就满足了，永远学不到新地址）。
+//!
 //! 另外还挂着**中转控制台**（见 `console`）：面板、微信登录、激活码与准入。
 //! 它是可选的——`PLATFORM_ENABLED` 没设时整套不生效，中转就是纯转发。
 //! 控制台与转发只有一处交界：隧道接入前的准入校验，转发路径本身不碰数据库。
@@ -26,6 +30,7 @@ pub mod config;
 pub mod console;
 pub mod headers;
 pub mod http;
+pub mod migrate;
 pub mod mirror;
 pub mod proxy;
 pub mod selfupdate;
@@ -88,3 +93,54 @@ pub fn tunnel_connected() -> bool {
         .map(|tunnel| !tunnel.is_closed())
         .unwrap_or(false)
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    /// 帧表与 `relay-core/PROTOCOL.md` 必须逐行对齐。
+    ///
+    /// 两处都在同一个仓里，却各写各的：编号只改一处的话，后人照文档实现必错（A4-01
+    /// 那条坑）。这条用例把「文档」变成可验证的产物——两边任何一边多一帧、少一帧、
+    /// 或者名字写错，都会当场红。
+    #[test]
+    fn protocol_doc_matches_the_frame_table() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../relay-core/PROTOCOL.md");
+        let doc = std::fs::read_to_string(path).expect("PROTOCOL.md 必须可读");
+        let mut documented: BTreeMap<u8, String> = BTreeMap::new();
+        for line in doc.lines() {
+            let cells: Vec<&str> = line.split('|').map(str::trim).collect();
+            let Some(hex) = cells.get(1).and_then(|cell| cell.strip_prefix("0x")) else {
+                continue;
+            };
+            let Ok(code) = u8::from_str_radix(hex, 16) else {
+                continue;
+            };
+            let Some(name) = cells.get(2).filter(|name| !name.is_empty()) else {
+                continue;
+            };
+            assert!(
+                documented.insert(code, name.to_string()).is_none(),
+                "PROTOCOL.md 里 {code:#04x} 出现了两次"
+            );
+        }
+
+        // 文档里的每一行都要在 Rust 表里有同编号同名的常量。
+        for (&code, name) in &documented {
+            assert_eq!(
+                dsh_relay_protocol::t::name(code),
+                Some(name.as_str()),
+                "PROTOCOL.md 的 {code:#04x} 行写的是 {name}，Rust 侧对不上"
+            );
+        }
+        // 反过来：Rust 表里的每一帧都必须在文档里有行。
+        for code in 0x01..=0x1Cu8 {
+            let name = dsh_relay_protocol::t::name(code).expect("每一帧都要有名字");
+            assert!(
+                documented.contains_key(&code),
+                "PROTOCOL.md 缺 {name}（{code:#04x}）这一行"
+            );
+        }
+    }
+}
+
