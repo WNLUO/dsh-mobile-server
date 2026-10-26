@@ -28,9 +28,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
-/// 同时记多少台实例的镜像。中转本来是给「一台机器一个实例」用的，公用中转上实例数
-/// 也就这么多；超了淘汰最旧的那份，别让一张表长到吃光内存。
-const MAX_INSTANCES: usize = 16;
+/// 同时记多少台实例的镜像。
+///
+/// 16 是按「一台机器一个实例」的老口径定的。公用中转上一百多台宿主同时在线时，16 个
+/// 位置每插一台就挤掉最旧那台，于是每台每 5 秒推上来的那帧都被当成「第一次落地」：
+/// 日志每帧一行（一台机器一天两百万行），缓存和凭据摘要随时被挤掉——宿主掉线后手机读
+/// 不到兜底，推令牌上报也核不过。512 覆盖公用中转的实际规模，内存由下面的总字节预算兜。
+const MAX_INSTANCES: usize = 512;
+/// 整本账的总字节预算。只按台数卡的话，512 台 × 单份 4MB 理论上能吃到 2GB，而公用中转
+/// 跑在小机器上（一台 960MB 内存）。超了就从最旧的那份开始淘汰，刚推上来的那份永远留。
+const MAX_TOTAL_BYTES: usize = 64 * 1024 * 1024;
 /// 单份镜像（会话清单 + 工作区两份 body）的字节上限。
 ///
 /// 4MB 而不是 3MB：宿主把业务正文封进信封之后，base64 让同样的内容大 4/3。上限卡在
@@ -147,17 +154,14 @@ pub fn remember(instance_id: &str, payload: &[u8]) -> bool {
     let mut map = store().lock().unwrap_or_else(|e| e.into_inner());
     let previous_creds = map.get(key).map(|entry| entry.creds.len());
     if !map.contains_key(key) && map.len() >= MAX_INSTANCES {
-        let oldest = map
-            .iter()
-            .min_by_key(|(_, entry)| (entry.stored_at_ms, entry.stored_seq))
-            .map(|(instance, _)| instance.clone());
-        if let Some(instance) = oldest {
-            map.remove(&instance);
-        }
+        evict_oldest(&mut map);
     }
     let (sessions_bytes, workspaces_bytes) = (entry.sessions.len(), entry.workspaces.len());
     let creds_count = entry.creds.len();
     map.insert(key.to_string(), entry);
+    // 台数管住之后还要管住总量：大清单 × 多实例会先把内存吃满，再轮到台数上限。
+    // 淘汰的永远是最旧的那份，刚插进来的这份 seq 最大、轮不到它。
+    prune_to_budget(&mut map, MAX_TOTAL_BYTES);
     drop(map);
     // 只在这两件事上留一行：镜像第一次落地、摘要条数变了。镜像本身每 500ms 就重推一次，
     // 每推一次打一行会把日志刷满；而这两条恰恰是运维要看的（「中转到底收没收到镜像」
@@ -172,6 +176,41 @@ pub fn remember(instance_id: &str, payload: &[u8]) -> bool {
         Some(_) => {}
     }
     true
+}
+
+/// 一份镜像占多少字节。粗算即可：口径只需要在几份同量级的镜像之间分得出新旧，
+/// 不计字段名与结构体本身的开销。
+fn entry_bytes(key: &str, entry: &MirrorEntry) -> usize {
+    key.len()
+        + entry.sessions.len()
+        + entry.workspaces.len()
+        + entry.creds.iter().map(|(hash, _)| hash.len()).sum::<usize>()
+}
+
+fn total_bytes(map: &HashMap<String, MirrorEntry>) -> usize {
+    map.iter()
+        .map(|(key, entry)| entry_bytes(key, entry))
+        .sum()
+}
+
+/// 淘汰最旧的那一份。新旧按「落地时刻 + 落地顺序」排：只按毫秒排的话，同一毫秒里
+/// 推上来的几份会变成「随便挑一份」。
+fn evict_oldest(map: &mut HashMap<String, MirrorEntry>) {
+    let oldest = map
+        .iter()
+        .min_by_key(|(_, entry)| (entry.stored_at_ms, entry.stored_seq))
+        .map(|(instance, _)| instance.clone());
+    if let Some(instance) = oldest {
+        map.remove(&instance);
+    }
+}
+
+/// 总量超预算就从头淘汰，直到装得下。留一份是给「单份自己就超预算」兜底：
+/// 淘汰到最后只剩刚推上来的这份，至少不会把最新的镜像也扔掉。
+fn prune_to_budget(map: &mut HashMap<String, MirrorEntry>, max_bytes: usize) {
+    while map.len() > 1 && total_bytes(map) > max_bytes {
+        evict_oldest(map);
+    }
 }
 
 /// 读缓存：给不出去就 None，调用方照旧走「那台宿主不在线」。
@@ -636,5 +675,64 @@ mod tests {
         assert_eq!(lookup("mirror-cap-0", ListKind::Sessions, "", &presented(&["cred_live"])), None);
         let newest = format!("mirror-cap-{}", MAX_INSTANCES + 3);
         assert!(lookup(&newest, ListKind::Sessions, "", &presented(&["cred_live"])).is_some());
+    }
+
+    /// 公用中转上一百多台宿主同时在线时，每台那份都要留得住。
+    ///
+    /// 2026-10-27 实测：美国那台 124 台在线，上限 16 的账本每插一台就挤掉最旧那台，
+    /// 于是每台每 5 秒推上来的那帧都被当成「第一次落地」——一天两百万行日志，而且
+    /// 兜底缓存与推送令牌的凭据核对随时失效。这条按公用规模插一遍、逐台读回来，
+    /// 谁把上限调回单机口径就红。
+    #[test]
+    fn a_busy_public_relay_keeps_every_instance() {
+        let _guard = serial();
+        assert!(MAX_INSTANCES >= 256, "公用中转的实例规模远超「一台机器一个实例」的口径");
+        let count = 200usize;
+        for index in 0..count {
+            let instance = format!("mirror-public-{index}");
+            assert!(remember(
+                &instance,
+                &payload(serde_json::json!([{ "hash": sha256_hex("cred_live") }]))
+            ));
+        }
+        for index in 0..count {
+            let instance = format!("mirror-public-{index}");
+            assert!(
+                lookup(&instance, ListKind::Sessions, "", &presented(&["cred_live"])).is_some(),
+                "{instance} 被别的实例挤掉了"
+            );
+        }
+    }
+
+    /// 只按台数卡不够：512 台 × 单份 4MB 能把小机器吃光，所以总量还要有预算。
+    fn fake_entry(bytes: usize, seq: u64) -> MirrorEntry {
+        MirrorEntry {
+            sessions: "s".repeat(bytes),
+            workspaces: String::new(),
+            sessions_revision: String::new(),
+            workspaces_revision: String::new(),
+            sessions_generated_at: 0,
+            workspaces_generated_at: 0,
+            creds: Vec::new(),
+            stored_at_ms: seq,
+            stored_seq: seq,
+        }
+    }
+
+    #[test]
+    fn a_byte_budget_prunes_the_oldest() {
+        let mut map: HashMap<String, MirrorEntry> = HashMap::new();
+        for seq in 0..8u64 {
+            map.insert(format!("m{seq}"), fake_entry(1000, seq));
+        }
+        prune_to_budget(&mut map, 3000);
+        assert!(total_bytes(&map) <= 3000, "淘汰之后总量必须落在预算内");
+        assert!(map.contains_key("m7"), "刚推上来的那份不能被扔");
+        assert!(!map.contains_key("m0"), "淘汰从最旧的开始");
+        // 单份自己就超预算时也要留一份，至少别把最新的镜像也扔掉。
+        let mut single: HashMap<String, MirrorEntry> = HashMap::new();
+        single.insert("big".to_string(), fake_entry(5000, 1));
+        prune_to_budget(&mut single, 1000);
+        assert_eq!(single.len(), 1);
     }
 }
