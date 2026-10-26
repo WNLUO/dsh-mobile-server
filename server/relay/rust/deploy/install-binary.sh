@@ -74,8 +74,9 @@ done
 entry=$(tr -d '\n' <"$MANIFEST" | grep -o "\"$ARCH\":{[^}]*}" | head -1 || true)
 [ -n "$entry" ] || die "清单里没有 $ARCH 这个架构的包"
 VERSION=$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$MANIFEST" | head -1)
-URL=$(printf '%s' "$entry" | sed -n 's/.*"url":"\([^"]*\)".*/\1/p')
-SHA=$(printf '%s' "$entry" | sed -n 's/.*"sha256":"\([^"]*\)".*/\1/p')
+# 冒号后面的空白可有可无：紧凑格式和手工写的多行格式都要认。
+URL=$(printf '%s' "$entry" | sed -n 's/.*"url"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+SHA=$(printf '%s' "$entry" | sed -n 's/.*"sha256"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
 [ -n "$VERSION" ] && [ -n "$URL" ] && [ -n "$SHA" ] || die "清单里的版本 / 地址 / 校验和少了一样"
 
 say "下载 dsh-relay $VERSION（$ARCH）"
