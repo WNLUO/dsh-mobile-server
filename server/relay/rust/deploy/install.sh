@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 #
-# 一键安装并启动 dsh-relay。
+# 一键安装并启动 dsh-relay —— **源码编译路线**。
+#
+# 普通部署不要用这个：`install-binary.sh` 直接下已经编好的静态包，不用装 Rust、不用编译。
+# 这条留给要改代码的人（改完就得自己编一份）。
 #
 # 用法（在仓库根目录）：
 #   sudo ./deploy/install.sh

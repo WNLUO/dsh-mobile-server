@@ -226,7 +226,7 @@ impl UpdateState {
 pub struct Paths {
     /// 正在运行的那个可执行文件。上一版就放在它边上的 `.previous`。
     pub exe: PathBuf,
-    /// 数据目录，状态文件与下载的临时文件都放这里。
+    /// 数据目录，升级状态文件放这里。
     pub data_dir: PathBuf,
 }
 
@@ -237,6 +237,17 @@ impl Paths {
 
     pub fn previous(&self) -> PathBuf {
         self.exe.with_extension("previous")
+    }
+
+    /// 下载暂存文件。
+    ///
+    /// **必须和可执行文件在同一个文件系统上**：最后一步是 `rename`，跨设备会直接
+    /// `EXDEV` 失败。早先它放在数据目录里，而数据目录跟着数据库路径走
+    /// （`PLATFORM_DB_PATH` 那套），把库挪到另一块盘的部署就会每天记一行「替换失败」。
+    /// 放在 exe 旁边没有这个隐患，也不用为了升级额外要求两个目录同盘。
+    pub fn staging(&self, version: &str) -> PathBuf {
+        self.exe
+            .with_file_name(format!(".dsh-relay-{version}.new"))
     }
 
     pub fn load(&self) -> UpdateState {
@@ -626,10 +637,7 @@ async fn apply(
         ));
     }
 
-    let staging = ctx
-        .paths
-        .data_dir
-        .join(format!(".dsh-relay-{version}.new"));
+    let staging = ctx.paths.staging(version);
     write_executable(&staging, &bytes)?;
 
     // **替换之前**先试跑。起不来的包在这里就拦住，线上文件名一个字节都没动。
@@ -749,6 +757,21 @@ mod tests {
             exe: dir.join("dsh-relay"),
             data_dir: dir.join("data"),
         }
+    }
+
+    /// 暂存文件必须落在可执行文件旁边，不能落在数据目录里。
+    ///
+    /// 两者常常不在同一个文件系统上（数据目录跟着数据库路径走），跨设备 rename 会
+    /// 直接失败——那台机器就会每天记一行「替换失败」，版本永远升不上去。
+    #[test]
+    fn staging_lives_next_to_the_executable() {
+        let dir = temp_dir("staging");
+        let paths = paths_at(&dir);
+        let staging = paths.staging("0.2.0");
+        assert_eq!(staging.parent(), paths.exe.parent(), "暂存文件必须和 exe 同目录");
+        assert_ne!(staging.parent(), Some(paths.data_dir.as_path()), "不能放数据目录");
+        assert!(staging.to_string_lossy().ends_with(".dsh-relay-0.2.0.new"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 测试用：给脚本加上可执行位。

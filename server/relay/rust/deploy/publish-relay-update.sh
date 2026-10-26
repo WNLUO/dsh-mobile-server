@@ -16,6 +16,15 @@
 # 两个列表按位置一一对应；只给一个就只发一处。海外那台的中转把海外源写在自己
 # SELF_UPDATE_SOURCE 里，它不会来国内取。
 #
+# 先预发、再正式（`RELAY_UPDATE_CHANNEL=canary`）：
+#   RELAY_UPDATE_CHANNEL=canary \
+#   RELAY_UPDATE_ROOT_CANARY=/opt/dsh-mobile/relay-updates-canary \
+#   RELAY_UPDATE_PUBLIC_BASE_CANARY=https://dsh-hub.wnluo.com/relay-updates-canary \
+#   ./publish-relay-update.sh 0.1.9 /abs/path/dsh-relay-linux-x86_64 [aarch64 路径]
+# canary 目录只有「更新源把 canary 写在最前面」的那台机器会读。它升上去、跑一段、
+# 人看过日志与 /status 之后，去掉这两个变量再跑一次同一条命令，才是正式发布。
+# 两条通道共用同一份二进制——差别只在清单放在哪个目录。
+#
 # 目标是 GitHub 时，ROOT 那一项写 `@github`（不是目录）：
 #   RELAY_UPDATE_EXTRA_ROOTS=/path/to/repo-checkout/relay-updates\ @github
 #   RELAY_UPDATE_EXTRA_BASES=<raw 前缀> <github 前缀>
@@ -48,10 +57,32 @@ printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || {
 
 # 更新源的落盘目录与对外地址都由部署方给，**不写死**：这份脚本一旦被抄到别人的机器上，
 # 写死的地址会把人家的二进制发布到我们的域名下（或反过来取错地方）。
-ROOT=${RELAY_UPDATE_ROOT:-/opt/dsh-mobile/relay-updates}
-PUBLIC_BASE=${RELAY_UPDATE_PUBLIC_BASE:-}
+#
+# 两条通道同一套逻辑，区别只在清单落哪个目录：canary 是「先给我们自己的机器升」的那份，
+# release 是所有人读的那份。二进制两次发布用的是同一份文件，不做任何重编。
+CHANNEL=${RELAY_UPDATE_CHANNEL:-release}
+case "$CHANNEL" in
+    release)
+        ROOT=${RELAY_UPDATE_ROOT:-/opt/dsh-mobile/relay-updates}
+        PUBLIC_BASE=${RELAY_UPDATE_PUBLIC_BASE:-}
+        BASE_HINT=https://your-domain.example/relay-updates
+        ;;
+    canary)
+        ROOT=${RELAY_UPDATE_ROOT_CANARY:-/opt/dsh-mobile/relay-updates-canary}
+        PUBLIC_BASE=${RELAY_UPDATE_PUBLIC_BASE_CANARY:-}
+        BASE_HINT=https://your-domain.example/relay-updates-canary
+        ;;
+    *)
+        echo "RELAY_UPDATE_CHANNEL 只能是 release 或 canary，收到：$CHANNEL" >&2
+        exit 2
+        ;;
+esac
 if [ -z "$PUBLIC_BASE" ]; then
-    echo "请设 RELAY_UPDATE_PUBLIC_BASE（例如 https://your-domain.example/relay-updates），" >&2
+    if [ "$CHANNEL" = canary ]; then
+        echo "请设 RELAY_UPDATE_PUBLIC_BASE_CANARY（例如 $BASE_HINT），" >&2
+    else
+        echo "请设 RELAY_UPDATE_PUBLIC_BASE（例如 $BASE_HINT），" >&2
+    fi
     echo "它是写进 latest.json 的下载地址前缀，必须是一个能从外网取到的真实地址。" >&2
     exit 2
 fi
@@ -137,12 +168,9 @@ mirror_manifest_only() {
     [ -d "$target_root" ] || mkdir -p "$target_root"
     entries=""
     for arch in x86_64 aarch64; do
-        # 资产名沿用已有约定：x86_64 就是 dsh-relay-<版本>，aarch64 加后缀区分。
-        if [ "$arch" = "x86_64" ]; then
-            asset="dsh-relay-$VERSION"
-        else
-            asset="dsh-relay-$VERSION-linux-$arch"
-        fi
+        # 资产名与更新源里的文件名、与 GitHub Actions 出的包**三处同名**：
+        # dsh-relay-linux-<arch>。装、升、人工下载看到的是同一个名字。
+        asset="dsh-relay-linux-$arch"
         hash=$(sha256sum "$ROOT/dsh-relay-linux-$arch" 2>/dev/null | cut -d' ' -f1)
         [ -n "$hash" ] || continue
         entry="\"$arch\":{\"url\":\"https://github.com/$repo/releases/download/$tag/$asset\",\"sha256\":\"$hash\"}"
@@ -215,4 +243,8 @@ for base in $EXTRA_BASES; do
     fi
 done
 
-echo "已发布 $VERSION：$ROOT/latest.json"
+echo "已发布 $VERSION（$CHANNEL）：$ROOT/latest.json"
+if [ "$CHANNEL" = canary ]; then
+    echo "预发通道：只有把 $PUBLIC_BASE 写在 SELF_UPDATE_SOURCE 最前面的那台会升。"
+    echo "跑一段、看过日志与 /status 之后，去掉 RELAY_UPDATE_CHANNEL 再跑一次同一条命令发正式。"
+fi

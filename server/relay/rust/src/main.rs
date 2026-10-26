@@ -160,16 +160,19 @@ async fn main() {
     }
 
     if config.self_update {
-        // 开了自动更新却没给更新源：**拒绝启动**，不静默跳过。
-        // 静默跳过会让人以为「开着」，真出事时才发现从没生效过；更早的版本还会默认去
-        // 别人的域名拉包（见 config.rs 里更新源默认值为空的注释）。这两种都比一句
-        // 启动报错糟得多。
+        // 开了自动更新却没有更新源：**拒绝启动**，不静默跳过。
+        // 静默跳过会让人以为「开着」，真出事时才发现从没生效过。
+        //
+        // 走不到这里的情形是「官方预编译包」：那个包在编译期烤进了一组默认源
+        // （见 config.rs 的 BUILT_IN_SOURCES），所以从我们发布的包装的人只要
+        // SELF_UPDATE=1 就够了。自己 `cargo build` 出来的没有默认源，必须自己指定
+        // ——这是刻意的：源码编的机器不该被官方二进制悄悄换掉。
         if config.self_update_sources.is_empty() {
             eprintln!(
-                "错误：SELF_UPDATE=1 但没设 SELF_UPDATE_SOURCE。自动更新要从一个你控制的\
-                 静态目录取 latest.json，不设就不知道去哪取。\
-                 \n  例：SELF_UPDATE_SOURCE=https://your-domain.example/relay-updates\
-                 \n  多个源用逗号分隔，按顺序试。\
+                "错误：SELF_UPDATE=1 但没有任何更新源，也没有烤进默认源。\
+                 \n  源码编译出来的版本不带默认源（避免自己编的被官方二进制替换）。要么给一个：\
+                 \n    SELF_UPDATE_SOURCE=https://your-domain.example/relay-updates\
+                 \n  要么改用官方预编译包（它内置了默认源）。多个源用逗号分隔，按顺序试。\
                  \n  不想用自动更新就别设 SELF_UPDATE。"
             );
             std::process::exit(1);

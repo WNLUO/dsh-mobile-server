@@ -1,0 +1,199 @@
+# 出中转的发布包：两个架构的静态二进制，编完自己验一遍，再挂到 Release 上。
+#
+# 为什么在 CI 编，不在服务器上编：
+#   - 静态 musl 包要交叉工具链。服务器上没有、也装不干净（Alpine 自带的 rust 编不出
+#     这个工程，见 build-static.sh 文件头），而这里两行 apt / 一次下载就齐了。
+#   - ARM64 的包在 x86 机器上没法真跑，这里可以装 qemu 跑一次 `--version`——
+#     没有这一步，「发了个坏包」要等用户机器升不上去才知道。
+#   - 一个版本号只对应**一份**二进制：本机编一版、CI 再编一版，就会出现同一版本两份
+#     不同字节的文件（这个项目踩过，见 README 的发布一节）。
+#
+# 这个 workflow **只出文件、不发布清单**。清单（latest.json）在 soak 之后由发布脚本
+# 写出去：先给我们自己的机器升，看过日志与 /status 再对外。所以这里的 Release
+# 有资产、但没有指向它的清单，用户那会儿还收不到更新。
+name: release-relay
+
+on:
+  push:
+    tags:
+      - 'rust-v*'
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: '创建 / 更新 GitHub Release（留空只编包，不挂 Release）'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  # 烤进二进制的默认更新源（config.rs 的 BUILT_IN_SOURCES）。
+  # **要和 deploy/install-binary.sh 里的 DEFAULT_SOURCES 一致**：一个管装的时候从哪下，
+  # 一个管装完以后从哪儿升级。国内镜像在前是因为国内服务器基本连不上 github.com。
+  DSH_RELAY_UPDATE_SOURCE: https://dsh-hub.wnluo.com/relay-updates,https://raw.githubusercontent.com/WNLUO/dsh-mobile-server/relay-updates/relay-updates
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: 编 ${{ matrix.arch }} 静态包
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            target: x86_64-unknown-linux-musl
+          - arch: aarch64
+            target: aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 读版本号，tag 对不上一律失败
+        id: version
+        run: |
+          set -eu
+          version=$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' server/relay/rust/Cargo.toml | head -1)
+          [ -n "$version" ] || { echo "没能从 Cargo.toml 读出版本号" >&2; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "版本 $version"
+          case "$GITHUB_REF" in
+            refs/tags/rust-v*)
+              tag=${GITHUB_REF#refs/tags/rust-v}
+              # 版本号早就发过就不能复用：同一版本两份二进制会让「机器上升上去的是哪份」
+              # 永远说不清。发布脚本也拦这一条，这里再拦一次是因为 tag 是绕过它的入口。
+              [ "$tag" = "$version" ] || {
+                echo "tag 是 rust-v$tag，但 Cargo.toml 是 $version；先抬版本号再打 tag" >&2
+                exit 1
+              }
+              ;;
+          esac
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: 装交叉工具链
+        run: |
+          set -eu
+          case "${{ matrix.arch }}" in
+            x86_64)
+              # 宿主就是 x86_64，musl-tools 给的 musl-gcc 直接能用。
+              sudo apt-get update -qq
+              sudo apt-get install -y -qq --no-install-recommends musl-tools file binutils
+              cc=musl-gcc ar=ar expect_machine="Advanced Micro Devices X86-64"
+              ;;
+            aarch64)
+              # musl.cc 的交叉工具链：从国内机器上下不动，GitHub 的 runner 上一分钟。
+              curl -fsSL --retry 3 https://musl.cc/aarch64-linux-musl-cross.tgz -o /tmp/musl-cross.tgz
+              sudo tar -xzf /tmp/musl-cross.tgz -C /opt
+              cc=/opt/aarch64-linux-musl-cross/bin/aarch64-linux-musl-gcc
+              ar=/opt/aarch64-linux-musl-cross/bin/aarch64-linux-musl-ar
+              expect_machine=AArch64
+              echo "/opt/aarch64-linux-musl-cross/bin" >> "$GITHUB_PATH"
+              # 只为了试跑一次 --version，编的时候不用模拟。
+              sudo apt-get update -qq
+              sudo apt-get install -y -qq --no-install-recommends qemu-user-static file binutils
+              ;;
+          esac
+          # cc-rs 认的是把 - 换成 _ 的大写变量名。
+          key=$(printf '%s' "${{ matrix.target }}" | tr 'a-z-' 'A-Z_')
+          {
+            echo "CC_${key}=$cc"
+            echo "AR_${key}=$ar"
+            echo "CARGO_TARGET_${key}_LINKER=$cc"
+            echo "TARGET=${{ matrix.target }}"
+            echo "ARCH=${{ matrix.arch }}"
+            echo "EXPECT_MACHINE=$expect_machine"
+            # 不加 crt-static 会出 static-pie（file 显示 interpreter /lib/ld-musl-*.so.1），
+            # 在 Rocky / Debian 上照样起不来；relocation-model=static 消掉 PT_INTERP。
+            echo "RUSTFLAGS=-C target-feature=+crt-static -C relocation-model=static"
+          } >> "$GITHUB_ENV"
+
+      - name: 编译
+        run: cargo build --release --locked --manifest-path server/relay/rust/Cargo.toml --target "$TARGET"
+
+      - name: 验真静态、验架构、跑一次 --version
+        run: |
+          set -eu
+          bin="server/relay/rust/target/$TARGET/release/dsh-relay"
+          version="${{ steps.version.outputs.version }}"
+          ls -l "$bin"
+          file "$bin"
+          file "$bin" | grep -q 'statically linked' || { echo "不是静态链接" >&2; exit 1; }
+          if readelf -l "$bin" | grep -q INTERP; then
+            echo "产物里有 PT_INTERP，换台机器就起不来" >&2; exit 1
+          fi
+          readelf -h "$bin" | grep -qF "$EXPECT_MACHINE" || { echo "架构不对" >&2; exit 1; }
+          # 架构不对、缺动态库、包是坏的，都在这里暴露。ARM64 在 x86 runner 上只能靠 qemu。
+          if [ "$ARCH" = aarch64 ]; then
+            out=$(qemu-aarch64-static "$bin" --version)
+          else
+            out=$("$bin" --version)
+          fi
+          echo "$out"
+          echo "$out" | grep -qF "$version" || { echo "自报版本不对（期望 $version）" >&2; exit 1; }
+
+      - name: 收产物
+        run: |
+          set -eu
+          mkdir -p dist
+          # 资产名和更新源里的文件名**一致**（dsh-relay-linux-<arch>）：
+          # 装的时候、升级的时候、人工下载的时候看到的是同一个名字。
+          cp "server/relay/rust/target/$TARGET/release/dsh-relay" "dist/dsh-relay-linux-$ARCH"
+          chmod 755 "dist/dsh-relay-linux-$ARCH"
+          sha256sum "dist/dsh-relay-linux-$ARCH"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dsh-relay-linux-${{ matrix.arch }}
+          path: dist/dsh-relay-linux-${{ matrix.arch }}
+          if-no-files-found: error
+
+  release:
+    name: 挂到 Release
+    needs: build
+    # 只有 tag 推上来、或者手动点了「要发 Release」才发；手动空跑只出包。
+    if: startsWith(github.ref, 'refs/tags/rust-v') || inputs.publish
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 读版本号
+        id: version
+        run: |
+          set -eu
+          version=$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' server/relay/rust/Cargo.toml | head -1)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: 发 Release（已存在就覆盖资产）
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          version="${{ steps.version.outputs.version }}"
+          tag="rust-v$version"
+          ls -l dist
+          cat > /tmp/notes.md <<NOTES
+          静态包（musl，静态链接）：Rocky / Debian / Ubuntu / Alpine 通用，同一份二进制。
+
+          - \`dsh-relay-linux-x86_64\`
+          - \`dsh-relay-linux-aarch64\`
+
+          装（不用装 Rust、不编译）：
+
+          \`\`\`
+          curl -fsSLO https://raw.githubusercontent.com/${{ github.repository }}/main/server/relay/rust/deploy/install-binary.sh
+          sudo sh install-binary.sh
+          \`\`\`
+          NOTES
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/* --clobber
+          else
+            gh release create "$tag" dist/* --title "dsh-relay $version" --notes-file /tmp/notes.md
+          fi

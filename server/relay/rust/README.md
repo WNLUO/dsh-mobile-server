@@ -32,19 +32,38 @@
 在一台装好 systemd 的 Linux 上，`root` 身份跑一次：
 
 ```sh
+# 下安装脚本，跑一次（不用装 Rust，不编译）
+curl -fsSLO https://raw.githubusercontent.com/WNLUO/dsh-mobile-server/main/server/relay/rust/deploy/install-binary.sh
+sudo sh install-binary.sh
+```
+
+它从更新源取**已经编好的静态包**（x86_64 / aarch64 各有），先核对 sha256、再真的跑一次
+`--version` 确认这个包在这台机器上起得来，然后装到 `/opt/dsh-relay/`、写 systemd 单元并
+启动（监听 `127.0.0.1:18788`），顺手把自动更新打开。跑完会打印 nginx 反代片段，把域名
+指到那个端口就行。
+
+包是静态链接的 musl 二进制，Rocky / Debian / Ubuntu / Alpine 共用同一份——不用挑发行版，
+也不用装运行时依赖。
+
+**它刻意不碰的东西**：不改你的 nginx、不配 TLS、不开控制台。原因写在脚本头上——上证书的
+方式太多，脚本猜一种就会把别人的机器配歪；控制台要微信登录的三件套密钥，没有那三样的
+机器开了也登不进去。
+
+### 从源码装（要改代码才用这条）
+
+```sh
 git clone https://github.com/WNLUO/dsh-mobile-server.git
 cd dsh-mobile-server/server/relay/rust
 sudo ./deploy/install.sh
 ```
 
 它做四件事：装 Rust（走国内镜像，官网在国内基本下不动）、编译、把二进制放到
-`/opt/dsh-relay/`、写 systemd 单元并启动（监听 `127.0.0.1:18788`）。跑完会打印
-nginx 反代片段，把域名指到那个端口就行。
+`/opt/dsh-relay/`、写 systemd 单元并启动。**普通部署不要走这条**——编一次要装两百多兆
+的工具链、等几分钟，而我们发布的包跟它是同一份代码编出来的。
 
-**它刻意不碰的东西**：不改你的 nginx、不配 TLS、不开控制台、不自动更新。原因写在
-脚本头上——上证书的方式太多，脚本猜一种就会把别人的机器配歪；控制台要微信登录的
-三件套密钥，没有那三样的机器开了也登不进去；自动更新要从别人的服务器下载二进制再
-替换自己，默认开等于给别人一个远程执行的口子。
+源码编出来的二进制**不带默认更新源**，开自动更新必须自己指定 `SELF_UPDATE_SOURCE`；
+从我们发布的包装的那份带了默认源（`SELF_UPDATE=1` 就够）。这条差别是刻意的：自己编的
+不应该被官方二进制悄悄换掉。
 
 ### 手动装
 
@@ -100,8 +119,13 @@ WantedBy=multi-user.target
 | `WS_PONG_TIMEOUT_MS` | 60000 | 手机 WS 半开判定 |
 | `DEBUG_SSE` | 关 | 打 SSE 开/关日志 |
 | `SELF_UPDATE` | **关** | 打开后这台中转会自己升到更新源上的新版本 |
-| `SELF_UPDATE_SOURCE` | **空** | 更新源，下面要能取到 `latest.json`。`SELF_UPDATE=1` 时必填，不填启动报错。**多个源用逗号分隔，按顺序试** |
-| `SELF_UPDATE_INTERVAL_SECONDS` | 86400 | 查新版本的间隔，**下限一天** |
+| `SELF_UPDATE_SOURCE` | 见下 | 更新源，下面要能取到 `latest.json`。**多个源用逗号分隔，按顺序试** |
+| `SELF_UPDATE_INTERVAL_SECONDS` | 86400 | 查新版本的间隔，越界（小于一天 / 大于一周）**报错**，不 clamp |
+
+`SELF_UPDATE_SOURCE` 的默认值分两种：**官方预编译包**里烤了一组默认源（国内镜像在前、
+GitHub 那份清单在后），所以 `SELF_UPDATE=1` 就够；**自己 `cargo build` 出来的没有默认源**，
+`SELF_UPDATE=1` 又不给地址会直接启动报错。这条差别是刻意的——源码编的机器不该被官方
+二进制悄悄替换掉。
 
 越界的值**直接报错启动失败，不是 clamp**——手滑写个 0 被静默接受，表现是「限额关掉了」
 而不是「设错了」。
@@ -266,40 +290,30 @@ npm run test:e2e
 
 ## 自动更新
 
-**默认关，而且默认没有更新源。** 两件都要你自己给：
+**出厂是关的。** 从我们发布的包装的那种，安装脚本会把它打开（写进
+`/etc/dsh-relay-update.env`），因为发布渠道只有我们这一条，不打开等于用户永远停在装的
+那一版。关着的时候什么都不会发生，转发一个字都不变。
+
+**默认源由包内置**：国内镜像在前、GitHub 上那份清单在后，按顺序试。所以用官方包时只要：
 
 ```sh
 SELF_UPDATE=1
-SELF_UPDATE_SOURCE=https://your-domain.example/relay-updates   # 必须写，指向你自己的静态目录
 ```
 
-**跟控制台无关**：纯转发的机器（没设 `PLATFORM_ENABLED`）一样能自己升级。升级状态记在
-数据目录的 `.update-state` 里，是个纯文本文件，不碰数据库。
-
-**可以给多个源，逗号分隔、按顺序试**：
+想换成自己的静态目录就覆盖掉：
 
 ```sh
-SELF_UPDATE_SOURCE=https://dsh-hub.wnluo.com/relay-updates,https://raw.githubusercontent.com/WNLUO/dsh-mobile-server/main/relay-updates
+SELF_UPDATE_SOURCE=https://your-domain.example/relay-updates
 ```
 
-国内机器把国内源放前面，海外机器把海外源放前面。单源的问题是它安静地变成单点：
-那个域名一挂（或被墙），这台机器就再也收不到新版本，而它只会每天往日志里写一行失败。
+自己 `cargo build` 出来的二进制**没有内置默认源**，`SELF_UPDATE=1` 又不给地址会直接启动
+报错退出（不静默跳过）。这是刻意的：早先写死过我们自己的运营机，那意味着「开了自动更新
+但没改源」的用户会来别人的域名取二进制、校验通过、替换掉自己的程序——那不是更新，是把
+远程执行的口子交给了一个陌生人。源码编的机器现在同样不许有这个默认。
 
-只开 `SELF_UPDATE` 不给地址 → **启动直接报错退出**，不静默跳过。早先这里写死了我们自己
-的运营机，那意味着「开了自动更新但没改源」的用户会来别人的域名取二进制、校验通过、
-然后替换掉自己的程序——那不是更新，是把远程执行的口子交给了一个陌生人。
-
-两种情形下这件事的实情：
-
-- **自己部署这台中转**：开关一开就生效，去看更新源上有没有 `latest.json`。但**你得自己
-  有地方发布**——这套机制是给「我们自己发版给一批中转用」设计的，不是给单节点用户准备
-  的升级通道。单节点用户直接重装更快：`git pull` 后重跑一遍 `deploy/install.sh`。
-  没有更新源就别开这个开关。
-- **用我们发布的二进制**：那才有意义。前提是 `SELF_UPDATE_SOURCE` 指向发布方的更新源，
-  并且那个地址在国内稳定可访问（为什么不能用 GitHub Release，见下）。
-
-一句话：**这项能力的存在前提是「有一方在批量发布、有一方在批量消费」。** 不是那种前提时，
-直接重装。
+**为什么 GitHub 排在后面**：试过。`api.github.com` 在国内能连，但 Release 资产真正的
+下载域名 `github.com` 连不通；绕开它走 API 的资产直链也只有几十 KB/s，8MB 的二进制
+要下一个多小时。所以国内镜像当主力，GitHub 那份清单是**主源挂了**时的兜底。
 
 ### 换上去之前先试跑，换上去之后自己验收
 
@@ -307,9 +321,10 @@ SELF_UPDATE_SOURCE=https://dsh-hub.wnluo.com/relay-updates,https://raw.githubuse
 定案有四道闸，任何一道不过就退回旧版本继续服务：
 
 1. **校验和**。清单里写着 sha256，对不上就连临时文件都不留。
-2. **试跑**。替换前先在数据目录里跑一次 `dsh-relay --version`，能起来、能报出清单声明的
-   版本号，才允许换。拦的是「这个包在这台机器上根本跑不了」——动态链接的包下发到 musl
-   系统上，进程连 `main` 都进不去，它自己没机会回滚。
+2. **试跑**。替换前先在可执行文件旁边跑一次 `dsh-relay --version`，能起来、能报出清单声明
+   的版本号，才允许换。拦的是「这个包在这台机器上根本跑不了」——动态链接的包下发到 musl
+   系统上，进程连 `main` 都进不去，它自己没机会回滚。暂存文件放在 exe 旁边而不是数据目录，
+   因为 `rename` 不能跨文件系统，而数据目录常常跟着数据库路径被挪到别的盘。
 3. **自检**。换上去之后退出、由服务管理器拉起新版；新版绑上端口后自己打一次 `/healthz`，
    拿到 200 才算这次升级成立。
 4. **数次数**。万一新版在自检之前就死了（panic、配置错），同一个版本连续两次启动都没验明，
@@ -317,6 +332,9 @@ SELF_UPDATE_SOURCE=https://dsh-hub.wnluo.com/relay-updates,https://raw.githubuse
 
 换回之后写一条回滚记录，**之后不再自动升级**，直到人上去把 `.update-state` 删掉。状态文件
 里那几行就是现场：`pending` / `attempts` / `confirmed` / `rollback`。
+
+**跟控制台无关**：纯转发的机器（没设 `PLATFORM_ENABLED`）一样能自己升级。状态记在数据
+目录的 `.update-state` 里，是个纯文本文件，不碰数据库。
 
 更新源是一个自己控制的静态目录：一个 `latest.json` 加若干二进制。
 
@@ -329,21 +347,38 @@ SELF_UPDATE_SOURCE=https://dsh-hub.wnluo.com/relay-updates,https://raw.githubuse
 }
 ```
 
-**为什么不是 GitHub Release**：试过。`api.github.com` 在国内能连，但 Release 资产真正的
-下载域名 `github.com` 连不通；绕开它走 API 的资产直链也只有几十 KB/s，8MB 的二进制
-要下一个多小时。更新源必须在国内稳定可访问。
-
 ### 发布一个版本
 
-在服务器上编好之后跑一次发布脚本：
+**编包不在这台机器上做**。打 tag 推上去，GitHub Actions 会编两份静态包（x86_64 与
+aarch64）、各自验一遍真静态与架构、ARM64 还会用 qemu 跑一次 `--version`，然后挂到
+`rust-v<版本>` 这个 Release 上：
 
 ```sh
-./deploy/publish-relay-update.sh 0.1.1 /path/to/dsh-relay [aarch64 二进制]
+# 先抬 server/relay/rust/Cargo.toml 的 version 并提交
+git tag rust-v0.1.14 && git push origin rust-v0.1.14
 ```
 
-它会先把二进制放进 `<更新源>/`、再写 `latest.json`（**顺序有讲究**：反过来会让中转
-在「清单已更新、文件还没到」的窗口里下到 404），然后当场自检——把清单里的地址真的
-取一遍、比对哈希。自检不过就报错退出，不会留下一个你自己都下不来的版本。
+tag 和 `Cargo.toml` 里的版本对不上，CI 直接失败——同一版本号两份二进制是这个项目踩过的
+坑（机器上跑的和你以为发出去的不是同一份）。不想打 tag 也可以手动触发那个 workflow，
+只出包、不挂 Release。
+
+**Release 出来不等于发布了**：清单（`latest.json`）还没动，那会儿一个用户都收不到更新。
+出包之后按「预发 → 正式」两步走：
+
+```sh
+# 1. 预发：只有把 canary 地址写在 SELF_UPDATE_SOURCE 最前面的那台会升
+RELAY_UPDATE_CHANNEL=canary \
+RELAY_UPDATE_ROOT_CANARY=/opt/dsh-mobile/relay-updates-canary \
+RELAY_UPDATE_PUBLIC_BASE_CANARY=https://dsh-hub.wnluo.com/relay-updates-canary \
+./deploy/publish-relay-update.sh 0.1.14 /abs/path/dsh-relay-linux-x86_64 /abs/path/dsh-relay-linux-aarch64
+
+# 2. 那台升上去、跑一段，看过日志与 /status 的 hostConnected 之后，发正式
+./deploy/publish-relay-update.sh 0.1.14 /abs/path/dsh-relay-linux-x86_64 /abs/path/dsh-relay-linux-aarch64
+```
+
+发布脚本会先把二进制放进 `<更新源>/`、再写 `latest.json`（**顺序有讲究**：反过来会让中转
+在「清单已更新、文件还没到」的窗口里下到 404），然后当场自检——把清单里的地址真的取
+一遍、比对哈希。自检不过就报错退出，不会留下一个你自己都下不来的版本。
 
 发到第二个更新源（国内一个、海外一个）加两个环境变量，按位置一一配对：
 
@@ -365,11 +400,14 @@ Linux 上有 glibc（Rocky / Debian / Ubuntu）和 musl（Alpine）两套 C 库�
 不能混用——实测把 glibc 包放到 Alpine 上直接缺 `libgcc_s`，补 `gcompat` 也还缺
 `fcntl64` / `__res_init`。
 
-所以对外发布统一发**静态包**：`deploy/build-static.sh` 编 `x86_64-unknown-linux-musl`，
-RUSTFLAGS 里显式 `-C target-feature=+crt-static -C relocation-model=static`。少了后者
-编出来的是 static-pie（file 会显示 `interpreter /lib/ld-musl-x86_64.so.1`），在 Rocky 和
-Debian 上照样起不来。产物用 `file`（要 `statically linked`）和 `ldd`（要
-`not a dynamic executable`）验收。
+所以对外发布统一发**静态包**（CI 的 `release-relay.yml` 就是干这个的），RUSTFLAGS 里
+显式 `-C target-feature=+crt-static -C relocation-model=static`。少了后者编出来的是
+static-pie（file 会显示 `interpreter /lib/ld-musl-x86_64.so.1`），在 Rocky 和 Debian 上
+照样起不来。产物在 CI 里用 `file`（要 `statically linked`）、`readelf`（不许有 `INTERP`）
+和真跑一次 `--version` 验收。
+
+要在本机编一份同样的静态包（改完代码想立刻验），`deploy/build-static.sh` 走的是同一套
+参数，但它要 docker。
 
 同一个版本号重复发布会直接拒绝：机器上跑的版本没变、问题却以为已经修了，是发布
 事故最常见的形态。

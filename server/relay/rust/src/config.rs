@@ -6,16 +6,67 @@
 
 use std::env;
 
-/// 默认更新源：自己域名下的一组静态文件（`latest.json` + 二进制）。
-/// **默认空 = 没有更新源**，和 `SELF_UPDATE` 默认关是同一件事的两半。
+/// 默认更新源：官方预编译包在**编译时**烤进去的那组地址。
 ///
-/// 早先这里写死过一个具体域名，对一个「用户自己部署」的项目是错的：
-/// 谁把 `SELF_UPDATE` 打开又没改更新源，他那台中转就会去**别人的机器**拉一个二进制、
-/// 校验通过、然后替换掉自己。那不是更新，是让人家替我们托管了一个可以随时替换其程序
-/// 的入口。所以更新源必须由部署方显式指定，指向哪台就是哪台。
+/// 由发布流水线用 `DSH_RELAY_UPDATE_SOURCE`（逗号分隔）注入；自己 `cargo build` 出来的
+/// 二进制没有这一项，于是维持原来「必须显式指定」的规矩——要拦的正是那个场景：谁 fork
+/// 了一份自己编，一开自动更新就会被换成**官方**二进制。
 ///
-/// 为什么不用 GitHub Release：`github.com` 在国内服务器上连不通，Release 资产下不下来；
-/// 详见 `selfupdate` 模块头部。
+/// 早先这里写死过一个具体域名，对源码部署是错的：谁把 `SELF_UPDATE` 打开又没改源，
+/// 他那台中转就会去别人的机器拉二进制、校验通过、替换掉自己。现在仍然是「源码编的
+/// 没有默认」，只给从我们发布的包里装的人一个开箱可用的源。
+///
+/// 默认源里 GitHub 排在国内镜像后面：`github.com` 在国内服务器上连不通、Release 资产
+/// 下不下来，只有前面那个挂了才轮到它；详见 `selfupdate` 模块头部。
+const BUILT_IN_SOURCES: Option<&str> = option_env!("DSH_RELAY_UPDATE_SOURCE");
+
+/// 查新间隔：下限一天，上限一周。
+const MIN_UPDATE_INTERVAL: i64 = 86_400;
+const MAX_UPDATE_INTERVAL: i64 = 7 * 86_400;
+
+/// 把逗号分隔的地址串拆成列表：去空白、去尾斜杠、丢空项。
+///
+/// 顺序就是尝试顺序，不重排——国内与海外谁先，只有部署方知道。
+fn split_sources(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(|part| part.trim().trim_end_matches('/').to_string())
+        .filter(|part| !part.is_empty())
+        .collect()
+}
+
+/// 烤进二进制的那组默认源；源码编译时为空。
+pub fn built_in_sources() -> Vec<String> {
+    split_sources(BUILT_IN_SOURCES.unwrap_or_default())
+}
+
+/// 查新间隔：越界**直接报错**，不 clamp。
+///
+/// 早先它是 `positive_int(..., 86_400)` 后面再挂一个 `.max(86_400)`：写 21600（6 小时）
+/// 会被静默抬成一天，配置看着生效、实际不是那个数。本项目其余可调项全是「越界即失败」，
+/// 这里没有理由例外。
+fn update_interval_seconds() -> Result<u64, String> {
+    match env::var("SELF_UPDATE_INTERVAL_SECONDS") {
+        Ok(raw) => parse_update_interval(Some(&raw)),
+        Err(_) => parse_update_interval(None),
+    }
+}
+
+/// 纯函数那半：单测直接钉它，不碰环境变量（并行测试里改 env 会互相踩）。
+fn parse_update_interval(raw: Option<&str>) -> Result<u64, String> {
+    let raw = match raw.map(str::trim) {
+        Some("") | None => return Ok(MIN_UPDATE_INTERVAL as u64),
+        Some(raw) => raw,
+    };
+    let range = format!(
+        "SELF_UPDATE_INTERVAL_SECONDS 必须是 {MIN_UPDATE_INTERVAL}..={MAX_UPDATE_INTERVAL} \
+         之间的整数（秒；下限一天）"
+    );
+    let value: i64 = raw.parse().map_err(|_| range.clone())?;
+    if value < MIN_UPDATE_INTERVAL || value > MAX_UPDATE_INTERVAL {
+        return Err(range);
+    }
+    Ok(value as u64)
+}
 
 /// 一次能收多少、等多久。全部是可调项，含义与 Node 版一一对应。
 #[derive(Debug, Clone)]
@@ -59,16 +110,17 @@ pub struct Config {
     pub mirror_fallback_ms: u64,
 
     // ── 自动更新 ─────────────────────────────────────────────────
-    /// **默认关**。开了之后这台中转会自己从发布仓库升到新版本。
+    /// **默认关**。开了之后这台中转会自己升到更新源上的新版本。
     pub self_update: bool,
-    /// 查新版本的间隔（秒）。
+    /// 查新版本的间隔（秒）。低于一天或高于一周直接报错，不 clamp。
     pub self_update_interval_seconds: u64,
     /// 更新源基址，按顺序试；每个下面要能取到 `latest.json`。
     ///
-    /// `SELF_UPDATE_SOURCE` 支持逗号分隔的多条。它解决的是一个单点问题：一台机器的
-    /// 更新源写死成一个域名，那个域名倒了（或被墙了）这台机器就再也收不到更新，
-    /// 而它自己不会报错——只是日志里每天一条失败。国内与海外各放一个地址、按本机
-    /// 位置调整顺序，是这套东西唯一需要人做的判断。
+    /// 来自 `SELF_UPDATE_SOURCE`（逗号分隔）；没设时用编译期烤进来的那一组
+    /// （官方预编译包才有，见 `BUILT_IN_SOURCES`）。
+    ///
+    /// 多条解决的是一个单点问题：一台机器的更新源写死成一个域名，那个域名倒了（或被墙了）
+    /// 这台机器就再也收不到更新，而它自己不会报错——只是日志里每天一条失败。
     pub self_update_sources: Vec<String>,
 }
 
@@ -162,21 +214,18 @@ impl Config {
                 env::var("SELF_UPDATE").unwrap_or_default().to_ascii_lowercase().as_str(),
                 "1" | "true" | "yes"
             ),
-            // 下限一天：GitHub 的匿名接口是每 IP 每小时 60 次，几台中转共用出口时
-            // 设小了会一起撞额度。
-            self_update_interval_seconds: positive_int(
-                "SELF_UPDATE_INTERVAL_SECONDS",
-                86_400,
-                7 * 86_400,
-            )?
-            .max(86_400) as u64,
-            // 逗号分隔，逐条去空白、去尾部斜杠、丢掉空项。顺序就是尝试顺序。
-            self_update_sources: env::var("SELF_UPDATE_SOURCE")
-                .unwrap_or_default()
-                .split(',')
-                .map(|part| part.trim().trim_end_matches('/').to_string())
-                .filter(|part| !part.is_empty())
-                .collect(),
+            // 越界即失败：写 6 小时会被抬成一天的话，配置看着生效、实际不是那个数。
+            self_update_interval_seconds: update_interval_seconds()?,
+            // 环境变量优先；没设就用编译期烤进来的那组（官方预编译包才有），
+            // 源码编出来的这里是空的，维持「必须自己指定」。
+            self_update_sources: {
+                let from_env = split_sources(&env::var("SELF_UPDATE_SOURCE").unwrap_or_default());
+                if from_env.is_empty() {
+                    built_in_sources()
+                } else {
+                    from_env
+                }
+            },
         })
     }
 }
@@ -213,36 +262,54 @@ impl Default for Config {
 mod tests {
     use super::*;
 
-    /// 更新源默认必须是空的。
+    /// 源码编译出来的二进制**不带**默认更新源；官方包带的是流水线烤进去的那组。
     ///
-    /// 写死成我们自己的运营机，就等于让「打开自动更新但没改更新源」的用户来**别人的域名**
-    /// 取二进制并替换自己的程序。这一条钉住默认值本身，不再靠人记得改。
+    /// 这条钉住「自己编的那份不会去别人的域名取二进制」——有人 fork 了一份自己编，
+    /// 正是这里要拦的场景。所以两种构建都要能过：没烤就空，烤了就按逗号拆开。
     #[test]
-    fn update_source_defaults_to_empty() {
-        let config = Config::default();
+    fn built_in_sources_follow_the_build_flag() {
         assert!(
-            config.self_update_sources.is_empty(),
-            "更新源默认必须为空，不能指向任何真实域名"
+            Config::default().self_update_sources.is_empty(),
+            "Config::default 不能指向任何真实域名"
         );
+        match option_env!("DSH_RELAY_UPDATE_SOURCE") {
+            Some(raw) => {
+                assert_eq!(built_in_sources(), split_sources(raw), "烤进去的源要原样拆开");
+                assert!(!built_in_sources().is_empty(), "烤了空串等于没烤");
+            }
+            None => assert!(built_in_sources().is_empty(), "没烤就必须是空"),
+        }
     }
 
     /// 多个更新源：逗号分隔、按顺序、去空白与尾斜杠、丢空项。
     #[test]
     fn parses_multiple_update_sources_in_order() {
-        std::env::set_var(
-            "SELF_UPDATE_SOURCE",
-            " https://cn.example/relay-updates/ , ,https://us.example/relay-updates ",
-        );
-        let config = Config::from_env().expect("两条合法地址应该能读出来");
-        std::env::remove_var("SELF_UPDATE_SOURCE");
         assert_eq!(
-            config.self_update_sources,
+            split_sources(" https://cn.example/relay-updates/ , ,https://us.example/relay-updates "),
             vec![
                 "https://cn.example/relay-updates".to_string(),
                 "https://us.example/relay-updates".to_string()
             ],
             "顺序必须保留：先国内后海外是部署方的决定"
         );
+        // 空串与只有逗号都退化成「没有源」，不产生一条空地址去拼 URL。
+        assert!(split_sources("").is_empty());
+        assert!(split_sources(" , , ").is_empty());
+    }
+
+    /// 查新间隔：不设就是一天，写小了报错而不是静默抬上去。
+    #[test]
+    fn update_interval_is_validated_not_clamped() {
+        assert_eq!(parse_update_interval(None).unwrap(), 86_400);
+        assert_eq!(parse_update_interval(Some("")).unwrap(), 86_400);
+        assert_eq!(parse_update_interval(Some("86400")).unwrap(), 86_400);
+        assert_eq!(parse_update_interval(Some("604800")).unwrap(), 604_800);
+        for bad in ["21600", "3600", "0", "-1", "604801", "一天"] {
+            assert!(
+                parse_update_interval(Some(bad)).is_err(),
+                "{bad} 必须报错，不能 clamp 成一天"
+            );
+        }
     }
 
     #[test]
