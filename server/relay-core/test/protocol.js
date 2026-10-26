@@ -1,19 +1,18 @@
 'use strict';
 
 /**
- * dsh-mobile-server 隧道协议 v2 编解码（取代 v1 的 JSON/base64 文本帧）。
+ * dsh-mobile-server 隧道协议 v2 编解码。
  *
  * 每条隧道消息 = 一个 WS binary 帧：
  *   [type: 1B][id: 4B 大端][length: 4B 大端][payload: length B]
  *
- * - 数据通道（httpBody / httpChunk / wsText / wsBinary）的 payload 为
- *   原始字节，不再 base64（消除 ~33% 体积膨胀）；
+ * - 数据通道（httpBody / httpChunk / wsText / wsBinary）的 payload 是原始字节，不走 base64
+ *   （省掉 ~33% 体积膨胀）；
  * - 控制消息（register / httpHead 等）payload 为 UTF-8 JSON；
- * - ping/pong 为应用层心跳（经代理/负载均衡时比 WS 原生 ping 更可靠）。
+ * - ping/pong 为应用层心跳（经代理 / 负载均衡时比 WS 原生 ping 更可靠）。
  *
- * 协议语义见 ../PROTOCOL.md。
- * 本文件是测试用 JS 协议实现，Rust 对撞测试与端到端参考宿主共用它。
- * 类型表事实源为 ../protocol-types.js；协议变更时还须同步独立发布的插件副本。
+ * 协议语义见 ../PROTOCOL.md。本文件是测试用的 JS 实现，Rust 对撞测试与端到端参考宿主共用；
+ * 类型表事实源为 ../protocol-types.js，协议变更时还须同步独立发布的插件副本。
  */
 
 const T = {

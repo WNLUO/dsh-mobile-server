@@ -103,10 +103,9 @@ function stripDeployPrefix(pathname) {
 /**
  * 送给宿主的路径：剥掉部署前缀，保留查询串。
  *
- * 与 `stripDeployPrefix` 分开，是因为两者命中面不同：判路由时 `/status` 这种短路径
- * 有歧义（`/relay/some/status` 也会命中），但送给宿主时 `/api/mobile/v1/` 是唯一的
- * 手机 API 前缀，只按它剥就不会误伤。宿主只认这个前缀下的路径，带前缀的路径一律 404，
- * 所以宁可多剥一个确定的部署前缀，也不要让用户填错一格就整片不可用。
+ * 与 `stripDeployPrefix` 分开是因为命中面不同：判路由时短路径有歧义（`/relay/some/status`
+ * 也会命中 `/status`），送给宿主时只按 `/api/mobile/v1/` 剥就不会误伤——宿主只认这个前缀
+ * 下的路径，带前缀的一律 404。
  */
 function routedPath(pathname, search = '') {
   const normalized = normalizePath(pathname);

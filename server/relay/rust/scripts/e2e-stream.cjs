@@ -377,7 +377,7 @@ async function main() {
   // ── 控制台与准入 ─────────────────────────────────────────────
   // 这一段用一次性的临时库，单独起一个开了 PLATFORM_ENABLED 的中转，与上面那条
   // 纯转发的中转互不干扰。**必须放在 finally 之外**：finally 里不能收尾退出，
-  // 否则这一段永远跑不到（上一版就栽在这里，输出停在「开放模式」那条之后）。
+  // 否则这一段永远跑不到。
   await runConsoleChecks(binary, check);
 
   if (failures.length > 0) {
