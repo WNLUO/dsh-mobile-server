@@ -81,37 +81,44 @@ jobs:
               # 宿主就是 x86_64，musl-tools 给的 musl-gcc 直接能用。
               sudo apt-get update -qq
               sudo apt-get install -y -qq --no-install-recommends musl-tools file binutils
-              cc=musl-gcc ar=ar expect_machine="Advanced Micro Devices X86-64"
+              key=X86_64_UNKNOWN_LINUX_MUSL
+              {
+                echo "CC_${key}=musl-gcc"
+                echo "AR_${key}=ar"
+                echo "CARGO_TARGET_${key}_LINKER=musl-gcc"
+              } >> "$GITHUB_ENV"
+              expect_machine="Advanced Micro Devices X86-64"
               ;;
             aarch64)
-              # musl.cc 的交叉工具链：从国内机器上下不动，GitHub 的 runner 上一分钟。
-              curl -fsSL --retry 3 https://musl.cc/aarch64-linux-musl-cross.tgz -o /tmp/musl-cross.tgz
-              sudo tar -xzf /tmp/musl-cross.tgz -C /opt
-              cc=/opt/aarch64-linux-musl-cross/bin/aarch64-linux-musl-gcc
-              ar=/opt/aarch64-linux-musl-cross/bin/aarch64-linux-musl-ar
-              expect_machine=AArch64
-              echo "/opt/aarch64-linux-musl-cross/bin" >> "$GITHUB_PATH"
-              # 只为了试跑一次 --version，编的时候不用模拟。
+              # 用 cross：它拉 ghcr.io 上现成的 aarch64-musl 镜像，工具链与 CC/AR/linker
+              # 都在镜像里。（先试过 musl.cc 的交叉工具链，runner 上连它 135 秒超时，
+              # 三次重试全废——那个站从境外也不稳，别再指望它。）
+              curl -fsSL --retry 2 \
+                https://github.com/cross-rs/cross/releases/latest/download/cross-x86_64-unknown-linux-musl.tar.gz \
+                | sudo tar -xz -C /usr/local/bin
               sudo apt-get update -qq
               sudo apt-get install -y -qq --no-install-recommends qemu-user-static file binutils
+              expect_machine=AArch64
               ;;
           esac
-          # cc-rs 认的是把 - 换成 _ 的大写变量名。
-          key=$(printf '%s' "${{ matrix.target }}" | tr 'a-z-' 'A-Z_')
           {
-            echo "CC_${key}=$cc"
-            echo "AR_${key}=$ar"
-            echo "CARGO_TARGET_${key}_LINKER=$cc"
             echo "TARGET=${{ matrix.target }}"
             echo "ARCH=${{ matrix.arch }}"
             echo "EXPECT_MACHINE=$expect_machine"
-            # 不加 crt-static 会出 static-pie（file 显示 interpreter /lib/ld-musl-*.so.1），
-            # 在 Rocky / Debian 上照样起不来；relocation-model=static 消掉 PT_INTERP。
-            echo "RUSTFLAGS=-C target-feature=+crt-static -C relocation-model=static"
           } >> "$GITHUB_ENV"
 
       - name: 编译
-        run: cargo build --release --locked --manifest-path server/relay/rust/Cargo.toml --target "$TARGET"
+        run: |
+          set -eu
+          # musl 目标的两条编译参数在仓库根的 .cargo/config.toml 里，
+          # 不在这里重复写：CI、build-static.sh、本机手编读的都是那一份。
+          if [ "$ARCH" = aarch64 ]; then
+            cross build --release --locked \
+              --manifest-path server/relay/rust/Cargo.toml --target "$TARGET"
+          else
+            cargo build --release --locked \
+              --manifest-path server/relay/rust/Cargo.toml --target "$TARGET"
+          fi
 
       - name: 验真静态、验架构、跑一次 --version
         run: |

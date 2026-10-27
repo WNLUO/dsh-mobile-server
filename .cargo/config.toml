@@ -1,0 +1,19 @@
+# 两个 musl 目标的编译参数。放在仓库根：cargo 从当前目录往上找配置，所以从仓库根
+# 或 server/relay/rust 里跑都读得到。三处共用这一份：CI 出包、deploy/build-static.sh、
+# 本机手动 `cargo build --target …-linux-musl`。
+# （build-static.sh 在容器里编、把 server/ 单独拷进去，读不到这份配置——它自己设 RUSTFLAGS，值相同。）
+#
+# 两条都不能少：
+#   -C target-feature=+crt-static   不加的话 rustc 出的是 static-pie，file 会显示
+#                                   "interpreter /lib/ld-musl-*.so.1"，在 Rocky / Debian
+#                                   上直接 "No such file or directory"（那边没有 musl 加载器）
+#   -C relocation-model=static      配合上一条消掉 PT_INTERP，才是「一个文件拷到任何
+#                                   发行版都能跑」
+#
+# 环境变量 RUSTFLAGS 会盖掉这里（build-static.sh 就是这么干的，值相同）；两边改一处
+# 就够，但别只改一边忘了另一边。
+[target.x86_64-unknown-linux-musl]
+rustflags = ["-C", "target-feature=+crt-static", "-C", "relocation-model=static"]
+
+[target.aarch64-unknown-linux-musl]
+rustflags = ["-C", "target-feature=+crt-static", "-C", "relocation-model=static"]
