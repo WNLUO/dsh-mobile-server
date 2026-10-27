@@ -7,7 +7,7 @@
 //! 心跳与半开判定对齐 Node 版：隧道 15s ping、60s 没 pong 就认定死链；手机 WS 同形，
 //! 但只 terminate **这一条**，不碰隧道。
 
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -24,6 +24,21 @@ use crate::http::RequestHead;
 use crate::tunnel::{log, Pending, Tunnel, TunnelSlot, WsPending};
 
 type WsReader = BufReader<TcpStream>;
+
+/// 连上之后多久必须自报家门。
+///
+/// 宿主的注册超时是 8 秒（`relay/tunnel.js` 的 `start()`），这里留 12 秒：正常连接远到不了
+/// 这一步，只有「连上以后再也没说话」的那种会撞上。不设这道闸的话，这类连接要一直挂到
+/// 对端 RST 才收尾——2026-10-27 美国那台实测一天 4,738 条（占全部隧道连接的三分之一），
+/// 全是连接重置，白占槽位、白刷一行日志。
+const UNREGISTERED_TIMEOUT_MS: u64 = 12_000;
+
+/// 累计有多少条隧道「连上但始终没自报家门」。给 `/status` 看趋势。
+static UNREGISTERED_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
+
+pub fn unregistered_timeouts() -> u64 {
+    UNREGISTERED_TIMEOUTS.load(Ordering::Relaxed)
+}
 
 /// 把已经读过请求头的连接接管成 WebSocket。
 async fn upgrade(reader: WsReader, head: &RequestHead) -> Option<WebSocketStream<PrefixedStream>> {
@@ -255,6 +270,10 @@ pub async fn accept_tunnel(
     // 读循环：解帧 → 代次守卫 → 分发。心跳超时会通过 kill_rx 打断它。
     let mut decoder = FrameDecoder::new(crate::config().max_frame_bytes);
     let mut kill_rx = kill_rx;
+    // 注册截止时刻：过了点还挂着 `unregistered` 就直接收尾。守卫让注册成功的连接再也
+    // 不走这个分支（`instance_label` 一改，条件就为假）。
+    let registration_deadline = tokio::time::sleep(Duration::from_millis(UNREGISTERED_TIMEOUT_MS));
+    tokio::pin!(registration_deadline);
     // 带标签是为了两件事能真的「断开」而不是只跳出内层 for：准入被拒要在外层的
     // 读循环上收尾（原来那个裸 break 只跳出 for，隧道其实还连着）。
     let close_reason: Option<String> = 'tunnel: loop {
@@ -267,6 +286,11 @@ pub async fn accept_tunnel(
             _ = &mut kill_rx => {
                 log("tunnel killed by heartbeat timeout");
                 break 'tunnel Some("heartbeat timeout".to_string());
+            }
+            _ = &mut registration_deadline, if instance_label == "unregistered" => {
+                let total = UNREGISTERED_TIMEOUTS.fetch_add(1, Ordering::Relaxed) + 1;
+                log(format!("tunnel registration timeout, closing (unregistered so far={total})"));
+                break 'tunnel Some("registration timeout".to_string());
             }
         };
         let bytes = match message {

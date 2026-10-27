@@ -446,9 +446,19 @@ pub async fn handle_owned_path(
             Ok(true)
         }
         "/status" => {
-            // 在线状态只回答「隧道通没通」，不泄露实例与设备。
+            // 在线状态只回答「隧道通没通」。那些数字全是计数，没有实例 id、没有设备、
+            // 也没有任何一份清单的内容：账本有多大、预算多少、有多少条隧道连上却没自报家门。
+            // 后两个数就是「镜像是不是又快满了」和「有多少连接在空转」的体检指标。
             let host_connected = slot.get().map(|t| !t.is_closed()).unwrap_or(false);
-            let body = format!(r#"{{"ok":true,"hostConnected":{host_connected}}}"#);
+            let mirror = crate::mirror::stats();
+            let body = format!(
+                r#"{{"ok":true,"hostConnected":{},"mirror":{{"instances":{},"bytes":{},"budget":{}}},"tunnelUnregisteredTimeouts":{}}}"#,
+                host_connected,
+                mirror.instances,
+                mirror.bytes,
+                mirror.budget,
+                crate::ws::unregistered_timeouts()
+            );
             respond_json(reader, 200, &body).await?;
             Ok(true)
         }

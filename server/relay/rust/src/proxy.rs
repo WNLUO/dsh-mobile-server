@@ -73,6 +73,36 @@ fn short_device(device: &str) -> String {
     device.chars().take(8).collect()
 }
 
+/// 顶流同样按分钟聚合。
+///
+/// 2026-10-27 实测一天 21,475 行「sse superseded」，占中转日志四成，而九成是同一台设备
+/// 在自己的重连风暴里反复顶自己、说的都是同一件事。逐条写盘不提供任何额外信息，压成
+/// 一分钟一行汇总：这一分钟顶了多少条、最后被顶的是谁、上限几。
+static SSE_SUPERSEDED_LOG: std::sync::Mutex<Option<(Instant, u64)>> = std::sync::Mutex::new(None);
+
+fn log_sse_superseded(device: &str, victim: u64, limit: usize) {
+    let now = Instant::now();
+    let mut slot = SSE_SUPERSEDED_LOG.lock().unwrap_or_else(|e| e.into_inner());
+    let line = format!(
+        "sse superseded: device={} victim={victim} limit={limit}",
+        short_device(device)
+    );
+    match slot.as_mut() {
+        Some((at, suppressed)) if now.duration_since(*at).as_millis() < CAPACITY_LOG_INTERVAL_MS => {
+            *suppressed += 1;
+        }
+        _ => {
+            let carried = slot.as_ref().map(|(_, count)| *count).unwrap_or(0);
+            if carried > 0 {
+                log(format!("{line}（此前一分钟内另有 {carried} 次顶流未逐条记录）"));
+            } else {
+                log(line);
+            }
+            *slot = Some((now, 0));
+        }
+    }
+}
+
 /// 隧道积压回落到低水位之后恢复读的轮询间隔。
 const FEED_RESUME_POLL_MS: u64 = 25;
 
@@ -151,10 +181,7 @@ pub async fn proxy_request(
                     send_terminal(sender, ResponseChunk::End);
                 }
                 drop(head);
-                log(format!(
-                    "sse superseded: device={} victim={victim} limit={limit}",
-                    short_device(device)
-                ));
+                log_sse_superseded(device, victim, limit);
             }
         }
     }

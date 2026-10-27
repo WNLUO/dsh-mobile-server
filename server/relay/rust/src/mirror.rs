@@ -23,6 +23,7 @@
 //! 而「谁在看」这条冷路径上多一次解析换来的开销可以忽略。
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -34,10 +35,20 @@ use sha2::{Digest, Sha256};
 /// 位置每插一台就挤掉最旧那台，于是每台每 5 秒推上来的那帧都被当成「第一次落地」：
 /// 日志每帧一行（一台机器一天两百万行），缓存和凭据摘要随时被挤掉——宿主掉线后手机读
 /// 不到兜底，推令牌上报也核不过。512 覆盖公用中转的实际规模，内存由下面的总字节预算兜。
-const MAX_INSTANCES: usize = 512;
-/// 整本账的总字节预算。只按台数卡的话，512 台 × 单份 4MB 理论上能吃到 2GB，而公用中转
-/// 跑在小机器上（一台 960MB 内存）。超了就从最旧的那份开始淘汰，刚推上来的那份永远留。
-const MAX_TOTAL_BYTES: usize = 64 * 1024 * 1024;
+///
+/// 2026-10-27 美国那台实测：一天之内见过 **512 个不同实例**，正好把 512 个位置占满，
+/// 每来一台新的就挤掉最旧的那台。位置不够的原因不是机器多，而是**离线的机器不会自己
+/// 让位**（过期只在读缓存时比对，没人来读就一直躺着）。所以两条一起改：闲置清理
+/// （`ENTRY_IDLE_MS`）负责让位，上限抬到 4096 负责余量。单份按现在的量级只有 9KB 上下，
+/// 4096 份约 40MB，仍在下面的自适应预算之内。
+const MAX_INSTANCES: usize = 4096;
+/// 整本账总字节预算的上下限。**实际值在第一次用到时按这台机器的可用内存算出来**
+/// （见 `total_bytes_budget`）：公网上这些中转从 960MB 的小机器到几 G 的都有，写死一个
+/// 数要么把小机器吃光、要么把大机器白限死。超了就从最旧的那份开始淘汰，刚推上来的永远留。
+const MIN_TOTAL_BYTES: usize = 32 * 1024 * 1024;
+const MAX_TOTAL_BYTES: usize = 256 * 1024 * 1024;
+/// 预算取可用内存的这个分数。
+const TOTAL_BYTES_SHARE: usize = 16;
 /// 单份镜像（会话清单 + 工作区两份 body）的字节上限。
 ///
 /// 4MB 而不是 3MB：宿主把业务正文封进信封之后，base64 让同样的内容大 4/3。上限卡在
@@ -49,8 +60,15 @@ const MAX_ENTRY_BYTES: usize = 4 * 1024 * 1024;
 /// 跟着条目上限一起放宽：一帧里装的是两份封过信封的 body 加上其余字段，12MB 的余量在
 /// 条目上限抬到 4MB 之后会先于条目上限触发，等于上限白抬。
 const MAX_SYNC_BYTES: usize = 16 * 1024 * 1024;
-/// 一份镜像最多留多久。宿主七天没正常连上来，这份缓存就该当它不存在了。
-const ENTRY_TTL_MS: u64 = 7 * 24 * 3600 * 1000;
+/// 一份镜像空闲多久就该清掉。
+///
+/// 宿主在线时每 500ms 推一帧，这个时间戳一直在刷新，所以在线的永远不会被清。反过来，
+/// 它也是「电脑关机以后手机还能看到上次那份列表」的时长：超过它，打开 App 只剩「那台
+/// 不在线」。六小时是按「够覆盖一次关机/休眠，又不至于让离线的机器把位置占满」定的。
+const ENTRY_IDLE_MS: u64 = 6 * 3600 * 1000;
+/// 两次清扫之间至少隔这么久。清扫本身只有几百个 key、只比时间戳，但要跟着每次推送跑
+/// 就变成每秒几百次全表扫描，节流到一分钟一次足够。
+const SWEEP_INTERVAL_MS: u64 = 60_000;
 /// 一份镜像最多认多少条设备凭据摘要。
 const MAX_CREDS: usize = 200;
 
@@ -112,8 +130,63 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// 这台机器给镜像账本多少预算：可用内存的 1/16，夹在 32MB ~ 256MB 之间。
+///
+/// 第一次用到时算一次就定住——镜像常驻内存，中途按当前可用内存浮动会让预算忽大忽小，
+/// 淘汰就变成随机。取不到（非 Linux）就用下限，宁可保守。
+fn total_bytes_budget() -> usize {
+    static BUDGET: OnceLock<usize> = OnceLock::new();
+    *BUDGET.get_or_init(|| budget_for(available_memory_bytes()))
+}
+
+fn budget_for(available: Option<usize>) -> usize {
+    available
+        .map(|bytes| (bytes / TOTAL_BYTES_SHARE).clamp(MIN_TOTAL_BYTES, MAX_TOTAL_BYTES))
+        .unwrap_or(MIN_TOTAL_BYTES)
+}
+
+/// `/proc/meminfo` 的 `MemAvailable`（字节）。读不到就 None。
+///
+/// 用它而不是 `MemFree`：后者不含可回收的 page cache，会把这台实际能腾出来的内存算小
+/// 一个量级（美国那台 `free` 里 free 只有 270MB、available 有 577MB）。
+fn available_memory_bytes() -> Option<usize> {
+    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("MemAvailable:") {
+            let kb: usize = rest.split_whitespace().next()?.parse().ok()?;
+            return Some(kb.saturating_mul(1024));
+        }
+    }
+    None
+}
+
+/// 账本现在的规模，给 `/status` 用。**不暴露实例 id 与设备**，只有数量。
+pub struct Stats {
+    pub instances: usize,
+    pub bytes: usize,
+    pub budget: usize,
+}
+
+pub fn stats() -> Stats {
+    let map = store().lock().unwrap_or_else(|e| e.into_inner());
+    Stats {
+        instances: map.len(),
+        bytes: total_bytes(&map),
+        budget: total_bytes_budget(),
+    }
+}
+
 /// 宿主推上来的镜像帧（隧道帧 `sync`）。收到就整份替换，格式不对就**保留上一份**。
 pub fn remember(instance_id: &str, payload: &[u8]) -> bool {
+    remember_with(instance_id, payload, crate::config().mirror_cache)
+}
+
+/// `keep_bodies = false` 时只留凭据摘要与时间戳，不留两份清单正文。
+///
+/// 纯转发的部署（`MIRROR_CACHE=0`）本来就不提供离线兜底，正文存进来一次都不会被读到，
+/// 却要跟着每次推送解析、序列化、占内存。**摘要不能一起丢**：推送令牌上报（`/push-token`）
+/// 的鉴权判据就是这本账里的摘要，丢了它，那台机器上报的令牌全变成 403。
+fn remember_with(instance_id: &str, payload: &[u8], keep_bodies: bool) -> bool {
     let key = instance_id.trim();
     if key.is_empty() || payload.len() > MAX_SYNC_BYTES {
         return false;
@@ -132,14 +205,19 @@ pub fn remember(instance_id: &str, payload: &[u8]) -> bool {
     ) else {
         return false;
     };
-    let (Ok(sessions_body), Ok(workspaces_body)) =
-        (serde_json::to_string(sessions), serde_json::to_string(workspaces))
-    else {
-        return false;
+    let (sessions_body, workspaces_body) = if keep_bodies {
+        let (Ok(sessions_body), Ok(workspaces_body)) =
+            (serde_json::to_string(sessions), serde_json::to_string(workspaces))
+        else {
+            return false;
+        };
+        if sessions_body.len() + workspaces_body.len() > MAX_ENTRY_BYTES {
+            return false;
+        }
+        (sessions_body, workspaces_body)
+    } else {
+        (String::new(), String::new())
     };
-    if sessions_body.len() + workspaces_body.len() > MAX_ENTRY_BYTES {
-        return false;
-    }
     let entry = MirrorEntry {
         sessions_revision: string_of(sessions, "revision"),
         workspaces_revision: string_of(workspaces, "revision"),
@@ -152,6 +230,8 @@ pub fn remember(instance_id: &str, payload: &[u8]) -> bool {
         stored_seq: next_seq(),
     };
     let mut map = store().lock().unwrap_or_else(|e| e.into_inner());
+    // 先让离线的让位，再看台数：顺序反过来就是「先挤掉一台在线的，再去删一台早该走的」。
+    sweep_idle(&mut map, entry.stored_at_ms);
     let previous_creds = map.get(key).map(|entry| entry.creds.len());
     if !map.contains_key(key) && map.len() >= MAX_INSTANCES {
         evict_oldest(&mut map);
@@ -161,7 +241,7 @@ pub fn remember(instance_id: &str, payload: &[u8]) -> bool {
     map.insert(key.to_string(), entry);
     // 台数管住之后还要管住总量：大清单 × 多实例会先把内存吃满，再轮到台数上限。
     // 淘汰的永远是最旧的那份，刚插进来的这份 seq 最大、轮不到它。
-    prune_to_budget(&mut map, MAX_TOTAL_BYTES);
+    prune_to_budget(&mut map, total_bytes_budget());
     drop(map);
     // 只在这两件事上留一行：镜像第一次落地、摘要条数变了。镜像本身每 500ms 就重推一次，
     // 每推一次打一行会把日志刷满；而这两条恰恰是运维要看的（「中转到底收没收到镜像」
@@ -213,6 +293,29 @@ fn prune_to_budget(map: &mut HashMap<String, MirrorEntry>, max_bytes: usize) {
     }
 }
 
+/// 清掉空闲超过 `ENTRY_IDLE_MS` 的条目。返回删了几条。
+fn sweep_idle_entries(map: &mut HashMap<String, MirrorEntry>, now: u64) -> usize {
+    let before = map.len();
+    map.retain(|_, entry| now.saturating_sub(entry.stored_at_ms) <= ENTRY_IDLE_MS);
+    before - map.len()
+}
+
+/// 带节流的清扫：粘在每次推送的路径上，但最多一分钟做一次真正的全表扫描。
+///
+/// 不节流的话，156 台宿主每台每 500ms 一帧就是每秒三百次全表扫描，白白吃这一核。
+fn sweep_idle(map: &mut HashMap<String, MirrorEntry>, now: u64) {
+    static LAST_SWEEP_MS: AtomicU64 = AtomicU64::new(0);
+    let last = LAST_SWEEP_MS.load(Ordering::Relaxed);
+    if last != 0 && now.saturating_sub(last) < SWEEP_INTERVAL_MS {
+        return;
+    }
+    LAST_SWEEP_MS.store(now, Ordering::Relaxed);
+    let removed = sweep_idle_entries(map, now);
+    if removed > 0 {
+        crate::tunnel::log(format!("mirror swept idle={removed} left={}", map.len()));
+    }
+}
+
 /// 读缓存：给不出去就 None，调用方照旧走「那台宿主不在线」。
 ///
 /// `rev` 是手机带来的内容指纹：与缓存里那份相同就只回一句 unchanged（几十字节），
@@ -228,10 +331,15 @@ pub fn lookup(
     let (body, revision, generated_at, creds) = {
         let map = store().lock().unwrap_or_else(|e| e.into_inner());
         let entry = map.get(instance_id.trim())?;
-        if now.saturating_sub(entry.stored_at_ms) > ENTRY_TTL_MS {
+        if now.saturating_sub(entry.stored_at_ms) > ENTRY_IDLE_MS {
             return None;
         }
         let (body, revision, generated_at) = entry.body_of(kind);
+        // 纯转发部署只记摘要不记正文（`remember_with(.., false)`）：没有正文就是没有
+        // 这份缓存，别拿一份空壳去拼 `unchanged` 或半份 JSON。
+        if body.is_empty() {
+            return None;
+        }
         (
             body.to_string(),
             revision.to_string(),
@@ -270,7 +378,7 @@ pub(crate) fn credential_ok(instance_id: &str, credentials: &[String]) -> bool {
     let creds = {
         let map = store().lock().unwrap_or_else(|e| e.into_inner());
         match map.get(instance_id.trim()) {
-            Some(entry) if now.saturating_sub(entry.stored_at_ms) <= ENTRY_TTL_MS => entry.creds.clone(),
+            Some(entry) if now.saturating_sub(entry.stored_at_ms) <= ENTRY_IDLE_MS => entry.creds.clone(),
             _ => Vec::new(),
         }
     };
@@ -734,5 +842,71 @@ mod tests {
         single.insert("big".to_string(), fake_entry(5000, 1));
         prune_to_budget(&mut single, 1000);
         assert_eq!(single.len(), 1);
+    }
+
+    /// 闲置清理：超过六小时没新推送的条目必须让位，在线的（时间戳一直被刷新）不受影响。
+    #[test]
+    fn idle_entries_get_swept_after_six_hours() {
+        let now = 100_000_000u64;
+        let mut map: HashMap<String, MirrorEntry> = HashMap::new();
+        let mut fresh = fake_entry(10, 2);
+        fresh.stored_at_ms = now - 1_000;
+        let mut stale = fake_entry(10, 1);
+        stale.stored_at_ms = now - ENTRY_IDLE_MS - 1;
+        map.insert("fresh".to_string(), fresh);
+        map.insert("stale".to_string(), stale);
+        assert_eq!(sweep_idle_entries(&mut map, now), 1);
+        assert!(map.contains_key("fresh"), "在线的不能被清");
+        assert!(!map.contains_key("stale"), "闲置超过六小时的必须让位");
+        // 边界：正好六小时那份还算「刚用过」，不算闲置。
+        let mut edge: HashMap<String, MirrorEntry> = HashMap::new();
+        let mut boundary = fake_entry(10, 1);
+        boundary.stored_at_ms = now - ENTRY_IDLE_MS;
+        edge.insert("edge".to_string(), boundary);
+        assert_eq!(sweep_idle_entries(&mut edge, now), 0);
+    }
+
+    /// 预算跟着这台机器的内存走，而不是写死一个数：小机器不被吃光，大机器不被白限死。
+    #[test]
+    fn the_byte_budget_follows_available_memory() {
+        // 读不到 MemAvailable（非 Linux）时退回下限，宁可保守。
+        assert_eq!(budget_for(None), MIN_TOTAL_BYTES);
+        // 1GB / 16 = 64MB，落在区间中间，跟着内存走。
+        assert_eq!(budget_for(Some(1024 * 1024 * 1024)), 64 * 1024 * 1024);
+        // 960MB 那台（可用 577MB）算下来约 36MB：比旧的写死 64MB 小，比下限大。
+        let small = budget_for(Some(577 * 1024 * 1024));
+        assert!(small > MIN_TOTAL_BYTES && small < 64 * 1024 * 1024, "{small}");
+        // 大机器封顶，不让一份账本吃掉几 G。
+        assert_eq!(budget_for(Some(64 * 1024 * 1024 * 1024)), MAX_TOTAL_BYTES);
+        assert!(MIN_TOTAL_BYTES >= 32 * 1024 * 1024, "下限不许回退到「几十台就满」的口径");
+    }
+
+    /// 纯转发部署（`MIRROR_CACHE=0`）只留摘要：正文一个字节都不存，但摘要还得在。
+    #[test]
+    fn a_forward_only_relay_keeps_only_the_digests() {
+        let _guard = serial();
+        let instance = "mirror-creds-only";
+        let cred = "cred_only";
+        assert!(remember_with(
+            instance,
+            &payload(serde_json::json!([{ "hash": sha256_hex(cred) }])),
+            false
+        ));
+        assert_eq!(
+            lookup(instance, ListKind::Sessions, "", &presented(&[cred])),
+            None,
+            "纯转发不该留正文，缓存读也一个字节都不给"
+        );
+        assert!(
+            credential_ok(instance, &presented(&[cred])),
+            "摘要必须留着：推送令牌上报靠它鉴权"
+        );
+        // 这台改成开机镜像之后，下一帧就把正文补上（切配置不用重启中转）。
+        assert!(remember_with(
+            instance,
+            &payload(serde_json::json!([{ "hash": sha256_hex(cred) }])),
+            true
+        ));
+        assert!(lookup(instance, ListKind::Sessions, "", &presented(&[cred])).is_some());
     }
 }
