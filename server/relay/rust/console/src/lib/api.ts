@@ -79,6 +79,20 @@ export interface Overview {
   reportIntervalSeconds: number
   /** 准入模式是否已被主控端接管。为真时本地面板不许改。 */
   modeControlled: boolean
+  /** 这台中转跑的是哪一版。 */
+  version: string
+  /** 自动更新：开没开、源、待验证版本、以及上一轮失败后的停手记录。 */
+  selfUpdate: {
+    enabled: boolean
+    sources: string[]
+    intervalSeconds: number
+    /** 换上去但还没验明的版本；空＝没有待验证的升级。 */
+    pending: string
+    /** 最后一次验明成功的版本。 */
+    confirmed: string
+    /** 非空＝上一轮升级失败、已经停手，等人处理。 */
+    rollback: string
+  }
 }
 
 /** 业务错误：带着中转回的那句人话。 */

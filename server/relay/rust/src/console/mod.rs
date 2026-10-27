@@ -243,6 +243,10 @@ impl Console {
                     "activeLicenseCount": active,
                     "deviceCount": devices,
                     "tunnelConnected": crate::tunnel_connected(),
+                    // 这台跑的是哪一版、自动更新开没开、有没有停手。停更的机器以前只能
+                    // 翻日志才知道，机器一多就没人看得见。
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "selfUpdate": self.update_report(),
                 }),
             );
         }
@@ -569,6 +573,28 @@ impl Console {
             .unwrap_or_else(|| "open".to_string())
     }
 
+    /// 自动更新现在的样子：开没开、源在哪、有没有待验证的版本、有没有停手。
+    ///
+    /// 状态文件与数据库同一个目录（`PLATFORM_DB_PATH` 的父目录），纯文本、不读库——
+    /// 纯转发的部署也能答得出来。
+    pub fn update_report(&self) -> serde_json::Value {
+        let config = crate::config();
+        let data_dir = std::path::Path::new(&self.config.db_path)
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("data"));
+        let state = crate::selfupdate::state_in(&data_dir);
+        json!({
+            "enabled": config.self_update,
+            "sources": config.self_update_sources,
+            "intervalSeconds": config.self_update_interval_seconds,
+            "pending": state.pending,
+            "confirmed": state.confirmed,
+            // 非空＝上一轮升级失败、已经停手，等人处理。面板上这条要显眼。
+            "rollback": state.rollback,
+        })
+    }
+
     /// 改准入模式。
     pub fn set_admission_mode(&self, actor: &crate::store::User, mode: &str) -> ConsoleResponse {
         if !actor.is_admin {
@@ -810,11 +836,17 @@ mod tests {
     use super::*;
 
     fn console() -> Arc<Console> {
+        console_at(":memory:")
+    }
+
+    /// 指定库路径的控制台。自动更新状态文件跟着 `PLATFORM_DB_PATH` 的父目录走，
+    /// 要验那条路就得真给一个目录。
+    fn console_at(db_path: &str) -> Arc<Console> {
         let mut config = ConsoleConfig::from_env();
         config.enabled = true;
         config.api_prefix = "/api/platform/v1".to_string();
         config.web_prefix = "/platform".to_string();
-        config.db_path = ":memory:".to_string();
+        config.db_path = db_path.to_string();
         let store = Store::in_memory().unwrap();
         Arc::new(Console {
             license_limiter: Limiter::new(config.license_rate_limit, Duration::from_secs(60)),
@@ -823,6 +855,38 @@ mod tests {
             config,
             store,
         })
+    }
+
+/// 自动更新的实况要能答出来：跑到哪一版、开没开、有没有停手。
+    ///
+    /// 升级失败后程序会退回旧版并停止自动升级，那台机器照样在服务——以前只有翻日志
+    /// 才知道它停在旧版本上，机器一多就没人看得见。
+    #[test]
+    fn update_report_reads_the_state_file_next_to_the_database() {
+        let dir = std::env::temp_dir().join(format!("dsh-relay-console-update-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let console = console_at(&dir.join("console.db").to_string_lossy());
+
+        // 没有状态文件时是「干净」的，不该 panic、也不该有残留值。
+        let fresh = console.update_report();
+        assert_eq!(fresh["confirmed"], "");
+        assert_eq!(fresh["rollback"], "");
+        assert!(fresh["sources"].is_array());
+
+        std::fs::write(
+            dir.join(".update-state"),
+            "pending=\nattempts=0\nconfirmed=0.1.14\nrollback=0.1.15 在这台机器上没起来\n",
+        )
+        .unwrap();
+        let report = console.update_report();
+        assert_eq!(report["confirmed"], "0.1.14");
+        assert_eq!(report["pending"], "");
+        assert!(
+            report["rollback"].as_str().unwrap().contains("0.1.15"),
+            "停手原因要原样给出来：{report}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn admin(console: &Console) -> crate::store::User {

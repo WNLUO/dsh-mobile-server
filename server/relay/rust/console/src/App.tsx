@@ -152,7 +152,10 @@ export function App() {
       <Card title="运行状态" description="这一页只说明中转活着没、宿主连上没，不显示任何密钥。">
         <InfoList>
           <InfoRow label="中转服务">
-            <ToneValue tone="ok" text="在线" />
+            <ToneValue tone="ok" text="在线" detail={overview ? `版本 ${overview.version}` : undefined} />
+          </InfoRow>
+          <InfoRow label="自动更新">
+            <SelfUpdateValue selfUpdate={overview?.selfUpdate} />
           </InfoRow>
           <InfoRow label="桌面隧道">
             {overview?.tunnelConnected ? (
@@ -360,6 +363,33 @@ export function App() {
 
       {selected ? <DevicePanel license={selected} onClose={() => setSelected(null)} onChanged={load} /> : null}
     </main>
+  )
+}
+
+/**
+ * 自动更新的状态：没开 / 正常 / 待验证 / 已停手。
+ *
+ * 「已停手」是这块存在的主要理由：升级失败后程序会退回旧版并**不再自动升级**，
+ * 等人处理。那台机器照样在正常服务，只是永远停在旧版本——以前只有翻日志才看得出来。
+ */
+function SelfUpdateValue({ selfUpdate }: { selfUpdate?: Overview['selfUpdate'] }) {
+  if (!selfUpdate) return <>—</>
+  if (!selfUpdate.enabled) {
+    return <ToneValue tone="off" text="关" detail="这台没开自动更新，要升级得手动换二进制" />
+  }
+  if (selfUpdate.rollback) {
+    return <ToneValue tone="error" text="已停手" detail={selfUpdate.rollback} />
+  }
+  if (selfUpdate.pending) {
+    return <ToneValue tone="warn" text={`待验证 ${selfUpdate.pending}`} detail="换上去的新版本还没验明，下次检查前会定案" />
+  }
+  const hours = Math.round((selfUpdate.intervalSeconds || 86400) / 3600)
+  return (
+    <ToneValue
+      tone="ok"
+      text={`开（每 ${hours} 小时查一次）`}
+      detail={selfUpdate.confirmed ? `上次验明 ${selfUpdate.confirmed}` : undefined}
+    />
   )
 }
 

@@ -221,6 +221,16 @@ impl UpdateState {
     }
 }
 
+/// 读某个数据目录里的升级状态；读不到就是「没在升过」。
+///
+/// 控制台用它回答「这台现在跑到哪一版、有没有停手」——文件名只在这里知道，
+/// 别在别处再拼一遍 `.update-state`。
+pub fn state_in(data_dir: &Path) -> UpdateState {
+    std::fs::read_to_string(data_dir.join(STATE_FILE))
+        .map(|text| UpdateState::parse(&text))
+        .unwrap_or_default()
+}
+
 /// 升级用到的那两个路径。分开传是为了让下面那些纯函数能被单测直接钉。
 #[derive(Debug, Clone)]
 pub struct Paths {
@@ -251,9 +261,7 @@ impl Paths {
     }
 
     pub fn load(&self) -> UpdateState {
-        std::fs::read_to_string(self.state_path())
-            .map(|text| UpdateState::parse(&text))
-            .unwrap_or_default()
+        state_in(&self.data_dir)
     }
 
     pub fn save(&self, state: &UpdateState) -> Result<(), String> {
