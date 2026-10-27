@@ -73,6 +73,21 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # 依赖编译是这个流程里唯一的大头（rusqlite bundled、ring 都要编 C）。
+      # 缓存之后改几行 Rust 只重编这个 crate，整轮从七八分钟降到几分钟——
+      # 「想快点只升我们几台」的诉求就落在这里，比在服务器上重编一份快，而且不产生
+      # 两份不同的二进制。锁文件没变就复用旧缓存，源码变了只是增量重编。
+      - name: 缓存 cargo 与 target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            server/relay/rust/target
+          key: relay-${{ matrix.target }}-${{ hashFiles('server/relay/rust/Cargo.lock') }}
+          restore-keys: relay-${{ matrix.target }}-
+
       - name: 装交叉工具链
         run: |
           set -eu
