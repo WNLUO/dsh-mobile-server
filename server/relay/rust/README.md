@@ -382,10 +382,26 @@ RELAY_UPDATE_PUBLIC_BASE_CANARY=https://dsh-hub.wnluo.com/relay-updates-canary \
 
 ### 只想快点把自己那几台升上去
 
-不用另外一套流程，还是上面那条，只是**停在预发**：发预发清单 → 自己那台升完 → 看过
-`/status` 的 `hostConnected` 和日志 → 再决定要不要发正式。CI 一轮几分钟（依赖有缓存，
-改几行 Rust 只重编那一个 crate），比在服务器上重开一遍编译快，也不会出现两份不同的
-二进制。
+不用另开一条编译路。CI 里 x86_64 那个 job 缓存之后**不到一分钟**就出包，而且比等整个
+workflow 快得多——不用等 ARM64，也不用等 Release 建出来：
+
+```sh
+# 1. 推上去之后等 x86_64 那个 job 跑完（约 45 秒），直接取那份产物
+gh run list --workflow=release-relay.yml --limit 1
+gh run download <run-id> -n dsh-relay-linux-x86_64 -D /tmp/relay-new
+
+# 2. 传到更新源那台，只发预发清单（ARM 那份可以先不给）
+RELAY_UPDATE_CHANNEL=canary \
+RELAY_UPDATE_ROOT_CANARY=/opt/dsh-mobile/relay-updates/canary \
+RELAY_UPDATE_PUBLIC_BASE_CANARY=https://dsh-hub.wnluo.com/relay-updates/canary \
+sh deploy/publish-relay-update.sh <版本> /tmp/relay-new/dsh-relay-linux-x86_64
+
+# 3. 重启自己那几台催它们立刻检查（不催的话最长等一天），65 秒内自己换好
+```
+
+这条路上的文件与正式发布是**同一份**：源码没变时两次编出来的 sha256 相同（实测跨两次
+运行一模一样），所以后面打 tag 发正式不会出现「两份二进制」。真对不上（工具链升级之类），
+就把这份传成 Release 资产、清单用它——见下。
 
 真要绕开 GitHub（那边不通，或者不想出公开版），就在本机或服务器上编
 （`deploy/build-static.sh`，要 docker），装到自己那几台，然后记住一条：
