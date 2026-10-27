@@ -43,15 +43,20 @@
 
 ## 部署
 
-在 Linux 服务器上运行：
+在一台 Linux 服务器上，`root` 跑一次：
 
 ```sh
-git clone https://github.com/WNLUO/dsh-mobile-server.git
-cd dsh-mobile-server/server/relay/rust
-sudo ./deploy/install.sh
+curl -fsSLO https://raw.githubusercontent.com/WNLUO/dsh-mobile-server/main/server/relay/rust/deploy/install-binary.sh
+sudo sh install-binary.sh
 ```
 
-安装脚本会安装 Rust、编译 `dsh-relay` 并配置 systemd 服务。服务默认监听 `127.0.0.1:18788`，应在前面配置 HTTPS/WSS 反向代理，Caddy 或 Nginx 都可以，证书走 Let's Encrypt 一类的自动签发。
+它下载**已经编好的静态包**（x86_64 / aarch64 都发），先核对 sha256、再真跑一次确认这个包在这台机器上起得来，然后装成 systemd 服务并打开自动更新。不用装 Rust，不用编译。
+
+包是静态链接的 musl 二进制，Rocky / Debian / Ubuntu / Alpine 共用同一份，不用挑发行版、也不用装运行时依赖。
+
+服务默认监听 `127.0.0.1:18788`，前面配 HTTPS/WSS 反向代理（Caddy 或 Nginx 都行，证书 Let's Encrypt 一类自动签发）。
+
+新版本发布后，装了的中转会自己升：下载 → 核对 → 试跑 → 替换 → 重启 → 自检，起不来自动回滚到上一版。要改代码、自己编一份改造版，走仓库里的 `deploy/install.sh`（源码路线，会装 Rust 并编译）。
 
 ## 环境变量（可选能力）
 

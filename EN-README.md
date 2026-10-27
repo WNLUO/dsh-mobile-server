@@ -44,15 +44,20 @@ The box in the middle of that diagram is the service you deploy. All it does is 
 
 ## Deployment
 
-On a Linux server:
+On a Linux server, as `root`:
 
 ```sh
-git clone https://github.com/WNLUO/dsh-mobile-server.git
-cd dsh-mobile-server/server/relay/rust
-sudo ./deploy/install.sh
+curl -fsSLO https://raw.githubusercontent.com/WNLUO/dsh-mobile-server/main/server/relay/rust/deploy/install-binary.sh
+sudo sh install-binary.sh
 ```
 
-The install script installs Rust, builds `dsh-relay`, and configures a systemd service. The service listens on `127.0.0.1:18788` by default; put an HTTPS/WSS reverse proxy in front of it — Caddy or Nginx both work, with a certificate from Let's Encrypt or anything that renews itself.
+It downloads a **prebuilt static binary** (both x86_64 and aarch64 are published), verifies its sha256, runs it once to make sure it actually starts on this machine, then installs it as a systemd service and turns on self-update. No Rust, no build step.
+
+The binary is statically linked against musl, so Rocky / Debian / Ubuntu / Alpine all run the same file — no per-distro choice and no runtime dependencies.
+
+The service listens on `127.0.0.1:18788` by default; put an HTTPS/WSS reverse proxy in front of it — Caddy or Nginx both work, with a certificate from Let's Encrypt or anything that renews itself.
+
+After a release, installed relays update themselves: download → verify → trial run → swap → restart → self-check, with an automatic rollback if the new one doesn't come up. To change the code and ship your own build, use `deploy/install.sh` (source route: installs Rust and compiles).
 
 ## Environment variables (optional capabilities)
 
