@@ -12,7 +12,7 @@
 
 | type | 名称 | id | 载荷 | 用途 |
 |---|---|---|---|---|
-| 0x01 | register | 0 | JSON `{instanceId}` | 宿主登记实例；同一实例重连只取代自己 |
+| 0x01 | register | 0 | JSON `{instanceId, version?}` | 宿主登记实例；同一实例重连只取代自己。`version` 是宿主正在跑的插件版本（`0.4.8` 这种三段数字）：中转按它记「谁还在老版本」，并在配了 `MIN_PLUGIN_VERSION` 时把太旧的挡在门外。**没这个字段 = 老插件 = 按最旧算** |
 | 0x02 | registered | 0 | JSON `{ok, mirror}` | 中转确认注册。`mirror` 是本节点的镜像口径：`false`（`MIRROR_CACHE=0` 的纯转发节点）表示收下整份镜像也只留凭据摘要、正文解析完就丢，宿主据此只推摘要帧（清单与工作区各只带 `ok`+`revision`、外加 `creds`）。老宿主只认帧类型、不读内容，多这个字段没有影响 |
 | 0x03 | updatePairing | 0 | JSON | 保留编号 |
 | 0x04 | httpRequest | N | JSON `{method, path, headers}` | 手机请求头送到宿主 |
@@ -23,7 +23,7 @@
 | 0x09 | httpError | N | JSON `{message}` | 上游错误 |
 | 0x0A | wsUpgrade | N | JSON `{path, headers}` | 手机 WS 升级请求 |
 | 0x0B | wsOpen | N | 空 | 上游 WS 已连接 |
-| 0x0C | wsError | N | JSON `{message}` | 上游 WS 错误 |
+| 0x0C | wsError | N | JSON `{message}` | 上游 WS 错误。**`id=0` 是控制帧**：中转在断开之前用它说明原因，目前只有一个 `code`：`plugin_too_old`（附带 `min` / `have` / `retryAfterMs`），宿主据此把「被版本挡住」和「网络不好」分开，按三十分钟而不是五秒重连 |
 | 0x0D | wsText | N | bytes | WS 文本数据 |
 | 0x0E | wsBinary | N | bytes | WS 二进制数据 |
 | 0x0F | wsClose | N | 2B 大端 code + 可选 UTF-8 reason | WS 关闭，reason 最多 123 字节 |

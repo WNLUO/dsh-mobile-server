@@ -32,6 +32,7 @@ pub mod headers;
 pub mod http;
 pub mod migrate;
 pub mod mirror;
+pub mod plugin_versions;
 pub mod proxy;
 pub mod selfupdate;
 pub mod store;

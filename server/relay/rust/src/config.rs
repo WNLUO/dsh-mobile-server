@@ -119,6 +119,16 @@ pub struct Config {
     /// 手机下次轮询照常再问一次。
     pub mirror_fallback_ms: u64,
 
+    /// 最低可接受的宿主插件版本（`MIN_PLUGIN_VERSION`，**默认空 = 不拦**）。
+    ///
+    /// 配了值以后，注册帧里报的版本低于它（或者干脆没报——老插件根本没这个字段）的宿主
+    /// 会在注册阶段被挡下，手机那侧收到一句带 `plugin_too_old` 的 503，而不是「电脑不在线」。
+    /// 门槛只按三段数字比，值形如 `0.4.7`。
+    ///
+    /// 为什么要有这个：插件升不上去的机器会一直按老协议推东西（每 5 秒整份镜像那一条尤其
+    /// 贵）。中转替宿主升不了级，能做的只是在门口把太旧的挡下来，并让手机说清原因。
+    pub min_plugin_version: Option<crate::plugin_versions::PluginVersion>,
+
     // ── 自动更新 ─────────────────────────────────────────────────
     /// **默认关**。开了之后这台中转会自己升到更新源上的新版本。
     pub self_update: bool,
@@ -228,6 +238,16 @@ impl Config {
                 env::var("SELF_UPDATE").unwrap_or_default().to_ascii_lowercase().as_str(),
                 "1" | "true" | "yes"
             ),
+            // 门槛写错就**起不来**：写错一个段位却当成「没配」，看起来生效、实际一个都不拦，
+            // 比直接报错难查得多。
+            min_plugin_version: match env::var("MIN_PLUGIN_VERSION") {
+                Ok(raw) if !raw.trim().is_empty() => Some(
+                    crate::plugin_versions::PluginVersion::parse(&raw).ok_or_else(|| {
+                        format!("MIN_PLUGIN_VERSION 要形如 0.4.7，收到：{raw}")
+                    })?,
+                ),
+                _ => None,
+            },
             // 越界即失败：写 6 小时会被抬成一天的话，配置看着生效、实际不是那个数。
             self_update_interval_seconds: update_interval_seconds()?,
             // 环境变量优先；没设就用编译期烤进来的那组（官方预编译包才有），
@@ -264,6 +284,7 @@ impl Default for Config {
             upstream_header_timeout_ms: 30_000,
             debug_sse: false,
             debug_sync_stats: false,
+            min_plugin_version: None,
             mirror_cache: true,
             mirror_fallback_ms: 2_500,
             self_update: false,

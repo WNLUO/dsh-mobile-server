@@ -380,6 +380,53 @@ pub async fn accept_tunnel(
                     .unwrap_or_default()
                     .trim()
                     .to_string();
+                // 版本门槛：先记账，再看要不要挡。
+                //
+                // **记账排在拦之前**：挡下来的那台也得留在账上，否则手机来问时中转说不出
+                // 「你那台报的是 0.4.6」这句具体的话，`/status` 也永远看不见太旧的有几台。
+                let plugin_version = request
+                    .get("version")
+                    .and_then(|v| v.as_str())
+                    .and_then(crate::plugin_versions::PluginVersion::parse);
+                if !instance_id.is_empty() {
+                    crate::plugin_versions::note(&instance_id, plugin_version);
+                }
+                if let Some(min) = crate::config().min_plugin_version {
+                    // 没报版本 = 未知 = 最旧：老插件根本没这个字段，放它进门等于门槛形同虚设。
+                    let too_old = plugin_version.map(|v| v < min).unwrap_or(true);
+                    if too_old {
+                        if crate::plugin_versions::should_log(&instance_id) {
+                            log(format!(
+                                "tunnel rejected: plugin too old instance={instance_id} have={} min={min}",
+                                plugin_version
+                                    .map(|v| v.to_string())
+                                    .unwrap_or_else(|| "unknown".to_string())
+                            ));
+                        }
+                        // 与准入拒绝同一套收尾：先说明原因再断。宿主读到 `plugin_too_old`
+                        // 就会换三十分钟的节奏，不再按 5 秒撞门（见插件的 OUTDATED_RETRY_MS）。
+                        tunnel.send_json(
+                            t::WS_ERROR,
+                            0,
+                            &format!(
+                                r#"{{"code":"plugin_too_old","message":"插件版本过旧（当前 {}），请更新后再连：本中转要求 {min} 及以上","min":"{min}","have":"{}","retryAfterMs":1800000}}"#,
+                                plugin_version
+                                    .map(|v| v.to_string())
+                                    .unwrap_or_else(|| "未知".to_string()),
+                                plugin_version
+                                    .map(|v| v.to_string())
+                                    .unwrap_or_default()
+                            ),
+                        );
+                        // **必须等这一帧真的写出去再断**：帧是经 writer 任务异步写的，
+                        // 立刻 break 会把还在队列里的 wsError 一起 abort 掉，宿主只看到一条
+                        // 光秃秃的 1006，分不出「被版本挡住」和「网络断了」——而那正是这条
+                        // 机制存在的意义。200ms 足够 writer 把它塞进内核（对端收到与否不影响
+                        // 判定，宿主本来就会重连）。
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                        break 'tunnel Some(format!("plugin too old: min={min}"));
+                    }
+                }
                 if instance_id.is_empty() {
                     log("tunnel registered without instanceId; it will receive no requests");
                 } else {

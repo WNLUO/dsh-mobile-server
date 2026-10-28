@@ -451,12 +451,21 @@ pub async fn handle_owned_path(
             // 后两个数就是「镜像是不是又快满了」和「有多少连接在空转」的体检指标。
             let host_connected = slot.get().map(|t| !t.is_closed()).unwrap_or(false);
             let mirror = crate::mirror::stats();
+            // 插件版本汇总：一小时内见过的实例数，以及其中低于门槛的台数（没配门槛时恒 0）。
+            // 这个数是决定「门槛定在哪」的唯一依据，别再让它只存在于网卡速率里。
+            let min_plugin = crate::config().min_plugin_version;
+            let (plugins_seen, plugins_old) = crate::plugin_versions::summary(min_plugin);
             let body = format!(
-                r#"{{"ok":true,"hostConnected":{},"mirror":{{"instances":{},"bytes":{},"budget":{}}},"tunnelUnregisteredTimeouts":{}}}"#,
+                r#"{{"ok":true,"hostConnected":{},"mirror":{{"instances":{},"bytes":{},"budget":{}}},"plugins":{{"seen":{},"outdated":{},"min":{}}},"tunnelUnregisteredTimeouts":{}}}"#,
                 host_connected,
                 mirror.instances,
                 mirror.bytes,
                 mirror.budget,
+                plugins_seen,
+                plugins_old,
+                min_plugin
+                    .map(|v| format!(r#""{v}""#))
+                    .unwrap_or_else(|| "null".to_string()),
                 crate::ws::unregistered_timeouts()
             );
             respond_json(reader, 200, &body).await?;
@@ -732,12 +741,15 @@ pub async fn serve_connection(stream: TcpStream, slot: Arc<TunnelSlot>) -> std::
         }
     } else {
         let Some(tunnel) = slot.get_for(instance) else {
-            respond_json(
-                &mut reader,
-                503,
-                r#"{"ok":false,"error":"that host is not connected to this relay"}"#,
-            )
-            .await?;
+            // 这台不在线的原因可能是「太旧被挡在门外」：那种情况必须说清楚，否则手机上
+            // 只会显示「电脑不在线」，用户以为是网络问题，去重启路由器也不会好。
+            let body = match crate::config().min_plugin_version {
+                Some(min) if crate::plugin_versions::outdated(instance, min) => format!(
+                    r#"{{"ok":false,"code":"plugin_too_old","error":"这台电脑的插件版本过旧，请更新到 {min} 及以上","min":"{min}"}}"#
+                ),
+                _ => r#"{"ok":false,"error":"that host is not connected to this relay"}"#.to_string(),
+            };
+            respond_json(&mut reader, 503, &body).await?;
             return Ok(());
         };
         tunnel
