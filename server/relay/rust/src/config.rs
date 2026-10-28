@@ -95,6 +95,12 @@ pub struct Config {
 
     pub upstream_header_timeout_ms: u64,
     pub debug_sse: bool,
+    /// 每分钟按实例打一行「收到多少 sync 帧、多大」（`DEBUG_SYNC_STATS=1`，默认关）。
+    ///
+    /// 纯转发节点（`MIRROR_CACHE=0`）收下的镜像正文解析完就丢，日志里一个字都不留——
+    /// 于是「宿主还在推整份」和「宿主已经改成只推摘要」在日志上长得一模一样，只能靠网卡
+    /// 入向去猜。开着它就能看见谁还在推、推多大，是这条优化唯一可核的抓手。
+    pub debug_sync_stats: bool,
 
     /// 宿主离线时用最后一份镜像兜底（`MIRROR_CACHE`，**默认开**）。
     ///
@@ -206,6 +212,10 @@ impl Config {
                 env::var("DEBUG_SSE").unwrap_or_default().to_ascii_lowercase().as_str(),
                 "1" | "true" | "yes"
             ),
+            debug_sync_stats: matches!(
+                env::var("DEBUG_SYNC_STATS").unwrap_or_default().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes"
+            ),
             // 缺省开：不设这个变量就是「宿主离线时手机还能看见列表」。显式写 0/false/no
             // 才是纯转发——两种口径都要能被部署方一眼选中，所以不设中间态。
             mirror_cache: !matches!(
@@ -253,6 +263,7 @@ impl Default for Config {
             tunnel_pong_timeout_ms: 60_000,
             upstream_header_timeout_ms: 30_000,
             debug_sse: false,
+            debug_sync_stats: false,
             mirror_cache: true,
             mirror_fallback_ms: 2_500,
             self_update: false,

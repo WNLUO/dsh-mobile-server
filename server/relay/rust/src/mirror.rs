@@ -177,6 +177,100 @@ pub fn stats() -> Stats {
 }
 
 /// 宿主推上来的镜像帧（隧道帧 `sync`）。收到就整份替换，格式不对就**保留上一份**。
+/// 诊断：一台宿主在这一分钟里推了多少帧、推了多大。
+#[derive(Default, Clone, Copy)]
+struct SyncStat {
+    frames: u64,
+    bytes: u64,
+    max: u64,
+}
+
+fn sync_stats() -> &'static Mutex<HashMap<String, SyncStat>> {
+    static MAP: OnceLock<Mutex<HashMap<String, SyncStat>>> = OnceLock::new();
+    MAP.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 记一帧（只在 `DEBUG_SYNC_STATS=1` 时收）。
+///
+/// 存在的理由：纯转发节点收下镜像正文只为了丢，日志里一个字都不留，于是「宿主还在推整份」
+/// 和「宿主已经只推摘要」在日志上完全同形，只能靠网卡入向去猜。开着这个开关就能看见
+/// 每台每分钟推了多少、最大的那一帧多大 —— 判断宿主有没有升级唯一可核的证据。
+pub fn note_sync_frame(instance_id: &str, bytes: usize) {
+    if !crate::config().debug_sync_stats {
+        return;
+    }
+    let key = instance_id.trim();
+    if key.is_empty() {
+        return;
+    }
+    let mut map = sync_stats().lock().unwrap_or_else(|e| e.into_inner());
+    let entry = map.entry(key.to_string()).or_default();
+    entry.frames += 1;
+    entry.bytes = entry.bytes.saturating_add(bytes as u64);
+    entry.max = entry.max.max(bytes as u64);
+}
+
+/// 每分钟把上面那本账打成一行汇总 + 前十几台的明细，然后清零。
+///
+/// 只在开了开关时起这个任务：关着的时候一行日志都不多。
+pub fn spawn_sync_stats() {
+    if !crate::config().debug_sync_stats {
+        return;
+    }
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            let rows = {
+                let mut map = sync_stats().lock().unwrap_or_else(|e| e.into_inner());
+                std::mem::take(&mut *map)
+            };
+            if rows.is_empty() {
+                continue;
+            }
+            let mut list: Vec<(String, SyncStat)> = rows.into_iter().collect();
+            list.sort_by(|a, b| b.1.bytes.cmp(&a.1.bytes));
+            let mut frames = 0u64;
+            let mut bytes = 0u64;
+            let mut max = 0u64;
+            let mut buckets = [0usize; 4];
+            for (_, stat) in &list {
+                frames += stat.frames;
+                bytes = bytes.saturating_add(stat.bytes);
+                max = max.max(stat.max);
+                let idx = if stat.max < 1024 {
+                    0
+                } else if stat.max < 50 * 1024 {
+                    1
+                } else if stat.max < 512 * 1024 {
+                    2
+                } else {
+                    3
+                };
+                buckets[idx] += 1;
+            }
+            crate::tunnel::log(format!(
+                "sync 一分钟：实例={} 帧={} 总={}MB 单帧最大={}KB ｜ 最大帧 <1KB:{} 1-50KB:{} 50-512KB:{} >512KB:{}",
+                list.len(),
+                frames,
+                bytes / 1048576,
+                max / 1024,
+                buckets[0],
+                buckets[1],
+                buckets[2],
+                buckets[3]
+            ));
+            for (id, stat) in list.iter().take(12) {
+                crate::tunnel::log(format!(
+                    "sync 明细 instance={id} 帧={} 合计={}KB 单帧最大={}KB",
+                    stat.frames,
+                    stat.bytes / 1024,
+                    stat.max / 1024
+                ));
+            }
+        }
+    });
+}
+
 pub fn remember(instance_id: &str, payload: &[u8]) -> bool {
     remember_with(instance_id, payload, crate::config().mirror_cache)
 }

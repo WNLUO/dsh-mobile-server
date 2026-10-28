@@ -190,6 +190,9 @@ async fn main() {
         });
     }
 
+    // 诊断：按实例统计收到的 sync 帧体积（`DEBUG_SYNC_STATS=1` 才真正开）。
+    dsh_relay::mirror::spawn_sync_stats();
+
     // HTTP 服务已经在上面那个任务里跑了。这里只等着被信号结束。
     tokio::signal::ctrl_c().await.ok();
     log("收到退出信号".to_string());

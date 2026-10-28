@@ -725,6 +725,7 @@ pub fn handle_tunnel_frame(tunnel: &Arc<Tunnel>, instance_id: &str, frame_type: 
             // 宿主推上来的整份镜像（会话清单 + 工作区 + 已签发设备凭据的摘要）。
             // 转发路径本身用不到它——只有这条隧道不在之后手机才来读（见 `mirror`）。
             // 存不下、格式不对都只是这一次不更新，绝不回执也不会断开隧道。
+            crate::mirror::note_sync_frame(instance_id, payload.len());
             crate::mirror::remember(instance_id, payload);
         }
         t::PUSH_REGISTER => {
