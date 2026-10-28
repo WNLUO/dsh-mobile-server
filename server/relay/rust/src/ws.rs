@@ -386,6 +386,18 @@ pub async fn accept_tunnel(
                     // 身份也挂到隧道自己身上：按实例记账的地方（迁移台账）只认它，
                     // 免得一条隧道替别家登记。这里**每次都覆盖**，跟表里的绑定一致。
                     tunnel.bind_instance(&instance_id);
+                    // 诊断（`DEBUG_SYNC_STATS=1`）：这台实例是哪个出口 IP 来的。
+                    // 中转只看得见 nginx 的 loopback 端口，`x-real-ip` 是本机 nginx 覆盖写入的，
+                    // 客户端伪造不了（`x-forwarded-for` 那串能随便填，不能当来源）。为的是把
+                    // 「还在推整份镜像的那几台」对到具体机器上，查完就没用了，所以只在开关打开时打。
+                    if crate::config().debug_sync_stats {
+                        let ip = head.header("x-real-ip").unwrap_or_default();
+                        log(format!(
+                            "tunnel registered instance={instance_id} ip={} peer={}",
+                            if ip.is_empty() { "-" } else { ip.trim() },
+                            peer.map(|p| p.to_string()).unwrap_or_else(|| "-".to_string())
+                        ));
+                    }
                     // 重报注册（同一个实例、同一条连接）也会走到这里，所以只在第一次
                     // 自报家门时改标签：收尾日志里要的是这条连接的身份，不是最后一次的。
                     if instance_label == "unregistered" {
