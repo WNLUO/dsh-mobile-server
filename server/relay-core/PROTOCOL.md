@@ -13,7 +13,7 @@
 | type | 名称 | id | 载荷 | 用途 |
 |---|---|---|---|---|
 | 0x01 | register | 0 | JSON `{instanceId}` | 宿主登记实例；同一实例重连只取代自己 |
-| 0x02 | registered | 0 | JSON | 中转确认注册 |
+| 0x02 | registered | 0 | JSON `{ok, mirror}` | 中转确认注册。`mirror` 是本节点的镜像口径：`false`（`MIRROR_CACHE=0` 的纯转发节点）表示收下整份镜像也只留凭据摘要、正文解析完就丢，宿主据此只推摘要帧（清单与工作区各只带 `ok`+`revision`、外加 `creds`）。老宿主只认帧类型、不读内容，多这个字段没有影响 |
 | 0x03 | updatePairing | 0 | JSON | 保留编号 |
 | 0x04 | httpRequest | N | JSON `{method, path, headers}` | 手机请求头送到宿主 |
 | 0x05 | httpBody | N | bytes | 请求体；空载荷表示结束 |

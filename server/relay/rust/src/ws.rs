@@ -40,6 +40,18 @@ pub fn unregistered_timeouts() -> u64 {
     UNREGISTERED_TIMEOUTS.load(Ordering::Relaxed)
 }
 
+/// 注册回执的载荷。
+///
+/// `mirror` 是本节点的镜像口径，宿主据此决定推什么：`MIRROR_CACHE=0` 的纯转发节点收下
+/// 整份镜像也只留凭据摘要，正文解析完就丢——那是每台宿主每 5 秒几十 KB 的白推（美国那台
+/// 实测入向 1.9MB/s、一天两百多 GB）。说了这一句，宿主就只推摘要帧。
+///
+/// 老宿主只认帧类型、不读内容（`relay/tunnel.js` 收到 0x02 直接 resolve），多一个字段
+/// 没有任何影响；反过来，**没有这个字段就按「存镜像」处理**，所以老中转 + 新宿主也照旧。
+fn registered_ack(mirror_cache: bool) -> String {
+    format!(r#"{{"ok":true,"mirror":{mirror_cache}}}"#)
+}
+
 /// 把已经读过请求头的连接接管成 WebSocket。
 async fn upgrade(reader: WsReader, head: &RequestHead) -> Option<WebSocketStream<PrefixedStream>> {
     // tokio-tungstenite 的 `from_raw_socket` 需要不含请求头的裸流；已经读掉的头不再参与
@@ -390,7 +402,7 @@ pub async fn accept_tunnel(
                         crate::proxy::fail_all_pending(&previous, "replaced");
                     }
                 }
-                tunnel.send_json(t::REGISTERED, 0, r#"{"ok":true}"#);
+                tunnel.send_json(t::REGISTERED, 0, &registered_ack(crate::config().mirror_cache));
                 continue;
             }
             crate::proxy::handle_tunnel_frame(&tunnel, &instance_label, frame_type, id as u64, &payload);
@@ -650,6 +662,14 @@ mod tests {
         let digest = sha1(b"abc");
         let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(hex, "a9993e364706816aba3e25717850c26c9cd0d89d");
+    }
+
+    /// 回执里那个 `mirror` 是宿主唯一的判据，拼错了（少字段、写成字符串）宿主就回落到
+    /// 「照推整份」——那是这次要省掉的两百多 GB。两条都钉住。
+    #[test]
+    fn registered_ack_carries_mirror_flag() {
+        assert_eq!(registered_ack(true), r#"{"ok":true,"mirror":true}"#);
+        assert_eq!(registered_ack(false), r#"{"ok":true,"mirror":false}"#);
     }
 }
 
