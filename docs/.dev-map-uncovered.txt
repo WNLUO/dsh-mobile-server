@@ -1,0 +1,28 @@
+# A 段未覆盖的源文件（没有任何条目的「改哪里」收它们）
+# 由 gen-dev-map.mjs 生成，勿手改。
+# 补条目到 A 段后跑 `npm run map`，这份清单会自动变短。
+# 共 24 / 32 个；其中 0 个已被「联动」点到过。
+server/relay-core/rust/src/lib.rs
+server/relay-core/rust/tests/parity.rs
+server/relay-core/test/protocol.js
+server/relay/rust/console/index.html
+server/relay/rust/console/src/App.tsx
+server/relay/rust/console/src/components/blocks.tsx
+server/relay/rust/console/src/index.css
+server/relay/rust/console/src/lib/api.ts
+server/relay/rust/console/src/lib/format.ts
+server/relay/rust/console/src/main.tsx
+server/relay/rust/console/vite.config.ts
+server/relay/rust/src/apns.rs
+server/relay/rust/src/config.rs
+server/relay/rust/src/console/config.rs
+server/relay/rust/src/console/mod.rs
+server/relay/rust/src/console/node.rs
+server/relay/rust/src/console/oidc.rs
+server/relay/rust/src/console/ota.rs
+server/relay/rust/src/console/ratelimit.rs
+server/relay/rust/src/lib.rs
+server/relay/rust/src/mirror.rs
+server/relay/rust/src/plugin_versions.rs
+server/relay/rust/src/selfupdate.rs
+server/relay/rust/src/store.rs

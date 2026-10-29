@@ -1,0 +1,168 @@
+# 开发地图
+
+> 这份文件是「需求 → 改哪里」的索引。**先看它，再 grep。**
+>
+> - **A 段**（手写）在 `docs/.dev-map-parts/*.md`，本文件里的 A 段是它们的汇总。
+>   定位失败、或踩到坑时，回写那里，再跑 `npm run map`。
+> - **B 段 / C 段是机械生成的**，改它们会被下次 `npm run map` 覆盖。
+>   B 段的「用途」列读的是每个源文件的文件头注释。
+
+## A 段 · 需求 → 改哪里
+
+每条条目的字段固定，含义如下：
+
+| 字段 | 写什么 |
+| --- | --- |
+| 典型说法 | 用户/同事会怎么描述这件事（口语原话最好）。这是入口——搜不到就定位不了。 |
+| 改哪里 | `文件:行号` + 符号名，一次全列。**必须含至少一个能被机器抽出的路径**，否则这条对 `affected` 等于不存在。 |
+| 联动 | 顺带被牵到的文件（契约、常量表、双份实现）。不参与「命中」判定，只提示。 |
+| 守卫 | 钉住这块行为的测试/检查脚本。`affected` 会把它们列出来让你跑。 |
+| 刻意设计 | 看起来像 bug、其实是故意的。**不写，下一个 agent 会顺手「修好」它。** |
+| 坑 | 根因，不是现象。踩过一次就写一句，省下一个人半天。 |
+
+<!-- BEGIN:TASK-PLAYBOOKS -->
+# Rust 中转（dsh-mobile-server）
+
+> Rust 中转与隧道协议的条目。这些原来写在 App 仓的开发地图里（A4 段），2026-10-30 搬过来：
+> 代码本体在这个仓库，写在那边指不到文件，也改不动。
+### A1-01. 中转 Rust 实现（server/relay/rust）
+- **典型说法**：「Rust 版中转」「把 Node 换成 Rust」「自建版换成 Rust 二进制」。
+- **改哪里**：`server/relay/rust/src/`：`main.rs`（入口）、`config.rs`（环境变量与限额，对齐 Node 版 `lib/config.js`）、`http.rs`（手写 HTTP/1.1 解析与中转自有路径）、`proxy.rs`（HTTP 转发、chunked 解码、隧道帧分发、背压）、`ws.rs`（WebSocket 握手、隧道接入、手机桥接）、`tunnel.rs`（单隧道状态、帧发送、积压记账）、`headers.rs`（逐跳头规则）。验收脚本两组：`scripts/e2e.cjs`（普通转发）与 `scripts/e2e-stream.cjs`（SSE 流式、手机 WS 桥接、隧道取代时的在途请求、心跳死链）；参考宿主 `test/fake-desktop.js` 使用与协议 Rust 对撞相同的测试编解码，不依赖主仓检出。在独立仓库运行 `npm run build:relay` 与 `npm run test:e2e`。
+- **联动**：协议编解码用独立仓库的 `server/relay-core/rust`（crate `dsh-relay-protocol`），类型表事实源是同仓的 `server/relay-core/protocol-types.js`；`headers.rs` 的逐跳头集合与 `dsh-mobile-plugin/lib/relay/lan-proxy.js` 手工同步（插件测试在本地有中转检出时比对；独立构建时各自钉住完整集合）。
+- **守卫**：`cargo test`（18 条单元测试，含 SHA-1、RFC 6455 握手向量，以及路径规则的四条：`owned_path_is_hit_under_deploy_prefix`、`forwarded_path_drops_prefix_but_keeps_query`、`repeated_and_trailing_slashes_are_collapsed`、`slashes_are_collapsed_before_owned_path_checks`）；`scripts/e2e.cjs` 18 条（自有路径、带部署前缀的 `/healthz` 与 `/status`、**手机 API 路径剥前缀后再进隧道**、不含前缀的路径原样转发、**双斜杠与尾斜杠压平后再进隧道**、无隧道 503、隧道连上、GET 转发、状态码与响应头、POST 请求体、自定义头）；`scripts/e2e-stream.cjs` 12 条（SSE 三条事件且**首尾间隔 ≥100ms** 证明是流式而非攒批、SSE content-type、手机 WS 文本与二进制往返、隧道取代后转发仍通、**在途请求被顶掉时 2 秒内回 502 带原因**、不回 pong 的隧道被判死链且 /status 转 false）。
+- **刻意设计**：**不引 HTTP 框架**。中转只处理固定几种形态，手写解析更容易和 Node 版逐条对齐，也避免了为「体量不大但行为很细」的部分引入一整套栈。**连接用单流 `BufReader<TcpStream>` 而不是拆读写两半**——升级时要把整个 reader 交给 tungstenite，拆开再合回去很别扭，而这里不需要半双工。
+- **坑**：三个都在移植时踩出来的，且**都是静默失败**：①WebSocket 握手要用真实请求头算 `Sec-WebSocket-Accept`，传一个空 headers 的假 RequestHead 会让客户端报 `Invalid Sec-WebSocket-Accept`；②`BufReader::into_inner()` 会丢掉已预读的字节，客户端收到 101 后立刻发的帧就躺在缓冲里，表现为「连上了但一个帧都收不到」——必须用 `PrefixedStream` 把残留字节接回前面；③无 `content-length` 的 GET 不能落到「读到连接关闭」的分支，那是死锁（客户端等响应、中转等它的字节），无体方法必须直接发空 `httpBody`；④响应通道**必须在插入 pending 时就建好**，等 httpHead 之后再建会让这中间到达的 chunk 整段丢掉（响应体为空）；⑤心跳超时只 `mark_closed()` 是**不够的**——读循环此时阻塞在 `source.next()` 上没人看那个标志位，必须用 oneshot 打断它，否则日志说终止了连接还挂着；⑥隧道被顶掉时，还在等响应头的请求要收到一个「上游不可用」的头转成 502，**只 drop 发送端会被上层当成超时报 504**；⑦**路径不能原样转发**：手机把 `https://host/relay` 当中转地址时，请求路径是 `/relay/api/mobile/v1/...`，而宿主只认 `/api/mobile/v1/...`——原样送过去每个接口都 404，且看起来像「宿主坏了」；剥前缀在 `RequestHead::routed_path()` 一处，转发与手机 WS 的 `wsUpgrade` 帧都走它。⑧**斜杠要先压平再剥前缀**：用户把中转地址填成 `https://host/` 时拼出来是 `//pair`，宿主按 URL 解析会把它当成协议相对地址解析成 `/`（`//api/mobile/v1/status` 则解析成 `/api/mobile/v1/status`）——不压平的表现是「有的接口 404、有的落回首页」，而不是连不上。顺序是 normalize → strip_deploy_prefix → strip_forward_prefix，写反了前缀会剥不干净。⑨**e2e 里验前缀要用 `/api/mobile/v1/` 下的路径**：上游夹具那条 `/echo` 是 `startsWith` 匹配，拿 `/relay/echo` 试的话剥没剥都 200，验不出东西（真实踩过一次）。⑩手机 WS 的保活要发 **WebSocket 协议层的 ping**（客户端栈自动回 pong），发隧道的应用层 ping 手机根本不认识。⑪**隧道关闭必须说清「谁、活了多久、为什么关」**（`src/ws.rs` 读循环把每条退出路径折成一个 `close_reason`，收尾日志打 `instance= lived= reason=`）：只有一句 `tunnel closed` 时，真机上一小时断十几次也分不清是中转踢的、被新连接顶掉的，还是对面悄悄消失（2026-10-17 排查绕了好几轮才排除「中转主动断」）。顺带修掉准入拒绝那条 `break` 只跳出 `for`、隧道其实还连着的老问题（改成带标签的 `break 'tunnel`）。⑫**上行请求体的积压等待必须自带期限**（`proxy.rs` 的 `wait_for_feed_room`，content-length 与 chunked 两条分支都走它）：宿主读帧卡住（事件循环被堵、GC、正在拼一条超大 SSE）时积压会一直停在高水位上，手机的上传永远停在半路、中转那条 pending 一直占着名额而日志里一个字都没有——攒够 256 条之后所有请求都开始 429，事后也看不出第一批被谁占住。期限**按「还在动」续**：积压只要比上一次采样小就重新计时（缓而不断的大上传不该被杀），一动不动到 30s（复用 `upstream_header_timeout_ms`，与等响应头同量级）才放弃；放弃时先摘 pending、发 `httpCancel`，隧道还在回 504 `upstream request stall`、已经没了回 502，不要落到「再白等一次响应头超时」。⑬**手机 WS 通道满不许静默丢帧**（`try_send` 回 `Full`）：丢一帧就是丢了重建不回来的一段，客户端不知道、宿主也没有补拉路径，换来的是「少了一截、没人发现」——整条 WS 关掉（`wsClose(1013, "phone ws backpressure")`，通道满所以等空位再送那帧）让客户端重连，比在这条连接上继续少数据强；只关这一条 WS、不碰隧道，与心跳超时那条收尾同形。删掉任何一条修复，两组 e2e 里都能看出是哪一条。
+
+### A1-02. 运营中转的部署与发布
+
+- **典型说法**：「更新几台中转」「在哪台编译」「发更新源 / GitHub」「0.1.x 现在跑的是哪版」「`ai-hub-de-1` 那台到底在哪」「发布中转」「只先升我们这几台」「中转发个版」「GitHub 挂了怎么发中转」。
+- **一句话「更新中转程序」就是走这条**（2026-10-27 用户明确：他一般只会给这一句，别反问要发哪个版本、要不要发 GitHub）：
+  1. `git fetch` 看 main 是不是最新、工作树干不干净 —— 这个仓库常有别的对话同时在改。
+  2. **先判有没有东西可发**：`git diff <上一个 rust-v tag>..HEAD -- server/relay/` 为空＝这轮只有文档/脚本改动，**不要为了发版而发版**，说明一声就停。
+  3. 抬补丁号（`0.1.x` +1；用户没点名就不要跳大版本）、提交、打 `rust-v<版本>` tag 推。
+  4. 等 CI 两架构都绿（x86_64 有缓存约 1 分钟、ARM64 约 5 分钟），CI 自己建 Release。
+  5. 本机下两份产物 → scp 到 A → 发**预发**清单 → B 自己升 → 看 `/healthz`、`/status` 的 `hostConnected`、日志「自动更新到 x.x.x 成功」。
+  6. 发**正式**清单（国内镜像 + 海外 `relay-updates` 分支；海外那份用 `gh api` PUT，A 连不上 github.com）→ 重启其余三台催检查 → 四台 sha256 相同、`/healthz` 全 `ok`。
+  7. 回报：版本号、两份 sha256、四台状态、以及「面板那两行要登录后才看得到，我没替你验渲染」这类没验到的部分。
+  只有他明确说「只升我们那几台」时才停在第 5 步、不碰公开清单；命令与坑在 `server/relay/rust/README.md` 的「发布一个版本」一节，别凭记忆重编一遍。
+- **改哪里**：`server/relay/rust/Cargo.toml`（版本号，锁文件同步）、`server/relay/rust/deploy/publish-relay-update.sh`（更新源发布）；部署对象就是下面这四台（2026-10-24 实测全部 x86_64 Linux，服务名都叫 `dsh-relay.service`，除 Alpine 那台走 OpenRC 见 A4-21）：
+  - **A = SHIYAN**（`210.16.177.228`，`dsh-hub.wnluo.com`，湖北十堰）：**运营服务器**——运营面还没对外开放，这条中转目前是项目主人自己在用。二进制 `/opt/dsh-mobile/dsh-relay`，数据 `/opt/dsh-mobile/data/console.db`，更新源 `/opt/dsh-mobile/relay-updates/`；**只有这台有 cargo**，编译目录 `/opt/dsh-mobile/build-src/`。主机上还叠着宝塔和一堆别的站点，动手只碰 `dsh-relay`。
+  - **B = JDBJ**（`117.72.53.95`，`ai-hub-jd-1.wnluo.com`，京东云北京）：二进制 `/opt/dsh-relay/dsh-relay`，没有 cargo。
+  - **D = 美国（纽约州水牛城）**（`107.175.156.143`，**`ai-hub-de-1.wnluo.com` 归它**）：Debian 12 / 1 核 960MB / 30G 盘，x86_64；二进制 `/opt/dsh-relay/dsh-relay`（musl 静态包，不在这台编译），配置 `/etc/dsh-relay.env`（600），systemd 单元 `/etc/systemd/system/dsh-relay.service`，只监听 `127.0.0.1:18788`；前面是这台自己的 nginx（`/etc/nginx/sites-available/ai-hub-de-1.wnluo.com.conf`，80 反代 18788，443 待证书）；`SELF_UPDATE=1` 且源指海外那条 `relay-updates`。登录 `ssh -i ~/.ssh/us40_ed25519 root@107.175.156.143`（默认 `id_rsa` 与 `id_wuxi_frps` 都会被拒）。**域名里那个 `de` 是历史命名，机器实际在美国**，按地区称呼或排延迟时别按欧洲算。
+  - **Alpine = 成都阿里云**（`47.108.201.215`，`cd-ai-hub.wnluo.com`）：**项目主人在用**。配置与证书自愈那套见 A4-21。
+- **联动**：宿主侧 SSE 限额 `dsh-mobile-plugin/lib/relay/lan-proxy.js`（两处上限同为 64，见 A4-18 与 A2 的 429 条目）；App 分发与 GitHub 渠道是另一条链（A5-20），别混。
+- **刻意的取舍**：**中转清单只列还在服役的机器**（2026-10-24 用户明确要求）。退役的节点从地图、归档与本地备忘里一并删掉——留在清单里的后果是下一个人照着单子去升一台没人在用的机器，白耗一次发版窗口。**每台的用途按用户口径记**：A 是运营机但运营面尚未开放、目前项目主人在用；B 是京东云北京；D 在美国水牛城；Alpine 在成都阿里云、项目主人在用。
+- **守卫**：在 SHIYAN 的 `build-src/server/relay/rust` 里 `cargo test --release --locked`（2026-10-25 实测 122 条），再跑 `node scripts/e2e.cjs target/release/dsh-relay`、`node scripts/e2e-stream.cjs target/release/dsh-relay`、`node scripts/e2e-mirror.cjs target/release/dsh-relay`；发布脚本自己会用公网地址回取一遍 `latest.json` 里的二进制并核对 sha256。
+- **部署顺序（2026-10-27 起改了两处，别照旧单子做）**：①**发布包不在任何服务器上编**——打 tag 由 CI 编（见下一条），要跑测试就在 SHIYAN `/opt/dsh-mobile/build-src/server/`（那边 `cargo test --release --locked` + 三个 e2e）；②二进制由本机从 GitHub Release 下（国内机器连不上 github.com，只有本机能直接取）、再 scp 到 A；③**各台不再手工替换**——它们自己有自动更新（四台都开着），发预发/正式清单 + `systemctl restart`（Alpine 用 `rc-service dsh-relay restart`）催一次检查，65 秒内自己换好、起不来自己回滚；④验收：`/healthz` 回 `ok`、`/status` 的 `hostConnected` 回来、日志里 `自动更新到 x.y.z 成功`、四台 sha256 必须相同。只有 GitHub 那边不通时才退回手工换文件（那份必须同时是对外发的那份）。
+- **发布**：更新源在 A 上跑 `RELAY_UPDATE_ROOT=/opt/dsh-mobile/relay-updates RELAY_UPDATE_PUBLIC_BASE=https://dsh-hub.wnluo.com/relay-updates sh deploy/publish-relay-update.sh <版本> <二进制的绝对路径>`；GitHub 侧另发 `rust-v<版本>` tag + release，资产名按现有约定 `dsh-relay-<版本>`（不是更新源里的 `dsh-relay-linux-x86_64`）。**两边都要发**：更新源给开了自动更新的中转，GitHub 给公开下载。
+- **海外更新源**（2026-10-24 起）：仓库的 `relay-updates` 分支只有一份 `latest.json`，里面 `url` 指向 `releases/download/rust-v<版本>/dsh-relay-<版本>`（二进制挂 Release 资产，**不进 git 历史**）。海外节点的 `SELF_UPDATE_SOURCE` 指向 `https://raw.githubusercontent.com/WNLUO/dsh-mobile-server/relay-updates/relay-updates`。实测美国那台取 8MB 约 0.9 秒，从国内更新源取约 15 秒。**发版时这个分支要跟着提交一行**，否则海外机器停在旧版本且只会每天记一行「已是最新」。
+- **出包改到 CI 了（2026-10-27）**：打 `rust-v<版本>` tag 推上去，`.github/workflows/release-relay.yml` 编两份静态包并挂 Release，资产名统一成 `dsh-relay-linux-<arch>`（此前 x86_64 叫 `dsh-relay-<版本>`，aarch64 从没发过）。**不再在 SHIYAN 上编发布包**，那台上的 cargo 只用于跑测试。两个坑：① `musl.cc` 从 GitHub runner 上也连不上（三次重试各 135 秒超时），ARM64 用 `cross` 拉 `ghcr.io` 的现成镜像编；② musl 的两条编译参数收在仓库根 `.cargo/config.toml`（CI / `build-static.sh` / 本机手编共用），别在工作流里再写一遍。ARM64 的包**只能用 qemu 跑一次 `--version`** 验「起得来」，转发没在真 ARM 机器上验过（用户 2026-10-27 定：没人验就先这样，等有人报）。发布清单仍走 `publish-relay-update.sh`，新加 `RELAY_UPDATE_CHANNEL=canary` 通道：先发预发目录让一台升、看过 `/status` 的 `hostConnected` 再发正式。**`/healthz` 只能证明进程活着，证明不了转发通**，所以预发这步必须人看一眼。**用户端安装改成 `deploy/install-binary.sh`**（下预编译包、核 sha256、试跑、装 systemd、开自动更新），源码编译那条降级成 `install.sh`；官方包里烤了默认更新源（编译期 `DSH_RELAY_UPDATE_SOURCE`），**自己 `cargo build` 出来的没有默认源**（防 fork 自编被官方二进制替换）。**2026-10-27 首次按新链路发版**：一天里走了两版——`0.1.14`（含另一条线的「按实例登记中转迁移」）与 `0.1.15`（面板显示版本与自动更新状态）。流程是 tag → CI 双架构出包 → 先发预发清单让 B 自己升上去、看过 `/status` 的 `hostConnected` → 再发正式（国内 `dsh-hub` + 海外 `relay-updates` 分支）。**海外那份清单是在本机用 `gh api` PUT 改的**：A 上跑发布脚本的 `@github` 分支会自检失败，因为国内机器连不上 `github.com`，二进制也是先下到本机再 scp 到 A（`/root/relay-dist-<版本>/`）。四台现在都是 `0.1.15`、同一份 sha256 `14e7743f…`，`/healthz` 全 `ok`；Alpine 那台 `hostConnected=false` 是老现象（宿主电脑当时没在线）。**B 是预发节点**：它的 `SELF_UPDATE_SOURCE` 第一项是 `https://dsh-hub.wnluo.com/relay-updates/canary`，以后发版先发预发它就先升，其余三台等正式；A 的自动更新开关在 `/etc/dsh-relay-console.env` 里（它的单元文件用的是 EnvironmentFile）。控制台产物 `dist-console` 已按新源码重建并推到 A 与 B（B 上没有 rsync，用 tar 过去；两边都留了 `dist-console.bak-*`）。
+- **坑**：**版本号已经发过就不能复用**。2026-10-23 的 `rust-v0.1.6` tag/release 在 SSE 修复提交 `276dcd3` 之前就已创建（当时只抬了版本号），所以这一轮只能抬 `0.1.7`；直接改 `latest.json` / release 资产会让「同一版本号、两份不同二进制」同时存在。**`ai-hub-de-1.wnluo.com` 这个名字与机器位置无关**：域名里的 `de` 是早期命名，机器在美国水牛城，别按名字推机房位置，按 IP 认。域名解析由用户自己改，改之前只有 IP 可证。**发布脚本会 `cd` 到更新源目录**，二进制要传绝对路径，传 `target/release/dsh-relay` 会报「找不到二进制」；rsync 可能把脚本的可执行位带丢，跑不动就用 `sh deploy/publish-relay-update.sh`。**换二进制必须先 stop 再 mv**（运行中 `cp` 覆盖会撞 `Text file busy`）。**A 上叠着宝塔和一堆别的站点**：重启/部署后要顺手确认没把它们带下去。**glibc 动态包在 Alpine 上跑不了**（缺 `libgcc_s`，补 `gcompat` 还缺 `fcntl64`/`__res_init`），所以发布统一发静态包（`deploy/build-static.sh`）；把 glibc 包下发到 Alpine 会被 0.1.8+ 的「替换前试跑」拦住、服务继续跑旧版，不会搞死机器，但白升一次。**`SELF_UPDATE_SOURCE` 的多源语法（逗号分隔）0.1.8 才有**：给 0.1.7 的机器配两个地址，它会把整串当成一个 URL、取不到清单。所以换源必须在换二进制之后。**Alpine 上重编不能用 apk 的 rust**（只带 alpine musl 标准库，编 proc-macro 直接报 `cannot produce proc-macro`）；用 `build-static.sh` 的 ubuntu + musl-gcc 交叉编译。**2026-10-23 当前状态**：三台均已到 `0.1.7`（sha256 `676683df…`），更新源 `latest.json` 与 GitHub `rust-v0.1.7` 已同步发布。**2026-10-24**：`0.1.9` 发布，首个 musl 静态包（sha256 `5ad0161c…`），Rocky/Debian/Alpine 同一份二进制；新增第四台节点 `47.108.201.215`（`cd-ai-hub.wnluo.com`，Alpine 3.20 + OpenRC，**不是** systemd，用 `deploy/openrc/` 那套，服务名 `dsh-relay` 走 `/etc/init.d`）。静态包在 Alpine 与 B 上都实测过 `/healthz`。**2026-10-25**：`0.1.12` 发布，四台统一到同一份 musl 静态包（sha256 `1fe6f657…`）。这一版把此前散在三条线上的东西并成一条：`0.1.10` 的「SSE 名额按设备分账、新流顶同设备最旧那条」（当时只在临时 worktree 里，没进 git）、`0.1.11` 的「响应保留 `content-length` 不退化成 chunked」（当时只编在 A 上）、以及 main 线的镜像凭据任意形状 + APNs + 信封体积账（`MAX_BODY_BYTES` 67MB、镜像条目 4MB / sync 帧 16MB）。本地 `cargo test --release --locked` 122 条、`e2e.cjs` / `e2e-stream.cjs` / `e2e-mirror.cjs` 三套全绿（在 A 上用 `target/release` 跑）；四台逐台「备份 → stop → mv → start」，`/healthz` 回 `ok`，A/B/D 的 `/status` `hostConnected=true`，Alpine 那台宿主当时没在线所以是 `false`（正常，宿主自己连上来才会变 true）。更新源 `latest.json`（国内 `dsh-hub` + 海外 `relay-updates` 分支）与 GitHub `rust-v0.1.12` Release 都已同步。**2026-10-27**：`0.1.13` 发布，四台统一 sha256 `c3cae77c…`，两条更新源与 GitHub `rust-v0.1.13` Release 同步。这一版只改镜像缓存的实例上限（16 → 512）并加总量预算（见 A4-18 的坑）；美国那台换完之后日志从每分钟上万行落回每分钟十几行，兜底缓存与令牌凭据表也重新装得下。**日志轮转要按机器路径装，装错了是静默失效**（2026-10-27）：模板 `deploy/logrotate.d-dsh-relay` 里的路径是 A 的 `/opt/dsh-mobile/logs/relay.log`，B/D 是 `/opt/dsh-relay/logs/relay.log`（Alpine 不用这份，走 `deploy/openrc/dsh-relay-log-rotate`：20MB 切、留 3 份，daily 与 hourly 都挂，2026-10-24 起已在跑）。路径写错时 `logrotate -d` 一个字都不报、只是什么都不切 —— 此前只有 A 装了这份配置，B/D 各攒成 85MB 与 537MB 的单文件；现在三台 systemd 机器都装上（`size 50M` / `rotate 7`，上限 350MB），并各手动切过一次验证：`copytruncate` 切完日志继续长才算数。历史那两个大文件按轮转链压成 `.1.gz`（B 5.9MB、D 39MB），交给 `rotate 7` 自然淘汰。**2026-10-28 发 `0.1.17`**：四台统一 sha256 `bc6d67a3…`（x86_64）/ `ab767329…`（aarch64），国内正式 + 国内 canary + 海外 `relay-updates` 分支 + GitHub `rust-v0.1.17` Release 四处同一份；内容是把「上行体积压等待加期限 / 手机 WS 通道满就关连接」与「镜像账本按内存定预算」两条并进来。这一轮照第 ① 条先把仓库里那份 `publish-relay-update.sh` 推到 A 才发 canary（否则 canary 变量被旧脚本静默忽略）；B 自更新时 systemd 记了一次 `status=75/TEMPFAIL` 后自动重启——那是替换二进制那条退出码，不是故障，判据看版本号与 sha256。四台验收：A/B/D 的 `/status` `hostConnected=true`、Alpine 那台宿主没在线（`false` 正常），美国那台 `tunnelUnregisteredTimeouts=9` 正是这一版新加的十二秒收尾在干活。**2026-10-28 又发 `0.1.18`**（注册回执带 `mirror`，见 A4-18）：四台同一份 sha256 `880b66de…`，国内正式 + 国内 canary + 海外 `relay-updates` 分支 + GitHub `rust-v0.1.18` Release 四处一致，`/healthz` 全 `ok`、A/B/D 的 `hostConnected=true`。**B 这次是手工装的**：它的 `SELF_UPDATE_SOURCE` 第一项 `dsh-hub.wnluo.com` 在这台上解析不出地址（`getent hosts` 空、`curl` 报 `Could not resolve host`），清单是从 GitHub raw 那份拿到的、二进制地址却指向 `github.com/releases/download`，于是卡在「开始下载」不动（`/opt/dsh-relay/data/.update-state` 一直 `confirmed=0.1.17`）。**判据：日志停在「发现新版本 x，开始下载」超过一分钟、又没有任何失败行，先核这台能不能解析 `dsh-hub`** —— 那条路断掉时自更新不打失败日志。美国那台是 `github` 那条源自己升的（「自动更新到 0.1.18 成功」），A 与 Alpine 走国内正式。**诊断开关 `DEBUG_SYNC_STATS=1`（0.1.19 起）**：每分钟一行「实例数 / 帧数 / 总字节 / 单帧最大 / 四个体积档各多少台」+ 前十二台明细，0.1.20 又在注册时多打一行 `tunnel registered instance=… ip=…`（`x-real-ip` 是本机 nginx 覆盖写入的，客户端伪造不了）。**这是「宿主到底还在推多大」唯一直接的证词**：网卡入向只知道有多少字节，日志原来一个字都不记帧体积。**2026-10-28 当天的现场**：283 台实例里 232 台的单帧不到 1KB（已经是摘要帧），剩下 22 台在推 0.5～2.4MB 的大帧、吃掉了接近全部 100MB/分钟的入向；把这 22 台按 IP 归并只有 13 个出口 IP（`223.109.1.187`、`114.66.247.140`、`117.85.65.211` 三家就占一半），其中多个实例共用一个 IP（同一宽带下的多台机器）。**结论：插件铺开是成功的，剩下的不是「所有人都在推」，而是一小撮清单特别大的老版本机器** —— 这也纠正了只看网卡总量得出的「一台都没升」的误判。
+
+### A1-03. Alpine 节点（cd-ai-hub.wnluo.com）与证书自愈
+
+- **典型说法**：「cd-ai-hub 那台」「海外/国内那台小机器」「证书到期怎么同步」「Alpine 上怎么装」「nginx 那套证书是哪个站点抄来的」。
+- **改哪里**：
+  - 节点本身 `47.108.201.215`（Alpine 3.20.9，2 核 / 431MB 内存 / 系统盘 427MB）：中转 `/opt/dsh-relay/dsh-relay`（**静态 musl 包**），配置 `/etc/dsh-relay.env`（600），数据 `/opt/dsh-relay/data/.update-state`，日志 `/opt/dsh-relay/logs/relay.log`。登录 `ssh -i ~/.ssh/id_wuxi_frps root@47.108.201.215`（默认 `id_rsa` 被拒）。
+  - 服务：OpenRC，不是 systemd。`/etc/init.d/dsh-relay` + `/etc/conf.d/dsh-relay` + `/etc/periodic/daily/dsh-relay-log-rotate`（同一份脚本在 `hourly` 也挂了符号链接），仓库里有通用版 `server/relay/rust/deploy/openrc/README.md`（同目录三份原件 `dsh-relay.initd` / `dsh-relay.confd` / `dsh-relay-log-rotate`）。
+  - TLS：节点 `/etc/nginx/http.d/cd-ai-hub.wnluo.com.conf`（443 终结 + 反代 `127.0.0.1:18788`，WS/SSE 长连接头），证书 `/etc/nginx/certs/cd-ai-hub.wnluo.com/`。
+  - 证书同步：**方向是 A → 节点**，脚本 `A:/opt/dsh-mobile/deploy/sync-cert.sh`，cron `/etc/cron.d/dsh-cert-sync`（`17 */10 * * *`，带 flock）。证书源是 A 上的 `*.wnluo.com` 泛域名（`/www/server/panel/vhost/cert/ai-hub.wnluo.com/`，二十多个站点共用同一张）。A 上生成专用 `/root/.ssh/id_node_push`，公钥在节点 `authorized_keys`；**节点上没有能读 A 私钥的东西**。
+- **联动**：发布与版本线在 A1-02（同一份静态包，`0.1.9` 起）；海外更新源同样是 A1-02 那条 `relay-updates` 分支。
+- **守卫**：无自动化守卫。人工复核用 `rc-service dsh-relay status`、`curl http://127.0.0.1:18788/healthz`、`cat /opt/dsh-relay/data/.update-state`（`confirmed=<版本>` 才算升级成立）；TLS 用 `openssl s_client -connect <IP>:443 -servername cd-ai-hub.wnluo.com` 与 `curl --resolve`；证书同步看 A 的 `/opt/dsh-mobile/logs/cert-sync.log` 与节点 `/var/log/cert-sync.log`（`SELFCHECK ok` / `upstream-down`）。
+- **刻意设计**：**同步只能 A 推**——反向拉意味着在节点上放一把能读 A 私钥的钥匙，那台机器是面向公网的最后一段。**替换前先在节点侧校验**（公钥配对 / 覆盖该域名 / 未过期 + `nginx -t`），任何一项不过就不动线上文件也不 reload。**A 的证书快到期却没换新时双写 WARN**（A 日志 + 节点日志）：只看 A 的日志，等于没人看。**80 端口保持关闭**：TLS 终结与反代都不依赖它，少一个面。
+- **坑**：① **本机（那台 Mac）不能当验证证据**：对 `cd-ai-hub.wnluo.com` 这个 SNI 的出站被本机规则代理转去 CDN 了，`curl --resolve` 会拿到 `server: ESA` + `acw_tc` cookie 而节点 access_log 里没有这条。验证要用 A 或节点 loopback。② **OpenRC 全局 `respawn_max` 被 rc.conf 设成 5**，同名变量会被继承，5 次崩溃后 `supervise-daemon` 自己退出、服务再没人管；仓库版用独立变量名 `dsh_relay_respawn_max` 给默认 0。③ **`--respawn-period 0` 是非法值**，`supervise-daemon` 直接拒绝启动。④ 日志必须**复制 + 原地截断**，改名换新文件会让新内容继续写进被改名那份（`supervise-daemon` 握着 fd）。⑤ **日志切分脚本不看磁盘余量**，它只保证日志不会长成吞掉整块盘的东西，盘被别的进程写满时它一个字节都不会动。⑥ 磁盘账：稳态 二进制 8 + `.previous` 8 = 16MiB，叠加日志上限 80MiB（4 份 × 20MiB）＝ 96MiB；升级瞬间峰值多一份 8MiB 暂存，**失败回滚后会再多一份 `dsh-relay.failed`**，所以最坏 104MiB。当前可用 285MiB。⑦ **443 是否对公网可达取决于阿里云安全组**，机器上没有 iptables/nft，本地不拦——要用户在安全组放行 443/tcp。
+
+### A1-04. 版本线对账（发版前先确认生产跑的是哪一条）
+
+- **典型说法**：「这次发版会不会把线上的东西冲掉」「main 怎么比机器上还旧」「0.1.10 / 0.1.11 在哪」「拿 main 编一版发出去就行吧」。
+- **改哪里**：把分叉的线并回来时落版本号的地方是 `server/relay/rust/Cargo.toml`（锁文件 `Cargo.lock` 里 `name = "dsh-relay"` 那一段同步），代码本身不该为了「对账」而改——改的是发版第一步的顺序。对账三件事：①`git fetch --all` 之后看 `git log --graph --oneline main relay-0.1.8-static origin/relay-updates`，确认 main 与发布线是不是同一条；②逐台 `dsh-relay --version` 与 `sha256sum`，记下真实的线上版本；③`A:/opt/dsh-mobile/build-src/server/` 与本机 clone 做 `diff -r`（排除 `target`），非空说明 A 上那棵树才是最新的，先把它落成提交。
+- **联动**：部署与发布流程在 A4-19；更新源与 GitHub 两条链同条；Alpine 那台的状态文件见 A4-21（`confirmed=` 只反映自动更新，手动换过二进制不会跟着变）。
+- **刻意设计**：**发版前先对账，不对就停下来落提交**。中转这条线的现实是「生产被手改过、改动没回仓库」，直接照着「本地编一版 → 分发」的流程走，会把机器上已经跑着、但仓库里没有的功能静默抹掉；而这种抹掉不会报错，只会在几天后表现为「某个修复又出现了」。所以宁可先花十分钟把 diff 落成提交，再发。
+- **坑**：**2026-10-25 实测踩到，值得照抄结论**。当时 main 停在 `0.1.7` 那一代，而线上是 `0.1.10`（内容只在 `/private/tmp/relay-0110` 这个临时 worktree 的未提交改动里）和 `0.1.11`（只在 A 的 build-src，是「响应保留 `content-length`」那一改）。三条线各有对方没有的东西：`0.1.10` 有「SSE 名额按设备分账、新流顶同设备最旧那条」，`0.1.11` 有 content-length，main 有 APNs 与「镜像凭据任意形状 + 信封体积账」。**任取一条编都会降级**，所以那一轮折成 `0.1.12` 一次发完，四台统一到 sha256 `1fe6f657…`。**版本号只能往前抬**：`0.1.10` 已进国内更新源、`0.1.11` 已上 A，都不能复用，所以合并后的版本是 `0.1.12`。**`/private/tmp` 里的 worktree 不可信**：`/private/tmp/relay-0110` 与 `/private/tmp/dsh-relay-018` 是临时检出的，机器重启或清理就没了，凡是它们里面改出来的东西都要落成提交才算数。**发布后别只看 `latest.json`**：海外那条是仓库 `relay-updates` 分支里的一个文件，要单独提交并 push（见 A4-19），漏了这一步海外机器只会每天记一行「已是最新」。**2026-10-28 发 `0.1.16` 时的三个现场，下次照抄**：① **A 上的发布脚本副本是旧的**（`0.1.13` 时代，目录写死成正式那个、不认 `RELAY_UPDATE_CHANNEL`），发 canary 前要先把仓库里那份 `deploy/publish-relay-update.sh` 推上去，否则 canary 变量被静默忽略、脚本拿正式目录的清单做幂等判定，回一句「已经是 0.1.16」就退出，canary 一个字都没动。② **canary 与正式必须同一天发**：B 的 `SELF_UPDATE_SOURCE` 把 canary 排第一，而多源判定是**第一个能解析的清单说了算**（`first_manifest` 里 `UpToDate` 直接 `return`，不再试后面的源），canary 停在旧版本时，只发正式的机器永远收不到新版本 —— 那天 B 是靠手工装才到 `0.1.16` 的。③ **自更新不在启动时立刻查**：`spawn_self_update` 先 `sleep 60` 秒才进循环，所以「重启催检查」至少等一分钟；而且不升的时候**不打日志**（`Ok(None) => {}`），验证源通不通只能看有没有「自动更新检查失败」。这一轮四台统一到 sha256 `228b9b06…`，国内正式 / 国内 canary / 海外 `relay-updates` 分支 / GitHub `rust-v0.1.16` Release 四处都是同一份；四台的 `mirror.budget` 分别是 43MB（美国 960MB）、256MB（A 封顶）、100MB（B）、32MB（Alpine 取下限），正好把「按内存自适应」验了个遍。
+
+### A1-05. 实例迁移台账：宿主换中转地址后，旧地址上门的人被指到新地址
+
+- **典型说法**：「电脑换了中转，手机还拿着旧地址」「旧中转一直回『那台不在线』」「换服务器之后只有同网的手机还能用」「迁移记录存哪、多久清」。
+- **改哪里**：协议帧 `MIGRATE = 0x1C`（宿主→中转，JSON `{to, at}`，`to` 空串 = 撤销）：编号在 `server/relay-core/protocol-types.js` 的 `T` 表（事实源，Rust 的 `t::MIGRATE` 与插件副本 `dsh-mobile-plugin/lib/relay/protocol.js` 逐字节对齐，守卫 `protocol-parity.test.cjs` 与 relay-core 的 `type_table_matches_js` 各钉一头）；`server/relay-core/PROTOCOL.md` 的帧表也要加一行。中转侧实现在 `server/relay/rust/src/migrate.rs`（`instanceId → {to}` 内存表、30 天 TTL、`migrated_response()` 出 body 与头值），分发在 `proxy.rs` 的 `handle_tunnel_frame`，命中判据在 `tunnel.rs`（`Tunnel` 上挂 `instance_id`，只认这条隧道自己登记的身份）与 `http.rs` / `ws.rs` 的「实例不在线」分支。
+- **联动**：宿主在 `dsh-mobile-plugin/lib/relay/migrate.js` 里切换前发这一帧（顺序与撤销见 A3-58 的改法）；App 侧收到 503 + `code:"migrated"` 就采纳新地址一次（A2-65）。设备凭据摘要、镜像兜底、`X-Dsh-Instance` 分发三套机制都不受影响。
+- **刻意设计**：**命中排在镜像兜底之前**。反过来做的话，手机拿到一份 200 的旧清单就满足了，永远学不到新地址 —— 那不是「少一次提示」，是把这次要解决的问题原样保留。**记录只放内存**（不落盘）：重启丢失可接受，宿主下一次切换会重新登记，且丢失只会退回「那台不在线」这句老话，不会把人指错。**TTL 从记录落地的时刻算**，不认宿主自报的 `at`（宿主的钟不准不该决定这条记录何时失效），`at` 只进日志。**不做签名**：中转本来就在明文转发，要伪造什么都能伪造，验签需要客户端预置信任锚，换不来新的安全；App 采纳前会先对目标地址打一发 `/healthz`。
+- **坑**：**没有记录时那句 503 一个字节都不许改** —— 老 App 与「真的不在线」都靠它，加了字段会让「网络断了」被读成「电脑搬家了」。**只能由已注册的隧道登记**：键取隧道自己 `register` 上来的 `instanceId`，一条隧道结构上替不了别家；没自报家门的隧道什么都记不了。**同一台中转上，同实例重连会顶掉旧连接**（A4-02 的老账），所以试连/探活必须用临时实例 id（见 A3-58），拿正式 id 探一次就把正在服务的连接踢了。
+
+### A1-06. 隧道连接与 5xx 的体检（未注册超时 / 顶流日志 / nginx 那一层）
+
+- **典型说法**：「中转一天重连几千次正常吗」「sse superseded 把日志刷屏了」「手机上老是网络错误」「昨天的日志怎么样」「看看中转」。
+- **改哪里**：`server/relay/rust/src/ws.rs` 的 `UNREGISTERED_TIMEOUT_MS`（12 秒；宿主的注册超时是 8 秒）与 `unregistered_timeouts()`；`proxy.rs` 的 `log_sse_superseded`（与容量拒绝同一套一分钟聚合）；`http.rs` 的 `/status` 里 `tunnelUnregisteredTimeouts`。
+- **2026-10-27 美国那台的实测**：一天 12,864 次隧道连接，其中 **4,738 次（37%）连上后从未注册就断**，全是 `Connection reset without closing handshake`、寿命 0–15 秒；已注册的另有 2,660 次被 RST、1,836 次心跳超时。同一时刻 nginx 层 62.6 万请求、5.7 万个 5xx（502 有 14,742，是前天的 3.6 倍，一半出自单个出口 IP 的同一台机器），而 `relay.log` 只有 5.3 万行，从里面看不出 5xx。
+- **2026-10-29 美国那台的实测（nginx 连接上限打满）**：当时 518 个实例登记、370 多在线，机器本身完全正常（0.1.20、`hostConnected=true`、CPU 0.12、内存剩 586MB），但 `nginx/error.log` 满屏 `768 worker_connections are not enough while connecting to upstream`，一天 6 万多次 500、6 万多次 503，失败集中在 `monitor`（长轮询）、`sessions`、`session/messages`、`stream` —— 手机上就是「列表刷不出来、消息发不出去」。根因是发行版默认的 `worker_connections 768`：这台 1 核，`worker_processes auto` 只起一个 worker，而一台设备的隧道在 nginx 上占**两条**（客户端一条 + 到 127.0.0.1:18788 一条），五百多台就一千条出头，必然越线；设备数是前一天 172 → 当天 363 一路顶上来的，所以是从凌晨零星漏、到晚上每小时两万次。改成 `worker_connections 8192` + `worker_rlimit_nofile 16384` 再 `systemctl reload nginx`：500 归零，60 秒窗口的请求量从三五千掉到五百多（原先一大半是失败重试撑起来的），内存 374 → 381MB 没涨。
+- **坑**：**中转自己的日志里没有 HTTP 状态码** —— 它只记隧道事件，5xx 全在 nginx 的 `access.log`（一天 91MB）与 `error.log`（5.9MB，几乎全是 `upstream prematurely closed connection`）。查「手机为什么失败」先看 nginx，再拿时间点对 relay.log。**502 有两种来源**：隧道被新连接顶掉时 `fail_all_pending` 显式回 502；SSE 被自己新流顶掉时如果还没写响应头就是裸关，nginx 记成 upstream prematurely closed。**未注册连接多数不是扫描器**：那天 `/tunnel` 只有 3 个 curl，其余 101 全是真实宿主；别去 nginx 加白名单挡它，该做的是让中转自己收尾（12 秒）。**`tunnelUnregisteredTimeouts` 是累计值**：重启归零，看速率别看绝对值。**连接上限不够时 nginx 回的是 500，中转侧一点痕迹都没有**（2026-10-29）：`/status` 正常、隧道在线、`relay.log` 干净，看着像「中转挂了」，其实请求压根没到中转。判据只有两处 —— nginx `error.log` 里那句 `N worker_connections are not enough while connecting to upstream`，以及 `/proc/<worker>/limits` 的 open files。**只改 `worker_connections` 不抬 nofile 等于白改**：master 从 systemd 继承的是 1024，挂到 8192 会先撞这个；`worker_rlimit_nofile` 让 master 在 fork worker 之前按 hard limit（这台 524288）重设，所以 `reload` 就生效，不用 `restart`、隧道一条不断。**reload 之后旧 worker 会挂着上一批隧道继续在超限状态下服务**（`is shutting down`），500 有余威、要几分钟才退空，别看到还在报就以为没生效。
+- **守卫**：`npm run test:relay` 与 e2e 三套。新逻辑手工验一条就够 —— 连上 `/tunnel` 故意不发注册帧，12 秒后连接被关、日志出现 `tunnel registration timeout`、`/status` 的计数加一。
+<!-- END:TASK-PLAYBOOKS -->
+
+## B 段 · 文件清单（机械生成，勿手改）
+
+<!-- BEGIN:GENERATED-FILES -->
+> **A 段未覆盖**：24 / 32 个源文件没有任何条目的「改哪里」收它们。
+> 其中 0 个被「联动」点到过——`affected` 按名字找得到，但只会提示「顺带被点到」，
+> 没有条目「拥有」它们。完整清单见
+> [`docs/.dev-map-uncovered.txt`](.dev-map-uncovered.txt)——那是一份「地图待补清单」，
+> 不是缺陷清单；把条目补进 A 段后跑 `npm run map`，它会自己变短。
+
+### Rust 中转与隧道协议（全部源码）
+
+共 32 个文件。
+
+| 文件 | 用途 |
+| --- | --- |
+| `server/relay-core/protocol-types.js` | DSH 隧道协议 v2 —— 帧类型表与线格式常量（唯一事实源）。 |
+| `server/relay-core/rust/src/lib.rs` | DSH 隧道协议 v2 —— Rust 实现。 |
+| `server/relay-core/rust/tests/parity.rs` | 跨语言逐字节对撞：Rust 实现与 JS 权威实现必须对同一输入编出**完全相同**的字节。 |
+| `server/relay-core/test/protocol.js` | dsh-mobile-server 隧道协议 v2 编解码。 |
+| `server/relay/rust/console/index.html` | (无文件头注释) |
+| `server/relay/rust/console/src/App.tsx` | 中转控制台。 |
+| `server/relay/rust/console/src/components/blocks.tsx` | 一枚小圆点，颜色说明这一行此刻好不好。 |
+| `server/relay/rust/console/src/index.css` | (无文件头注释) |
+| `server/relay/rust/console/src/lib/api.ts` | 控制台的接口层。 |
+| `server/relay/rust/console/src/lib/format.ts` | 一点点展示用的纯函数，和接口无关。 |
+| `server/relay/rust/console/src/main.tsx` | (无文件头注释) |
+| `server/relay/rust/console/vite.config.ts` | 中转控制台的构建配置。 |
+| `server/relay/rust/src/apns.rs` | APNs 推送转发：任务完成时把通知递到苹果，由苹果送到离线 / 后台的 iPhone。 |
+| `server/relay/rust/src/config.rs` | 环境变量配置（限额的唯一真源）。 |
+| `server/relay/rust/src/console/config.rs` | 控制台的配置：从环境变量读，前缀 `PLATFORM_`。 |
+| `server/relay/rust/src/console/mod.rs` | 中转控制台：管理面、准入、账号与激活码。 |
+| `server/relay/rust/src/console/node.rs` | 主控端 / 被控端。 |
+| `server/relay/rust/src/console/oidc.rs` | 微信登录（OIDC）：接一套标准 OIDC 聚合登录系统（基址由 `PLATFORM_OIDC_ISSUER` 给）。 |
+| `server/relay/rust/src/console/ota.rs` | 插件 OTA 的**临时通道**。 |
+| `server/relay/rust/src/console/ratelimit.rs` | 公开接口的限流。 |
+| `server/relay/rust/src/headers.rs` | 请求头 / 响应头的转发规则。 |
+| `server/relay/rust/src/http.rs` | 一个 TCP 连接上的 HTTP/1. |
+| `server/relay/rust/src/lib.rs` | DSH 自建版中转（Rust）。 |
+| `server/relay/rust/src/main.rs` | 自建版中转的入口：读配置、起 HTTP 服务、等隧道连上来。 |
+| `server/relay/rust/src/migrate.rs` | 实例迁移台账：宿主换中转之前，在旧中转上留一条「我搬到 X 了」。 |
+| `server/relay/rust/src/mirror.rs` | 宿主离线时的最后一份镜像。 |
+| `server/relay/rust/src/plugin_versions.rs` | 宿主上报的插件版本，以及「最低可接受版本」这道门槛。 |
+| `server/relay/rust/src/proxy.rs` | HTTP 转发与隧道帧分发。 |
+| `server/relay/rust/src/selfupdate.rs` | 中转自身的自动更新。 |
+| `server/relay/rust/src/store.rs` | 控制台的数据层：SQLite 建表与查询。 |
+| `server/relay/rust/src/tunnel.rs` | 隧道状态与帧发送（单条隧道）。 |
+| `server/relay/rust/src/ws.rs` | 隧道接入与手机 WebSocket 桥接。 |
+<!-- END:GENERATED-FILES -->
+
+## C 段 · 守卫与测试索引（机械生成，勿手改）
+
+<!-- BEGIN:GENERATED-GUARDS -->
+### 测试、夹具与部署脚本
+
+共 9 个文件。
+
+| 文件 | 用途 |
+| --- | --- |
+| `server/relay/rust/deploy/backup-console-db.sh` | !/bin/sh 中转控制台数据库的每日备份。 |
+| `server/relay/rust/deploy/build-static.sh` | !/bin/sh 编一个真正静态链接的 dsh-relay（musl），供 Alpine 之类没有 glibc 的机器直接跑。 |
+| `server/relay/rust/deploy/install-binary.sh` | !/bin/sh 装一台中转，**不编译**：从更新源取编译好的静态包，校验和过了才装。 |
+| `server/relay/rust/deploy/install.sh` | !/usr/bin/env bash 一键安装并启动 dsh-relay —— **源码编译路线**。 |
+| `server/relay/rust/deploy/publish-relay-update.sh` | !/bin/sh 发布一个中转版本：把二进制放进更新源目录，然后写 latest. |
+| `server/relay/rust/scripts/e2e-mirror.cjs` | 端到端验收：宿主离线时的镜像兜底（`MIRROR_CACHE`）。 |
+| `server/relay/rust/scripts/e2e-stream.cjs` | 端到端验证（第二组）：SSE 流式、手机 WebSocket 桥接、隧道被取代时的清理。 |
+| `server/relay/rust/scripts/e2e.cjs` | 端到端验证：起 Rust 中转 → 连一个参考宿主隧道 → 用 HTTP 请求穿过它。 |
+| `server/relay/rust/test/fake-desktop.js` | 参考隧道实现（协议 v2）：把「中转服务器」与「本地 HTTP/WS 服务」对接起来。 |
+<!-- END:GENERATED-GUARDS -->

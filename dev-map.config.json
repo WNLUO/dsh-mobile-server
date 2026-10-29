@@ -1,0 +1,31 @@
+{
+  "mapFile": "docs/dev-map.md",
+  "partsDir": "docs/.dev-map-parts",
+  "uncoveredFile": "docs/.dev-map-uncovered.txt",
+  "decisionsFile": "docs/decisions.md",
+  "guardRun": "npm test",
+  "sourceSections": [
+    {
+      "title": "Rust 中转与隧道协议（全部源码）",
+      "domain": "A1",
+      "roots": [
+        "server/relay/rust/src",
+        "server/relay-core",
+        "server/relay/rust/console"
+      ],
+      "exts": [".rs", ".js", ".cjs", ".mjs", ".ts", ".tsx", ".css", ".html"]
+    }
+  ],
+  "guardSections": [
+    {
+      "title": "测试、夹具与部署脚本",
+      "domain": "A2",
+      "roots": [
+        "server/relay/rust/test",
+        "server/relay/rust/scripts",
+        "server/relay/rust/deploy"
+      ],
+      "exts": [".js", ".cjs", ".mjs", ".sh", ".conf", ".yml", ".yaml", ".rs"]
+    }
+  ]
+}
