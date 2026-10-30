@@ -168,13 +168,25 @@ async function main() {
       probe.body,
     );
 
+    // 「不存在路径」的答案：后面每一条检查都跟它逐字节比。
+    const missing = await rawRequest('GET', '/api/relay/config', null, {});
+    check('宿主控制面在中转上一律 404', missing.status === 404, `status=${missing.status}`);
+
     const status = await request('GET', '/status');
     check('没有隧道时 /status 说 hostConnected=false', JSON.parse(status.body).hostConnected === false, status.body);
 
+    // 生产上中转在本机 nginx 后面，peer 永远是 127.0.0.1——判来源必须再往 x-real-ip
+    // 看一层，否则公网打进来也会被当成「本机运维」。0.1.22 实发到 B 上就是这么漏的。
+    const statusViaProxy = await rawRequest('GET', '/status', null, { 'x-real-ip': '203.0.113.9' });
+    check('经 nginx 转发的公网请求拿不到 /status（404，与不存在路径相同）',
+      statusViaProxy.status === 404 && statusViaProxy.body === missing.body,
+      `status=${statusViaProxy.status} body=${statusViaProxy.body}`);
+    const statusLocalProxy = await rawRequest('GET', '/status', null, { 'x-real-ip': '127.0.0.1' });
+    check('本机反代（x-real-ip 为回环）照常答 /status',
+      statusLocalProxy.status === 200, `status=${statusLocalProxy.status}`);
+
     // 不带实例头的请求：只有配对那条路径还走老规矩，其余路径一律是「和不存在一字不差」
     // 的那个 404。扫描器打根目录、打目录字典、瞎带参数，全都落到这一句上。
-    const missing = await rawRequest('GET', '/api/relay/config', null, {});
-    check('宿主控制面在中转上一律 404', missing.status === 404, `status=${missing.status}`);
     for (const path of ['/', '/index.html', '/admin', '/api/mobile/v1/status?x=1', '/.env']) {
       const anonymous = await rawRequest('GET', path, null, {});
       check(

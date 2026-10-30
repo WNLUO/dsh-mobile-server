@@ -169,12 +169,36 @@ fn is_pairing_route(pathname: &str) -> bool {
     strip_deploy_prefix(pathname) == PAIRING_PATH
 }
 
-/// `/status` 能不能答给这个来源：只认本机（含 `::1`）。
+/// `/status` 能不能答给这次请求：只认本机来的。
 ///
-/// 运维就在机器上 curl，nginx 也是本机反代，所以这一条不影响任何一种真实用法；公网上
-/// 的扫描器和「顺手试试这个域名」的人一律拿到和不存在路径一样的 404。
-fn status_peer_allowed(peer: Option<std::net::SocketAddr>) -> bool {
-    peer.map(|addr| addr.ip().is_loopback()).unwrap_or(false)
+/// **不能只看 peer 地址**：生产上四台中转都只监听 `127.0.0.1:18788`，前面是同机的
+/// nginx，于是每一个公网请求在中转眼里都是「127.0.0.1 来的」——只看 peer 等于这道闸
+/// 完全不存在（2026-10-31 在 B 上实测到的就是 200）。所以判据分两层：
+///   1. peer 必须是回环（直连的、或者绑了 0.0.0.0 被人直接打进来的，一律 404）；
+///   2. 是回环的话，再看 nginx 覆盖写入的 `x-real-ip`（退化时看 `x-forwarded-for` 第一段），
+///      只有它也是回环或者根本没带（机器上直接 curl）才放行。
+/// 头部只在 peer 已经确认是回环之后才采信：这样即使有人把端口绑到 0.0.0.0，伪造
+/// `x-real-ip: 127.0.0.1` 也没用（那一层的 peer 判据先把他拦掉了）。
+fn status_allowed(peer: Option<std::net::SocketAddr>, head: &RequestHead) -> bool {
+    let Some(peer) = peer else {
+        return false;
+    };
+    if !peer.ip().is_loopback() {
+        return false;
+    }
+    if let Some(raw) = head.header("x-real-ip") {
+        if let Ok(ip) = raw.trim().parse::<std::net::IpAddr>() {
+            return ip.is_loopback();
+        }
+    }
+    if let Some(raw) = head.header("x-forwarded-for") {
+        if let Some(first) = raw.split(',').next() {
+            if let Ok(ip) = first.trim().parse::<std::net::IpAddr>() {
+                return ip.is_loopback();
+            }
+        }
+    }
+    true
 }
 
 /// 送给宿主的路径：剥掉部署前缀，保留查询串。
@@ -480,7 +504,7 @@ pub async fn handle_owned_path(
             // 只答本机来源。这一条对外说的是「这台上有多少实例、多少台插件过旧、镜像占了
             // 多少预算」——全是运维自己要看的数，没有一个客户端消费它。放在公网上就是
             // 给扫描器一份现成的侦察报告，而运维本来就在机器上 curl。
-            if !status_peer_allowed(peer) {
+            if !status_allowed(peer, head) {
                 respond_text(reader, 404, NOT_FOUND).await?;
                 return Ok(true);
             }
@@ -1232,15 +1256,34 @@ mod tests {
     }
 
     /// `/status` 只认本机来源：公网那边拿到的是 404，和不存在路径一样。
+    ///
+    /// 生产的中转都在本机 nginx 后面，所以 peer 永远是回环——判据必须再往下看一层
+    /// `x-real-ip`，否则这道闸等于不存在（0.1.22 实发到 B 上就是这么漏的）。
     #[test]
     fn status_only_answers_loopback() {
         use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
         let local = Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 5000)));
         let local6 = Some(SocketAddr::new(Ipv6Addr::LOCALHOST.into(), 5000));
         let remote = Some(SocketAddr::from(([8, 8, 8, 8], 5000)));
-        assert!(status_peer_allowed(local));
-        assert!(status_peer_allowed(local6));
-        assert!(!status_peer_allowed(remote));
-        assert!(!status_peer_allowed(None));
+        let with = |name: &str, value: &str| {
+            let mut request = head("/status");
+            request.headers.push((name.into(), value.into()));
+            request
+        };
+        // 机器上直接 curl：回环 peer、没有反代头。
+        assert!(status_allowed(local, &head("/status")));
+        assert!(status_allowed(local6, &head("/status")));
+        // 直连进来的公网来源：无论带什么头都不行。
+        assert!(!status_allowed(remote, &head("/status")));
+        assert!(!status_allowed(remote, &with("x-real-ip", "127.0.0.1")));
+        assert!(!status_allowed(None, &head("/status")));
+        // 本机 nginx 转发：peer 是回环，真来源在 x-real-ip / x-forwarded-for 里。
+        assert!(!status_allowed(local, &with("x-real-ip", "203.0.113.9")));
+        assert!(status_allowed(local, &with("x-real-ip", "127.0.0.1")));
+        assert!(!status_allowed(
+            local,
+            &with("x-forwarded-for", "203.0.113.9, 10.0.0.1")
+        ));
+        assert!(status_allowed(local, &with("x-forwarded-for", "::1")));
     }
 }

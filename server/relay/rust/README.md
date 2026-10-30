@@ -19,7 +19,7 @@
   都不建立）。
 
 自己认领的路径只有 `/healthz`、`/api/mobile/v1/health`（地址体检）与 `/status`
-（在线状态，**只答本机来源**）；控制台打开时再加 `/api/platform/v1/**`、`/platform/**`，
+（在线状态，**只答本机来源**：自己 `curl 127.0.0.1:18788/status` 可以，经 nginx 转发的公网请求按 `x-real-ip` 判来源，拿到的是 404）；控制台打开时再加 `/api/platform/v1/**`、`/platform/**`，
 以及给宿主救急用的 `/api/desktop-plugins/ota/*`。其余全部转发。
 
 **认领之外的请求一律回同一个 404**（`not found`）：路径不存在、路径存在但不给外人看，
