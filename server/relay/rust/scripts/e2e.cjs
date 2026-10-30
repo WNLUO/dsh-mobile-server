@@ -82,7 +82,8 @@ function requestWithInstance(instanceId, method, urlPath) {
 async function waitForOnlyInstance(instanceId) {
   const deadline = Date.now() + 10_000;
   for (;;) {
-    const res = await rawRequest('GET', '/anything', null, {});
+    // 探的是配对那条路径：不带实例头还能被送到「唯一那台」的只剩它了。
+    const res = await rawRequest('GET', '/api/mobile/v1/pair', null, {});
     if (res.status === 200) return;
     if (Date.now() > deadline) {
       throw new Error(`等中转只剩 ${instanceId} 一条超时，最后一次 status=${res.status} body=${res.body}`);
@@ -161,9 +162,29 @@ async function main() {
     const probe = await request('GET', '/api/mobile/v1/health');
     const probeBody = JSON.parse(probe.body);
     check('地址体检自报 service', probe.status === 200 && probeBody.service === 'dsh-mobile-relay', probe.body);
+    check(
+      '地址体检不报版本号（扫描器不该知道该打哪一版）',
+      probe.status === 200 && !('version' in probeBody),
+      probe.body,
+    );
 
     const status = await request('GET', '/status');
     check('没有隧道时 /status 说 hostConnected=false', JSON.parse(status.body).hostConnected === false, status.body);
+
+    // 不带实例头的请求：只有配对那条路径还走老规矩，其余路径一律是「和不存在一字不差」
+    // 的那个 404。扫描器打根目录、打目录字典、瞎带参数，全都落到这一句上。
+    const missing = await rawRequest('GET', '/api/relay/config', null, {});
+    check('宿主控制面在中转上一律 404', missing.status === 404, `status=${missing.status}`);
+    for (const path of ['/', '/index.html', '/admin', '/api/mobile/v1/status?x=1', '/.env']) {
+      const anonymous = await rawRequest('GET', path, null, {});
+      check(
+        `不带实例头打 ${path}：同一个 404，且与不存在路径一致`,
+        anonymous.status === missing.status
+          && anonymous.body === missing.body
+          && anonymous.headers['content-type'] === missing.headers['content-type'],
+        `status=${anonymous.status} body=${anonymous.body} ct=${anonymous.headers['content-type']}`,
+      );
+    }
 
     const noTunnel = await request('GET', '/some/thing');
     check('没有隧道时其它路径回 503', noTunnel.status === 503, `status=${noTunnel.status}`);
@@ -302,10 +323,16 @@ async function main() {
     check('没连上的实例回 503，不会串到别人的宿主',
       stranger.status === 503, `status=${stranger.status} body=${stranger.body}`);
 
-    // 不带实例头的请求：这里有三台在线，**绝不能猜**给谁。
-    const anonymous = await rawRequest('GET', '/anything', null, {});
-    check('三台在线时不带 X-Dsh-Instance 的请求被拒，不猜给谁',
+    // 不带实例头的配对请求：这里有三台在线，**绝不能猜**给谁。
+    const anonymous = await rawRequest('POST', '/api/mobile/v1/pair', '{"code":"123456"}', {});
+    check('三台在线时不带 X-Dsh-Instance 的配对请求被拒，不猜给谁',
       anonymous.status === 503, `status=${anonymous.status}`);
+
+    // 同一时刻，不带实例头打别的路径连「有几台在线」都不该看出来。
+    const anonymousOther = await rawRequest('GET', '/anything', null, {});
+    check('三台在线时，不带实例头打别的路径仍是那个 404',
+      anonymousOther.status === 404 && anonymousOther.body === missing.body,
+      `status=${anonymousOther.status} body=${anonymousOther.body}`);
 
     // 同一个实例重连：只顶掉自己那条，另外两条照常。
     const reconnect = new RelayTunnel({
@@ -339,8 +366,8 @@ async function main() {
     for (const t of others) t.close();
     reconnect.close();
     tunnel.close();
-    // 手动输配对码的场景：手机手上没有实例 id。全中转只剩一台在线时它没有歧义，
-    // 必须放行——否则「不扫码就绑不上」，而扫码需要另一台设备或相机，走不通。
+    // 配对那条路径的老规矩：手机手上没有实例 id（没有实例号的老二维码 / 老版本 App 的
+    // 手输码）。全中转只剩一台在线时它没有歧义，必须放行。
     const solo = new RelayTunnel({
       relayUrl: `ws://127.0.0.1:${RELAY_PORT}`,
       instanceId: INSTANCE,
@@ -349,10 +376,15 @@ async function main() {
     });
     await solo.connect();
     await waitForOnlyInstance(INSTANCE);
-    const manualOk = await rawRequest('GET', '/anything', null, {});
-    check('只剩一台在线时，不带 X-Dsh-Instance 的请求照常送达（手动输配对码）',
-      manualOk.status === 200 && manualOk.body === 'hello from upstream',
-      `status=${manualOk.status} body=${manualOk.body}`);
+    const manualOk = await rawRequest('POST', '/api/mobile/v1/pair', '{"code":"123456"}', {});
+    check('只剩一台在线时，不带实例头的配对请求照常送达',
+      manualOk.status === 200, `status=${manualOk.status} body=${manualOk.body}`);
+
+    // 但别的路径不能因为「只剩一台」就跟着变成转发口：扫描器打的就是这些路径。
+    const soloOther = await rawRequest('GET', '/', null, {});
+    check('只剩一台在线时，不带实例头打根目录仍然是 404 而不是被转发',
+      soloOther.status === 404 && soloOther.body === missing.body,
+      `status=${soloOther.status} body=${soloOther.body}`);
 
     // 再来一台之后立刻恢复成「不猜」，否则公用场景下就会串台。
     const second = new RelayTunnel({
@@ -362,8 +394,8 @@ async function main() {
       onLog: () => {},
     });
     await second.connect();
-    const manualNowAmbiguous = await rawRequest('GET', '/anything', null, {});
-    check('第二台一上线，不带实例头的请求立刻又被拒',
+    const manualNowAmbiguous = await rawRequest('POST', '/api/mobile/v1/pair', '{"code":"123456"}', {});
+    check('第二台一上线，不带实例头的配对请求立刻又被拒',
       manualNowAmbiguous.status === 503, `status=${manualNowAmbiguous.status}`);
 
     second.close();

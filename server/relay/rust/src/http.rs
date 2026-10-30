@@ -94,8 +94,22 @@ const OWNED_PATHS: &[&str] = &[
     "/tunnel",
 ];
 
+/// 地址体检的回答。只有服务名，没有版本（理由见 `handle_owned_path` 那一条）。
+const HEALTH_BODY: &str = r#"{"ok":true,"service":"dsh-mobile-relay"}"#;
+
+/// 一条请求没被中转认领、也没资格转发时，唯一会得到的回答。
+///
+/// 控制面路径、不认得的路径、公网上来的 `/status`，**都是这一句**：状态码 404、
+/// 纯文本、一字不差。扫描器因此分不出「这条路径存在但不是给外人的」和「这条路径根本
+/// 不存在」，也搜不到任何能拿去指认产品的句子。凡是给这个字段加注释、加个 h1 标题之
+/// 类的主意，都等于把刚堵上的一半重新打开。
+const NOT_FOUND: &str = "not found";
+
 /// 手机 API 的固定前缀。与 `server/relay-core/protocol-types.js` 的 `MOBILE_PREFIX` 一致。
 const MOBILE_PREFIX: &str = "/api/mobile/v1/";
+
+/// 手机配对那条路径。它是唯一允许「不带实例头」进来的请求（见 `serve_connection`）。
+const PAIRING_PATH: &str = "/api/mobile/v1/pair";
 
 /// 宿主控制面的前缀。这个前缀下全是「管这台宿主」的接口：配对二维码、中转地址、
 /// 注册密钥、设备列表与吊销、插件更新。手机一条都不用（它只走 `/api/mobile/v1/**`）。
@@ -143,6 +157,24 @@ fn strip_deploy_prefix(pathname: &str) -> &str {
         Some(owned) => owned,
         None => pathname,
     }
+}
+
+/// 这条路径是不是手机配对（`/api/mobile/v1/pair`，带部署前缀也认）。
+///
+/// 它是「不带实例头」唯一还走老路的一条。扫码配对的请求带着实例头（二维码里有），
+/// 走到这里的是**没有实例号的老二维码**和老版本 App 的手输码：这两种手上都没有实例号，
+/// 中转没法替它挑宿主，只能按「这会儿只有一台在线」的老规矩送一次。这条尾巴等老版本
+/// 淘汰后单独下掉，在那之前它只多一条路径，不多说一句话。
+fn is_pairing_route(pathname: &str) -> bool {
+    strip_deploy_prefix(pathname) == PAIRING_PATH
+}
+
+/// `/status` 能不能答给这个来源：只认本机（含 `::1`）。
+///
+/// 运维就在机器上 curl，nginx 也是本机反代，所以这一条不影响任何一种真实用法；公网上
+/// 的扫描器和「顺手试试这个域名」的人一律拿到和不存在路径一样的 404。
+fn status_peer_allowed(peer: Option<std::net::SocketAddr>) -> bool {
+    peer.map(|addr| addr.ip().is_loopback()).unwrap_or(false)
 }
 
 /// 送给宿主的路径：剥掉部署前缀，保留查询串。
@@ -437,15 +469,21 @@ pub async fn handle_owned_path(
                 return Ok(true);
             }
             // 地址体检：手机在配对/接入**之前**问「这个地址上是谁」，因此刻意不鉴权。
-            // 回答只有服务名与版本。
-            let body = format!(
-                r#"{{"ok":true,"service":"dsh-mobile-relay","version":"{}"}}"#,
-                env!("CARGO_PKG_VERSION")
-            );
-            respond_json(reader, 200, &body).await?;
+            //
+            // 回答只有服务名，**不带版本号**。App 只用 `service` 分辨「填的是中转还是宿主」，
+            // 从上线到现在没有任何客户端读过版本；而在公网上把精确版本报给每一个路过的
+            // 扫描器，等于替对方挑好该打哪一版。版本要看就去 `/status`（只答本机）。
+            respond_json(reader, 200, HEALTH_BODY).await?;
             Ok(true)
         }
         "/status" => {
+            // 只答本机来源。这一条对外说的是「这台上有多少实例、多少台插件过旧、镜像占了
+            // 多少预算」——全是运维自己要看的数，没有一个客户端消费它。放在公网上就是
+            // 给扫描器一份现成的侦察报告，而运维本来就在机器上 curl。
+            if !status_peer_allowed(peer) {
+                respond_text(reader, 404, NOT_FOUND).await?;
+                return Ok(true);
+            }
             // 在线状态只回答「隧道通没通」。那些数字全是计数，没有实例 id、没有设备、
             // 也没有任何一份清单的内容：账本有多大、预算多少、有多少条隧道连上却没自报家门。
             // 后两个数就是「镜像是不是又快满了」和「有多少连接在空转」的体检指标。
@@ -643,7 +681,7 @@ pub async fn serve_connection(stream: TcpStream, slot: Arc<TunnelSlot>) -> std::
     // `/api/relay/healthz` 以中转自己的路径结尾，会被 `strip_deploy_prefix` 的末尾
     // 判定抢答成 200，那就不是 404 了。
     if is_control_plane_path(&head.normalized_pathname()) {
-        respond_text(&mut reader, 404, "not found").await?;
+        respond_text(&mut reader, 404, NOT_FOUND).await?;
         return Ok(());
     }
 
@@ -724,9 +762,18 @@ pub async fn serve_connection(stream: TcpStream, slot: Arc<TunnelSlot>) -> std::
     // 请求送进 B 家的电脑，那是最坏的串台。宁可报「那台不在线」，让手机自己判断
     // 是切换地址还是重连。
     //
-    // 没带实例 id 的唯一例外是手动输配对码（见下）：中转上只有一台宿主时才无歧义。
+    // 没带实例 id 的，**只有配对那一条路径**还按老规矩走（见下面的 `is_pairing_route`）。
+    // 其余路径一律 `NOT_FOUND`：以前这里是「谁来了都当手输码」，于是扫描器打根路径就会
+    // 收到一句「这台中转上有不止一台宿主，请扫码」——那是产品专属的一句话，能被
+    // Shodan / Censys 按响应体整片搜出来，扫到之后再顺着 `/status` 和别处那些回话
+    // 数出一大堆部署细节。现在这种请求在任何状态下都只拿到和「路径不存在」一样的 404，
+    // 连「这里到底有没有宿主」都不再是一个可探测的比特。
     let instance = instance_id.as_str();
     let tunnel = if instance.trim().is_empty() {
+        if !is_pairing_route(&head.normalized_pathname()) {
+            respond_text(&mut reader, 404, NOT_FOUND).await?;
+            return Ok(());
+        }
         match slot.sole() {
             Some(tunnel) => tunnel,
             None => {
@@ -1109,5 +1156,91 @@ mod tests {
             "{response}"
         );
         assert!(!response.contains("x-dsh-relay-mirror"), "{response}");
+    }
+
+    /// 不带实例头时，**只有配对那条路径**还走老规矩。
+    #[test]
+    fn pairing_is_the_only_headerless_path() {
+        for path in ["/api/mobile/v1/pair", "/relay/api/mobile/v1/pair"] {
+            assert!(is_pairing_route(path), "{path} 应当放行");
+        }
+        for path in [
+            "/",
+            "/index.html",
+            "/anything",
+            "/api/mobile/v1/pairx",
+            "/api/mobile/v1/status",
+            "/android.txt",
+        ] {
+            assert!(!is_pairing_route(path), "{path} 不该被当成配对");
+        }
+    }
+
+    /// 扫根目录、扫别的目录、瞎带参数、零台在线——拿到的都是同一个 404，
+    /// 而且和「宿主控制面」那一条逐字节相同。
+    #[tokio::test]
+    async fn headerless_requests_get_the_same_404_as_a_missing_route() {
+        let control = respond_to("GET /api/relay/config HTTP/1.1\r\nhost: relay\r\n\r\n").await;
+        assert!(control.starts_with("HTTP/1.1 404 "), "{control}");
+        let control_body = control.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+        assert_eq!(control_body, NOT_FOUND);
+
+        for path in [
+            "/",
+            "/index.html",
+            "/admin",
+            "/api/mobile/v1/status",
+            "/api/mobile/v1/sessions?deviceId=%27--",
+            "/.env",
+        ] {
+            let response = respond_to(&format!("GET {path} HTTP/1.1\r\nhost: relay\r\n\r\n")).await;
+            assert!(
+                response.starts_with("HTTP/1.1 404 "),
+                "{path} 必须 404，实际是 {response}"
+            );
+            assert!(
+                response.contains("content-type: text/plain; charset=utf-8"),
+                "{path} 的 contentType 要和不存在路径一致：{response}"
+            );
+            assert_eq!(
+                response.split("\r\n\r\n").nth(1).unwrap_or(""),
+                control_body,
+                "{path} 的正文要和不存在路径逐字节相同"
+            );
+        }
+    }
+
+    /// 配对那条仍然要回答：没有实例头、又零台在线时说清缺什么。
+    #[tokio::test]
+    async fn pairing_path_keeps_its_answer() {
+        let response =
+            respond_to("POST /api/mobile/v1/pair HTTP/1.1\r\nhost: relay\r\n\r\n").await;
+        assert!(response.starts_with("HTTP/1.1 503 "), "{response}");
+        assert!(
+            response.contains("missing x-dsh-instance header"),
+            "{response}"
+        );
+    }
+
+    /// 地址体检只报服务名，不报版本（版本号以前是给扫描器挑版本用的）。
+    #[tokio::test]
+    async fn health_does_not_report_a_version() {
+        let response = respond_to("GET /api/mobile/v1/health HTTP/1.1\r\nhost: relay\r\n\r\n").await;
+        assert!(response.starts_with("HTTP/1.1 200 "), "{response}");
+        assert!(response.contains("dsh-mobile-relay"), "{response}");
+        assert!(!response.contains("version"), "{response}");
+    }
+
+    /// `/status` 只认本机来源：公网那边拿到的是 404，和不存在路径一样。
+    #[test]
+    fn status_only_answers_loopback() {
+        use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+        let local = Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 5000)));
+        let local6 = Some(SocketAddr::new(Ipv6Addr::LOCALHOST.into(), 5000));
+        let remote = Some(SocketAddr::from(([8, 8, 8, 8], 5000)));
+        assert!(status_peer_allowed(local));
+        assert!(status_peer_allowed(local6));
+        assert!(!status_peer_allowed(remote));
+        assert!(!status_peer_allowed(None));
     }
 }

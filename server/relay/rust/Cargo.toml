@@ -1,6 +1,6 @@
 [package]
 name = "dsh-relay"
-version = "0.1.21"
+version = "0.1.22"
 edition = "2021"
 description = "DSH 自建版中转：出站隧道 + HTTP/WS 纯转发（Rust 实现）"
 
