@@ -1,0 +1,11 @@
+# 每小时跑一次中转的日志轮转（只跑 `logrotate.d-dsh-relay` 这一份配置）。
+#
+# 为什么需要它：系统的 `logrotate.timer` 一天只跑一次，而 `size` 阈值只在跑的那一刻
+# 被评估一次。回源访问日志一天涨 90MB，等到第二天才切，切下来的就是整份 90MB 文件，
+# `rotate 6` 于是攒到半G；接上这个定时器，阈值才真的按大小生效（20M 一份、六份，
+# 上限 120M）。
+#
+# 装法（Debian/Ubuntu）：放到 `/etc/cron.d/dsh-relay-logrotate`，权限 644。
+# 与系统那份共用同一个状态文件，两边不会重复切同一次；日志轮转本身没在跑时退出码为 0。
+SHELL=/bin/sh
+17 * * * * root /usr/sbin/logrotate -s /var/lib/logrotate/status /etc/logrotate.d/dsh-relay >/dev/null 2>&1

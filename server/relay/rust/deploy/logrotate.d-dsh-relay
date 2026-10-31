@@ -8,15 +8,34 @@
 # 只能「拷一份再把原件清空」。副作用是切的那一瞬间可能丢几行日志，对运维日志可以接受。
 #
 # ⚠️ 路径按机器不同，拷过去装之前先改这一行：A（十堰）是 `/opt/dsh-mobile/logs/relay.log`，
-# B（京东云）与 D（美国）都是 `/opt/dsh-relay/logs/relay.log`。路径写错的失败是静默的——
-# `logrotate -d` 不报错，只是什么都不切，日志继续涨（2026-10-27 之前 B/D 就是这样，
-# 各自攒到 85MB 与 537MB 的单文件）。Alpine 节点不用这份，它走 `deploy/openrc/` 那套。
+# B（京东云）、D（美国）与日本节点都是 `/opt/dsh-relay/logs/relay.log`。路径写错的失败是
+# 静默的——`logrotate -d` 不报错，只是什么都不切，日志继续涨（2026-10-27 之前 B/D 就是
+# 这样，各自攒到 85MB 与 537MB 的单文件）。Alpine 节点不用这份，它走 `deploy/openrc/` 那套。
 /opt/dsh-mobile/logs/relay.log {
     # 按大小切。**不用 `daily` + `size` 混写**：logrotate 会告警
     # 'size' overrides 'daily'，两个一起写实际上只剩 size 生效，看起来像配了两道锁、
     # 其实只有一道。50M 一份、留 7 份，上限 350M，对一个转发日志绰绰有余。
     size 50M
     rotate 7
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    su root root
+}
+
+# CDN 回源节点的 nginx 访问日志（`access_log /opt/dsh-relay/logs/nginx-cdn.log`）。
+#
+# 只有拿 CDN 回源的那几台有这个文件（日本节点写的是 `ai-hub-de-1.wnluo.com` 的回源日志），
+# 其余机器的 nginx 日志在 `/var/log/nginx/` 走 apt 自带那份配置。**它和中转日志在同一个
+# 目录里，装轮转时最容易漏掉**：2026-10-31 日本节点上手时就是只想着 relay.log。
+#
+# 阈值比 relay.log 小一档是照实测增长率定的：回源日志一天 90MB（其中一半是手机侧的
+# `/api/mobile/v1/health`），relay.log 一天 17MB。20M × 6 ≈ 一天多的排查窗口。
+/opt/dsh-relay/logs/nginx-*.log {
+    size 20M
+    rotate 6
     missingok
     notifempty
     compress

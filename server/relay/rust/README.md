@@ -276,8 +276,13 @@ npm run test:e2e
 
 - **`logrotate.d-dsh-relay`** → `/etc/logrotate.d/dsh-relay`。日志由 systemd 的
   `StandardOutput=append:` 直接写，进程一直握着同一个 fd，所以用 `copytruncate`：
-  拷一份再把原件清空。按 50M 切、留 7 份。不切的话磁盘写满时第一个坏掉的是同一个
-  分区上的 SQLite。
+  拷一份再把原件清空。relay.log 按 50M 切、留 7 份；拿 CDN 回源的那几台同目录下还有
+  `nginx-cdn.log`（一天 90MB），另按 20M 切、留 6 份。不切的话磁盘写满时第一个坏掉的
+  是同一个分区上的 SQLite。
+- **`cron.d-dsh-relay-logrotate`** → `/etc/cron.d/dsh-relay-logrotate`。系统的
+  `logrotate.timer` 一天只跑一次，`size` 阈值也就一天只判一次——回源日志一天 90MB，
+  等第二天才切就是整份 90MB 一起转。这条每小时跑一次上面那份配置，阈值才按大小生效；
+  两份共用同一个状态文件，不会重复切。
 - **`backup-console-db.sh`** → 每天凌晨 3 点跑一次（`/etc/cron.d/dsh-relay-backup`）。
   用 `sqlite3 .backup` 而不是裸拷文件——WAL 模式下直接拷 `.db` 会漏掉没 checkpoint
   的页。备份完**当场验一遍**（能打开、关键表在、行数非空），验不过就删掉并报错，
