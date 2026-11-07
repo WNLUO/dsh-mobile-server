@@ -1,7 +1,7 @@
 <h3 align="center">DSH Mobile Server</h3>
 
 <p align="center">
-  <img src="assets/banner.jpg" alt="AI-HUB：手机和平板上的 DSH 会话界面" width="760">
+  <img src="assets/banner.jpg" alt="AI-HUB：手机和平板上的 DeepSeek Harness 会话界面" width="760">
 </p>
 
 <p align="center">
@@ -16,7 +16,7 @@
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/WNLUO/dsh-mobile-server/main/assets/connection-dark.svg">
-    <img src="https://raw.githubusercontent.com/WNLUO/dsh-mobile-server/main/assets/connection-light.svg" alt="手机 App 经中转或局域网连到你电脑上的 DSH" width="720">
+    <img src="https://raw.githubusercontent.com/WNLUO/dsh-mobile-server/main/assets/connection-light.svg" alt="手机 App 经中转或局域网连到你电脑上的 DeepSeek Harness" width="720">
   </picture>
 </p>
 
@@ -94,7 +94,7 @@ npm run test:e2e
 
 ## 为什么做这个
 
-DSH 跑在家里的电脑上，人出门在外，手机要连回来。麻烦在两头都够不着对方：绝大多数家庭宽带没有公网地址，路由上开端口既不现实也不安全，而手机在外面也没有别的办法找到你那台机器。
+DeepSeek Harness 跑在家里的电脑上，人出门在外，手机要连回来。麻烦在两头都够不着对方：绝大多数家庭宽带没有公网地址，路由上开端口既不现实也不安全，而手机在外面也没有别的办法找到你那台机器。
 
 所以需要一台有公网地址的机器当落脚点，手机和电脑各自连上它，由它把两边对上。这个中转就是那个落脚点，它做的事刻意压得很窄 —— 对上连接、转发帧，剩下的都留在用户自己那台电脑上。
 

@@ -1,7 +1,7 @@
 <h3 align="center">DSH Mobile Server</h3>
 
 <p align="center">
-  <img src="assets/banner.jpg" alt="AI-HUB: DSH sessions on a phone and a tablet" width="760">
+  <img src="assets/banner.jpg" alt="AI-HUB: DeepSeek Harness sessions on a phone and a tablet" width="760">
 </p>
 
 <p align="center">
@@ -17,7 +17,7 @@
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/WNLUO/dsh-mobile-server/main/assets/connection-en-dark.svg">
-    <img src="https://raw.githubusercontent.com/WNLUO/dsh-mobile-server/main/assets/connection-en-light.svg" alt="The phone app reaches the DSH on your computer through a relay, or directly over the LAN" width="720">
+    <img src="https://raw.githubusercontent.com/WNLUO/dsh-mobile-server/main/assets/connection-en-light.svg" alt="The phone app reaches the DeepSeek Harness on your computer through a relay, or directly over the LAN" width="720">
   </picture>
 </p>
 
@@ -95,7 +95,7 @@ The frame type table in `server/relay-core/protocol-types.js` is authoritative. 
 
 ## Why I built this
 
-DSH runs on the computer at home, and people take their phones everywhere. The trouble is that neither side can reach the other: almost no home broadband comes with a public address, opening a port on the router is neither practical nor safe, and the phone has no other way to find that machine.
+DeepSeek Harness runs on the computer at home, and people take their phones everywhere. The trouble is that neither side can reach the other: almost no home broadband comes with a public address, opening a port on the router is neither practical nor safe, and the phone has no other way to find that machine.
 
 So you need one host with a public address for both ends to connect to, and something to match them up. That is what this relay is, and it is deliberately narrow — match the connections, move the frames, and leave the rest on the user's own computer.
 
