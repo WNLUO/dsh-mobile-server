@@ -47,6 +47,8 @@ pub mod t {
     pub const PUSH_SEND: u8 = 0x1B;
     /// 宿主断开旧隧道之前报「我搬到 `to` 了」；`to` 为空串撤销这条记录。
     pub const MIGRATE: u8 = 0x1C;
+    /// 宿主把 HK 加密的历史 blob（密文）推给中转；中转只存不解。
+    pub const BLOB_PUT: u8 = 0x1D;
 
     /// 编号 → 名字，用于日志与排错。与 JS 侧 `TYPE_NAME` 对应。
     pub fn name(code: u8) -> Option<&'static str> {
@@ -79,6 +81,7 @@ pub mod t {
             PUSH_REGISTER => "pushRegister",
             PUSH_SEND => "pushSend",
             MIGRATE => "migrate",
+            BLOB_PUT => "blobPut",
             _ => return None,
         })
     }
@@ -351,7 +354,7 @@ mod tests {
 
     #[test]
     fn every_type_has_a_name() {
-        for code in 0x01..=0x1Cu8 {
+        for code in 0x01..=0x1Du8 {
             assert!(t::name(code).is_some(), "{code:#04x} 没有名字");
         }
     }

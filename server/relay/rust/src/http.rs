@@ -411,9 +411,102 @@ fn presented_credentials(head: &RequestHead) -> Vec<String> {
     presented
 }
 
+/// 一个十六进制字符的值；非十六进制返回 `None`。
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// 解路径段里的 `%XX`（不做 `+` → 空格的表单语义，那是查询串的规矩，不是路径的）。
+fn percent_decode(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (hex_value(bytes[i + 1]), hex_value(bytes[i + 2])) {
+                out.push((hi << 4) | lo);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// 把密文编成 base64url（无填充），与 `blobPut` 帧里的 `cipher` 同一口径。
+fn base64_url_encode(bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// 历史 blob 的只读拉取：`GET /api/mobile/v1/blob/<scope>/<key>`。
+///
+/// 鉴权与镜像兜底同一套：必须带 `x-dsh-instance`，设备凭据（`Authorization: Bearer`
+/// 或配对 cookie）算 sha256 后交 `BlobStore::get` 去比对存下的摘要。对不上、没命中，
+/// 一律回与「路径不存在」一样的 404——不新增错误面。`BLOB_STORE` 关时返回 `Ok(false)`，
+/// 让调用方按未认领路径照旧转发/404。
+async fn handle_blob_get(
+    reader: &mut BufReader<TcpStream>,
+    head: &RequestHead,
+    rest: &str,
+) -> std::io::Result<bool> {
+    let Some(store) = crate::blob_store() else {
+        return Ok(false);
+    };
+    if head.method != "GET" {
+        respond_text(reader, 404, NOT_FOUND).await?;
+        return Ok(true);
+    }
+    let Some((scope_raw, key_raw)) = rest.split_once('/') else {
+        respond_text(reader, 404, NOT_FOUND).await?;
+        return Ok(true);
+    };
+    let scope = percent_decode(scope_raw);
+    let key = percent_decode(key_raw);
+    let instance_id = head
+        .header("x-dsh-instance")
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    // scope 只认这两档，其它值当作不存在；空 key、缺实例头同样只给 404。
+    let known_scope = scope == "messages" || scope == "file";
+    if !known_scope || key.is_empty() || instance_id.is_empty() {
+        respond_text(reader, 404, NOT_FOUND).await?;
+        return Ok(true);
+    }
+    let credentials = presented_credentials(head);
+    let mut hit: Option<(Vec<u8>, u64)> = None;
+    for credential in &credentials {
+        if let Some(found) = store.get_meta(&instance_id, &scope, &key, credential.as_bytes()) {
+            hit = Some(found);
+            break;
+        }
+    }
+    let Some((cipher, updated_at)) = hit else {
+        respond_text(reader, 404, NOT_FOUND).await?;
+        return Ok(true);
+    };
+    let body = serde_json::json!({
+        "ok": true,
+        "scope": scope,
+        "key": key,
+        "cipher": base64_url_encode(&cipher),
+        "updatedAt": updated_at,
+    })
+    .to_string();
+    respond_json(reader, 200, &body).await?;
+    Ok(true)
+}
+
 /// 控制台自己的请求体上限。控制台只有被控端上报那条带体，内容是个小 JSON。
-const MAX_CONSOLE_BODY: usize = 64 * 1024;
-/// 插件 OTA 发布的请求体上限。发布的是**整包**（npm tgz，几百 KB 到几 MB），
+const MAX_CONSOLE_BODY: usize = 64 * 1024;/// 插件 OTA 发布的请求体上限。发布的是**整包**（npm tgz，几百 KB 到几 MB），
 /// 不能套用控制台那个 64KB。
 const MAX_OTA_PUBLISH_BODY: usize = 32 * 1024 * 1024;
 
@@ -477,7 +570,13 @@ pub async fn handle_owned_path(
     peer: Option<std::net::SocketAddr>,
 ) -> std::io::Result<bool> {
     let pathname = head.normalized_pathname();
-    match strip_deploy_prefix(&pathname) {
+    let stripped = strip_deploy_prefix(&pathname);
+    // 历史 blob 拉取：`GET /api/mobile/v1/blob/<scope>/<key>`。只在 `BLOB_STORE` 开时
+    // 认领；关着时原样落到下面的转发/404，行为与没有这条路径一样。
+    if let Some(rest) = stripped.strip_prefix("/api/mobile/v1/blob/") {
+        return handle_blob_get(reader, head, rest).await;
+    }
+    match stripped {
         "/healthz" => {
             respond_text(reader, 200, "ok").await?;
             Ok(true)

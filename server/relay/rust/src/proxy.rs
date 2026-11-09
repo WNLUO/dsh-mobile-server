@@ -455,6 +455,31 @@ fn parse_json_value(payload: &[u8]) -> serde_json::Value {
     serde_json::from_slice(payload).unwrap_or_else(|_| serde_json::json!({}))
 }
 
+/// 解 `blobPut` 里的 `cipher`（base64url，无填充优先，带填充也认）。
+fn decode_base64_url(raw: &str) -> Option<Vec<u8>> {
+    use base64::Engine as _;
+    let raw = raw.trim();
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(raw)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(raw))
+        .ok()
+}
+
+/// `creds` 数组里只认 sha256 hex（64 位十六进制），别的形状整条丢掉。
+fn parse_cred_digests(value: Option<&serde_json::Value>) -> Vec<[u8; 32]> {
+    let mut out = Vec::new();
+    if let Some(list) = value.and_then(|v| v.as_array()) {
+        for item in list {
+            if let Some(raw) = item.as_str() {
+                if let Some(digest) = crate::blobstore::decode_hex32(raw) {
+                    out.push(digest);
+                }
+            }
+        }
+    }
+    out
+}
+
 /// 响应方向上推进给手机的一段数据。
 pub enum ResponseChunk {
     Data(Vec<u8>),
@@ -790,15 +815,34 @@ pub fn handle_tunnel_frame(tunnel: &Arc<Tunnel>, instance_id: &str, frame_type: 
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            if device_id.is_empty() || title.is_empty() {
+            // 富推送：类别（如审批 / 提问）与交互数据。都可缺省；category 空、
+            // interaction 缺省时载荷与老通知一致。
+            let category = value
+                .get("category")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let interaction = value.get("interaction").cloned();
+            // device_id 为空是合法值：推给该实例全部已登记令牌（宿主 push-notify
+            // 就这么发「推给我所有设备」）。只有标题为空才不能成一条通知。
+            if title.is_empty() {
                 return;
             }
             let Some(console) = crate::console() else { return };
             let instance = instance_id.to_string();
             let tokens = console.store.push_tokens_of(&instance);
             tokio::spawn(async move {
-                crate::apns::send_completion(&instance, &device_id, &tokens, &title, &body, &session_id)
-                    .await;
+                crate::apns::send_completion(
+                    &instance,
+                    &device_id,
+                    &tokens,
+                    &title,
+                    &body,
+                    &session_id,
+                    &category,
+                    interaction.as_ref(),
+                )
+                .await;
             });
         }
         t::MIGRATE => {
@@ -815,6 +859,47 @@ pub fn handle_tunnel_frame(tunnel: &Arc<Tunnel>, instance_id: &str, frame_type: 
                     }
                 }
                 None => log("ignored migrate frame from a tunnel with no instanceId"),
+            }
+        }
+        t::BLOB_PUT => {
+            // 宿主推上来一条用 HK 加密好的历史 blob。中转**只存密文、不解密**：
+            // 这里只取 `creds` 摘要与 `bytes`，cipher 原样落盘。`BLOB_STORE` 关时
+            // 没有仓库，直接忽略（不报错、不回执），转发行为一个字节都不变。
+            let Some(store) = crate::blob_store() else { return };
+            let value = parse_json_value(payload);
+            let scope = value
+                .get("scope")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let key = value
+                .get("key")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if scope.is_empty() || key.is_empty() {
+                return;
+            }
+            let Some(cipher) = value
+                .get("cipher")
+                .and_then(|v| v.as_str())
+                .and_then(decode_base64_url)
+            else {
+                return;
+            };
+            let creds = parse_cred_digests(value.get("creds"));
+            // 记录归属取**这条隧道自己登的 instanceId**（与 migrate 同口径），不信任
+            // payload 里可能出现的任何「替谁存」字段。
+            let Some(instance) = tunnel.instance_id() else {
+                return;
+            };
+            if !store.put(&instance, &scope, &key, &cipher, creds) {
+                log(format!(
+                    "blob put rejected instance={instance} scope={scope} bytes={}",
+                    cipher.len()
+                ));
             }
         }
         t::HTTP_HEAD => {

@@ -126,7 +126,7 @@
 ## B 段 · 文件清单（机械生成，勿手改）
 
 <!-- BEGIN:GENERATED-FILES -->
-> **A 段未覆盖**：24 / 32 个源文件没有任何条目的「改哪里」收它们。
+> **A 段未覆盖**：25 / 33 个源文件没有任何条目的「改哪里」收它们。
 > 其中 0 个被「联动」点到过——`affected` 按名字找得到，但只会提示「顺带被点到」，
 > 没有条目「拥有」它们。完整清单见
 > [`docs/.dev-map-uncovered.txt`](.dev-map-uncovered.txt)——那是一份「地图待补清单」，
@@ -134,7 +134,7 @@
 
 ### Rust 中转与隧道协议（全部源码）
 
-共 32 个文件。
+共 33 个文件。
 
 | 文件 | 用途 |
 | --- | --- |
@@ -151,6 +151,7 @@
 | `server/relay/rust/console/src/main.tsx` | (无文件头注释) |
 | `server/relay/rust/console/vite.config.ts` | 中转控制台的构建配置。 |
 | `server/relay/rust/src/apns.rs` | APNs 推送转发：任务完成时把通知递到苹果，由苹果送到离线 / 后台的 iPhone。 |
+| `server/relay/rust/src/blobstore.rs` | 加密历史 blob 的落盘仓库（`BLOB_STORE` 打开时才存在）。 |
 | `server/relay/rust/src/config.rs` | 环境变量配置（限额的唯一真源）。 |
 | `server/relay/rust/src/console/config.rs` | 控制台的配置：从环境变量读，前缀 `PLATFORM_`。 |
 | `server/relay/rust/src/console/mod.rs` | 中转控制台：管理面、准入、账号与激活码。 |

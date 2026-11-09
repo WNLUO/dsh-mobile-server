@@ -89,6 +89,32 @@ async fn main() {
         }
     }
 
+    // 历史 blob 仓库：默认关。开着时把密文落到 data 目录下，注入转发与 HTTP 两侧。
+    // 建不起来（磁盘不可写等）只记日志、不挡转发——中转的首要职责仍是转发。
+    if config.blob_store {
+        let blob_root = data_dir.join("blobs");
+        match dsh_relay::blobstore::BlobStore::new(
+            blob_root.clone(),
+            config.max_blob_bytes,
+            config.max_blob_per_instance_bytes,
+            config.max_blob_total_bytes,
+            config.blob_ttl_seconds,
+        ) {
+            Ok(store) => {
+                dsh_relay::install_blob_store(Arc::new(store));
+                log(format!(
+                    "历史 blob 仓库已开启 dir={} max_blob={}B per_instance={}B total={}B ttl={}s",
+                    blob_root.display(),
+                    config.max_blob_bytes,
+                    config.max_blob_per_instance_bytes,
+                    config.max_blob_total_bytes,
+                    config.blob_ttl_seconds
+                ));
+            }
+            Err(error) => log(format!("历史 blob 仓库启动失败，暂时不收 blob：{error}")),
+        }
+    }
+
     // 升级状态：是不是有一个换了上去、还没验证过的新版本在等这次启动。
     // 记账必须在绑定端口**之前**落盘：一个绑不上端口就死的版本，要靠这一次记账
     // 才能在下一次启动时被认出来。

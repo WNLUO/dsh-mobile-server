@@ -119,6 +119,25 @@ pub struct Config {
     /// 手机下次轮询照常再问一次。
     pub mirror_fallback_ms: u64,
 
+    // ── 加密历史 blob（只存不读）─────────────────────────────────
+    /// 历史 blob 仓库开关（`BLOB_STORE`，**默认关**）。
+    ///
+    /// 关着时中转不落任何 blob，`blobPut` 帧直接忽略、拉取路径也不认领——转发行为
+    /// 一个字节都不变。开了之后中转只存密文，不持钥、不解密（见 `blobstore`）。
+    pub blob_store: bool,
+    /// 单条 blob 上限（字节；默认 5MB，超了拒收并保留旧的）。
+    ///
+    /// 5MB 是「base64 塞进 JSON 帧后仍落在默认 `MAX_FRAME_BYTES`（8MB）之内」的上界：
+    /// 5MB 密文 base64 后约 6.7MB，加帧头与 creds 还有余量。调大到接近 8MB 时，必须
+    /// 同步抬高 `MAX_FRAME_BYTES`，否则这条 blobPut 会被帧解码层当超大帧清掉、静默丢。
+    pub max_blob_bytes: usize,
+    /// 每个实例的 blob 总量上限（字节；默认 64MB）。
+    pub max_blob_per_instance_bytes: usize,
+    /// 全局 blob 总量上限（字节；默认 512MB）。超过按 `updated_at` 从旧到新淘汰。
+    pub max_blob_total_bytes: usize,
+    /// blob 存活时长（秒；默认 7 天）。读/写时顺手清过期。
+    pub blob_ttl_seconds: u64,
+
     /// 最低可接受的宿主插件版本（`MIN_PLUGIN_VERSION`，**默认空 = 不拦**）。
     ///
     /// 配了值以后，注册帧里报的版本低于它（或者干脆没报——老插件根本没这个字段）的宿主
@@ -234,6 +253,25 @@ impl Config {
             ),
             // 0 是合法的「关」：谁只想留「隧道不在时兜底」这一半，就把它设成 0。
             mirror_fallback_ms: non_negative_int("MIRROR_FALLBACK_MS", 2_500, 60_000)? as u64,
+            // 历史 blob 仓库：默认关，`1`/`true`/`yes` 才开。关时一行行为都不变。
+            blob_store: matches!(
+                env::var("BLOB_STORE").unwrap_or_default().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes"
+            ),
+            // 四个 blob 限额全按「越界即 Err、不 clamp」解析，与其它可调项同一条规矩。
+            max_blob_bytes: positive_int("MAX_BLOB_BYTES", 5 * 1024 * 1024, 64 * 1024 * 1024)?,
+            max_blob_per_instance_bytes: positive_int(
+                "MAX_BLOB_PER_INSTANCE_BYTES",
+                64 * 1024 * 1024,
+                1024 * 1024 * 1024,
+            )?,
+            max_blob_total_bytes: positive_int(
+                "MAX_BLOB_TOTAL_BYTES",
+                512 * 1024 * 1024,
+                8 * 1024 * 1024 * 1024,
+            )?,
+            // 7 天 = 604800 秒；上限给一年，短于此都按原值生效。
+            blob_ttl_seconds: positive_int("BLOB_TTL_SECONDS", 604_800, 365 * 86_400)? as u64,
             self_update: matches!(
                 env::var("SELF_UPDATE").unwrap_or_default().to_ascii_lowercase().as_str(),
                 "1" | "true" | "yes"
@@ -287,6 +325,11 @@ impl Default for Config {
             min_plugin_version: None,
             mirror_cache: true,
             mirror_fallback_ms: 2_500,
+            blob_store: false,
+            max_blob_bytes: 5 * 1024 * 1024,
+            max_blob_per_instance_bytes: 64 * 1024 * 1024,
+            max_blob_total_bytes: 512 * 1024 * 1024,
+            blob_ttl_seconds: 604_800,
             self_update: false,
             self_update_interval_seconds: 86_400,
             self_update_sources: Vec::new(),
@@ -366,5 +409,10 @@ mod tests {
         assert_eq!(config.tunnel_pong_timeout_ms, 60_000);
         assert!(config.mirror_cache, "离线镜像兜底默认开");
         assert_eq!(config.mirror_fallback_ms, 2_500, "弱网兜底默认 2.5 秒");
+        assert!(!config.blob_store, "历史 blob 仓库默认关");
+        assert_eq!(config.max_blob_bytes, 5 * 1024 * 1024);
+        assert_eq!(config.max_blob_per_instance_bytes, 64 * 1024 * 1024);
+        assert_eq!(config.max_blob_total_bytes, 512 * 1024 * 1024);
+        assert_eq!(config.blob_ttl_seconds, 604_800, "blob 默认 7 天");
     }
 }

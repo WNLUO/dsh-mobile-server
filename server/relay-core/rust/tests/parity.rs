@@ -96,6 +96,7 @@ fn encode_frame_matches_js_byte_for_byte() {
         ("revokeAllAck", t::REVOKE_ALL_ACK),
         ("pushRegister", t::PUSH_REGISTER),
         ("pushSend", t::PUSH_SEND),
+        ("blobPut", t::BLOB_PUT),
     ];
 
     for (name, code) in cases {
@@ -192,6 +193,7 @@ fn type_table_matches_js() {
         ("revokeAllAck", t::REVOKE_ALL_ACK),
         ("pushRegister", t::PUSH_REGISTER),
         ("pushSend", t::PUSH_SEND),
+        ("blobPut", t::BLOB_PUT),
     ];
     for (name, code) in pairs {
         assert!(

@@ -40,6 +40,7 @@
 | 0x1A | pushRegister | 0 | JSON | 宿主代 App 上报/删除 iOS 推送令牌（{deviceId, platform, token} 或 {deviceId, action:'delete'}）；中转按实例落表，控制台未开时忽略 |
 | 0x1B | pushSend | 0 | JSON | 宿主请求中转发一条 APNs 推送（{deviceId, title, body, sessionId?, kind}）；只发给该实例登记过的令牌，APNs 未配置时零开销返回 |
 | 0x1C | migrate | 0 | JSON `{"to":"<新中转地址>","at":<毫秒>}` | 宿主断开旧隧道之前登记「我搬到 `to` 了」；`to` 为空串表示撤销这条记录。中转只接受这条隧道自己登记的 instanceId，按实例记 30 天 |
+| 0x1D | blobPut | 0 | JSON `{scope, key, creds, cipher}` | 宿主把用实例历史密钥（HK）加密好的历史 blob 推给中转：`scope` 为 `messages` 或 `file`，`key` 是 sessionId / fileId，`creds` 是本实例当前有效设备凭据的 sha256 hex 列表（供中转做拉取鉴权），`cipher` 是信封字节的 base64url。中转**只存密文、永不持钥、永不解密**；`BLOB_STORE` 关时直接忽略 |
 
 帧编号的事实源是 `protocol-types.js`；保留编号仍要与插件一致，但 Rust 中转不会将这些旧业务帧当成配对或镜像指令处理。中转侧 60 秒收不到 pong 则断开隧道，宿主侧超时为 90 秒。
 

@@ -26,6 +26,7 @@
 //! `../../relay-core/rust`，与 JS 实现由逐字节对撞测试钉住。
 
 pub mod apns;
+pub mod blobstore;
 pub mod config;
 pub mod console;
 pub mod headers;
@@ -55,6 +56,9 @@ static CONSOLE: OnceLock<Arc<Console>> = OnceLock::new();
 /// 隧道槽位。HTTP 入口要靠它回答 `/status` 与控制台的在线状态。
 static SLOT: OnceLock<Arc<TunnelSlot>> = OnceLock::new();
 
+/// 历史 blob 仓库。`BLOB_STORE` 关时永远为空。
+static BLOB_STORE: OnceLock<Arc<blobstore::BlobStore>> = OnceLock::new();
+
 /// 安装配置。重复调用会被忽略（第一次赢）。
 pub fn install_config(config: Arc<Config>) {
     let _ = CONFIG.set(config);
@@ -75,6 +79,16 @@ pub fn install_slot(slot: Arc<TunnelSlot>) {
 /// 取隧道槽位。没装过就建一个（单测里常见）。
 pub fn slot() -> Arc<TunnelSlot> {
     SLOT.get_or_init(|| Arc::new(TunnelSlot::new())).clone()
+}
+
+/// 安装历史 blob 仓库。只在 `BLOB_STORE` 打开时调用。
+pub fn install_blob_store(store: Arc<blobstore::BlobStore>) {
+    let _ = BLOB_STORE.set(store);
+}
+
+/// 取历史 blob 仓库；`BLOB_STORE` 关时返回 None。
+pub fn blob_store() -> Option<Arc<blobstore::BlobStore>> {
+    BLOB_STORE.get().cloned()
 }
 
 /// 安装控制台。只在 `PLATFORM_ENABLED` 打开时调用。
@@ -135,7 +149,7 @@ mod tests {
             );
         }
         // 反过来：Rust 表里的每一帧都必须在文档里有行。
-        for code in 0x01..=0x1Cu8 {
+        for code in 0x01..=0x1Du8 {
             let name = dsh_relay_protocol::t::name(code).expect("每一帧都要有名字");
             assert!(
                 documented.contains_key(&code),
