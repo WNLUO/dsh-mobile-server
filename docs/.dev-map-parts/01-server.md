@@ -98,3 +98,12 @@
 - **联动**：源站站点里那条 `limit_req zone=dsh_tunnel rate=4r/m burst=5` 留着不动，它是第二道闸；两条都拦同一批请求时叠在后面的那条永远不触发，所以 CDN 的阈值必须比源站松一点才有意义（CDN 拦掉大头，源站那条留给绕过 CDN 直连回源的情况）。`limit_req_zone` 的键是 `$dsh_client_ip`（= `X-Cdn-Real-IP`），与 CDN 那边的计数口径是同一个真实 IP，两边日志才对着看。
 - **怎么验**：回源日志里按分钟数 `/tunnel` 条数与其中 `429` 条数（生效后应为 0）；再按 IP 找「相邻两次请求间隔 55~75 秒」的形状——注册成功过的 IP 出现这个形状就是误伤，从没注册过的是老插件、挡对了。
 - **坑**：**规则生效那七八分钟会有一小波 502**（正在连的宿主被挡、隧道当场断，手机在途请求报错，实测峰值 76 次/分），十几分钟后自己回落，别当成故障；**改了参数要重新发布才生效**，生效时刻在日志上表现为每分钟条数一次阶跃；**窗口不是滑动速率而是「10 秒内计数」**，多台机器共用一个出口 IP 时计数是叠加的，这也是别把次数定得太松的原因。
+
+### A1-09. 历史 blob 存储（BLOB_STORE：只存密文、按设备凭据放行）
+
+- **典型说法**：「手机连不上电脑还能不能看历史」「离线的时候为什么只有最近几条」「中转占磁盘了」「BLOB_STORE 要不要开」「客户端没升级就开这个会不会出事」「凭据多的时候 blob 推上去没反应」。
+- **改哪里**：落盘仓库 `server/relay/rust/src/blobstore.rs`（`.blob` 正文 + `.meta` 元数据，内存只留元数据、正文按需读盘；启动时扫 `.meta` 重建索引，顺手清孤儿正文与残留 `.tmp`）；帧分发在 `proxy.rs` 的 `BLOB_PUT` / `BLOB_DELETE`；拉取路径在 `http.rs` 的 `handle_blob_get`（`GET /api/mobile/v1/blob/<scope>/<key>`，`BLOB_STORE` 关时 `Ok(false)` 照旧转发）；配置在 `config.rs`（`BLOB_STORE` 默认关，`MAX_BLOB_BYTES` 5MB / 每实例 64MB / 全局 512MB / `BLOB_TTL_SECONDS` 7 天），启动期还有 `check_limits`（单条 blob base64 后必须装得进一帧）与 `main.rs` 的「数据目录必须是绝对路径」两条硬校验。协议侧 `0x1D` / `0x1E` 见 `PROTOCOL.md`，编号表改动要三处一起动。
+- **刻意设计**：**中转不持钥、不解密**，只存信封字节；`cipher` 空串是「只换 creds 不动正文」（设备集合变了宿主就这么补一轮，读时按 `expiresAt` 现算是否有效）；`creds` 上限 200 与镜像那份、插件 `activeDigests` 同一个数——收窄会让凭据多的实例整条被拒，而 `blobPut` 没有回执，现场只剩「这台机器永远存不上离线历史」。**写盘是临时文件 + 同目录 rename**，并发写同一 key 读到的永远是某一次完整正文，进程被杀只留孤儿 `.tmp`。**TTL 在读取那一刻判**，清理只是收盘上垃圾，所以清理节流（60 秒一次）不会让过期条目被发出去。**启动期两条硬校验宁可起不来**：`MAX_BLOB_BYTES` 配得装不进一帧时，帧解码层会**断开整条隧道**（不是丢这一帧）；数据目录是相对路径时跟着进程 CWD 走，重启一次表现就是「以前推上来的 blob 全没了」。
+- **联动**：宿主侧 `dsh-mobile-plugin/lib/mirror/pusher.cjs`（删除 → creds-only → 正文 → 文件，各自配额）、`history-blob.cjs`（封信封）、`sidecar-facade-worker.cjs`（`blobPut` / `blobDelete` 帧）；App 侧离线拉取在 `app/src/services/history-blob-load.ts`（只在宿主够不着时才走，`take` 走本机 HK 解信封）。
+- **守卫**：`cargo test` 里 `blobstore` 那一组（roundtrip、错凭据、过期凭据读不到、`expiresAt=0` 按不过期、空 `cipher` 只换 creds 且目标不存在时拒收、scope 白名单与 200 条上限、删除幂等、预算淘汰记进 `evicted`、读时判 TTL、启动重建清孤儿与 `.tmp`）、`config::tests::blob_limit_must_fit_in_a_frame`。
+- **坑**：**`BLOB_STORE` 打开后 `PLATFORM_DB_PATH` 必须给绝对路径**（数据目录是从它 parent 推出来的），否则进程直接 `exit(1)`；而自动更新的「试跑」用的是 `--version`，**只打版本不读配置**，所以这种配置错会在替换完成后才炸出来（下一轮启动靠 `.update-state` 回滚，但白升一次）。**老插件照样安全**：它不认 `0x1E`、中转收到未知帧静默丢弃，`blobPut` 的旧形状（裸 hex 数组、无 `expiresAt`）按「不过期」读，所以新中转配老插件只是「不推新内容」，不会报错。**`/status` 多了一个 `blob` 字段**（enabled/count/bytes/evicted），`/status` 只答本机、没有客户端消费它。

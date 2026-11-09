@@ -44,6 +44,7 @@ const T = {
   pushSend: 0x1B,      // id=0  JSON {deviceId, title, body, sessionId?, kind}；宿主请求中转发一条 APNs 推送
   migrate: 0x1C,       // id=0  JSON {to, at}；宿主换中转地址前在旧隧道上登记「这台搬到 to」，to 空串 = 撤销
   blobPut: 0x1D,       // id=0  JSON {scope, key, creds, cipher}；宿主把 HK 加密的历史 blob（base64url 密文）推给中转，中转只存不解
+  blobDelete: 0x1E,    // id=0  JSON {scope, key} 或 {scope, keys:[...]}；宿主让中转删掉已推过的 blob
 };
 
 /** 编号 → 名字的反查表。 */

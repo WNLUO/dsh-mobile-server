@@ -20,7 +20,7 @@
   </picture>
 </p>
 
-图上中间那台就是你部署的这个服务。它只把连接对上、把帧转过去：模型怎么选、文件放哪、会话记录存哪儿，都在用户自己那台电脑上。
+图上中间那台就是你部署的这个服务。默认它就只把连接对上、把帧转过去：模型怎么选、文件放哪、会话记录存哪儿，都在用户自己那台电脑上。不配环境变量、不开控制台时行为就这一种；打开可选的历史 blob 存储也只是额外存一份密文（不持钥、不解密），见下面的环境变量。
 
 ## 功能
 
@@ -60,10 +60,11 @@ sudo sh install-binary.sh
 
 ## 环境变量（可选能力）
 
-纯转发部署一个环境变量都不用配。下面这些是**可选**能力的开关：
+默认部署（纯转发）一个环境变量都不用配。下面这些是**可选**能力的开关：
 
 - 控制台（微信登录 / 激活码 / 准入）：`PLATFORM_ENABLED=1` 起，其余见 `console/config.rs`。
 - 镜像兜底：`MIRROR_CACHE=0` 关（默认开），`MIRROR_FALLBACK_MS` 调阈值。
+- **历史 blob 存储**：`BLOB_STORE=1` 开（**默认关**），只存密文——中转不持钥、不解密，取密文按设备凭据摘要放行。容量与过期：单条 `MAX_BLOB_BYTES`（默认 5MB）、每实例 `MAX_BLOB_PER_INSTANCE_BYTES`（默认 64MB）、全局 `MAX_BLOB_TOTAL_BYTES`（默认 512MB，超了按更新时间从旧到新淘汰）、`BLOB_TTL_SECONDS`（默认 7 天，读写时顺手清过期）。
 - **iOS 离线推送**：`APNS_KEY` + `APNS_KEY_ID` + `APNS_TEAM_ID` 三样都配才开。`APNS_KEY` 是苹果开发者后台生成的 `.p8` 私钥（Apple Push Notifications authentication key，ES256），接受 PEM 原文或文件路径（支持 `~/`）。不配就是关闭，转发与其它功能零影响，启动日志会有一条 `apns disabled`。
 
 ## 关于 iOS 离线推送的一个苹果规矩

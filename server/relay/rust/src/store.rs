@@ -131,6 +131,17 @@ CREATE TABLE IF NOT EXISTS push_tokens (
   PRIMARY KEY (instance_id, device_id)
 );
 
+-- 每台设备的提醒偏好：App 上报的原始 JSON（`levels` 分级 + `muted` 静音会话），
+-- 中转只按它决定推不推、要不要声音，不解释其余字段。一台设备一行，随 push-token
+-- 上报一起落库；没上报过就是没有偏好（照旧全推、带声音）。
+CREATE TABLE IF NOT EXISTS push_prefs (
+  instance_id  TEXT NOT NULL,
+  device_id    TEXT NOT NULL,
+  prefs        TEXT NOT NULL,
+  updated_at   TEXT NOT NULL,
+  PRIMARY KEY (instance_id, device_id)
+);
+
 -- 主控端侧的「我管着谁」。被控端拿认领码来报到，主控端记下它。
 -- 只在主控端用得到；被控端自己的库里这张表是空的。
 CREATE TABLE IF NOT EXISTS nodes (
@@ -1001,6 +1012,49 @@ impl Store {
             Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
             Err(_) => Vec::new(),
         }
+    }
+
+    // ── push prefs（每台设备的提醒偏好）──────────────────────────
+    //
+    // 偏好是 App 自己定义的 JSON，中转只读 `levels` / `muted` 两处（见 apns.rs 的
+    // 过滤）。缺失、损坏都按「没有偏好」处理：照发、带声音——宁可多提醒一次，
+    // 也不能因为存坏了一行就悄悄吞掉通知。
+
+    /// 记录 / 更新一台设备的提醒偏好。整份覆盖（App 每次上报都是全文）。
+    pub fn upsert_push_prefs(&self, instance_id: &str, device_id: &str, prefs_json: &str) {
+        let _ = self.lock().execute(
+            "INSERT INTO push_prefs (instance_id, device_id, prefs, updated_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (instance_id, device_id)
+             DO UPDATE SET prefs = ?3, updated_at = ?4",
+            params![instance_id, device_id, prefs_json, now_iso()],
+        );
+    }
+
+    /// 这台实例上各设备的偏好：(device_id, prefs_json)。没上报过的设备不在列表里。
+    pub fn push_prefs_of(&self, instance_id: &str) -> Vec<(String, String)> {
+        let conn = self.lock();
+        let mut stmt = match conn
+            .prepare("SELECT device_id, prefs FROM push_prefs WHERE instance_id = ?1")
+        {
+            Ok(stmt) => stmt,
+            Err(_) => return Vec::new(),
+        };
+        let rows = stmt.query_map(params![instance_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        });
+        match rows {
+            Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// 删掉一台设备的偏好（令牌一起被删时调用；不存在也算删成）。
+    pub fn delete_push_prefs(&self, instance_id: &str, device_id: &str) {
+        let _ = self.lock().execute(
+            "DELETE FROM push_prefs WHERE instance_id = ?1 AND device_id = ?2",
+            params![instance_id, device_id],
+        );
     }
 
     /// 这台实例上还挂着令牌的设备数（诊断用）。

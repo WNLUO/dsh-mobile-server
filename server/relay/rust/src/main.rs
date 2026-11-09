@@ -62,6 +62,19 @@ async fn main() {
         .parent()
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| std::path::PathBuf::from("data"));
+
+    // blob 仓库必须落在绝对路径上。相对路径跟着进程 CWD 跑（systemd 下是 `/`、
+    // 手动启是当时那个目录），重启一次就可能换一个地方——表现是「手机上以前推上来的
+    // blob 突然全没了」，而盘上什么都没坏。这一项配错**直接起不来**：落到 `/data`
+    // 或 CWD 下面再报错，损失已经造成了。
+    if config.blob_store && data_dir.is_relative() {
+        eprintln!(
+            "配置错误：BLOB_STORE=1 要求数据目录是绝对路径，当前是 {}；\
+             用 PLATFORM_DB_PATH 指一个绝对路径（例如 /opt/dsh-relay/data/console.db）",
+            data_dir.display()
+        );
+        std::process::exit(1);
+    }
     if console_config.enabled {
         for problem in console_config.problems() {
             log(format!("控制台配置问题：{problem}"));
@@ -111,7 +124,10 @@ async fn main() {
                     config.blob_ttl_seconds
                 ));
             }
-            Err(error) => log(format!("历史 blob 仓库启动失败，暂时不收 blob：{error}")),
+            Err(error) => log(format!(
+                "警告：BLOB_STORE 开着但历史 blob 仓库没建起来（{}），本次启动不收 blob：{error}",
+                blob_root.display()
+            )),
         }
     }
 

@@ -448,9 +448,10 @@ fn base64_url_encode(bytes: &[u8]) -> String {
 
 /// 历史 blob 的只读拉取：`GET /api/mobile/v1/blob/<scope>/<key>`。
 ///
-/// 鉴权与镜像兜底同一套：必须带 `x-dsh-instance`，设备凭据（`Authorization: Bearer`
-/// 或配对 cookie）算 sha256 后交 `BlobStore::get` 去比对存下的摘要。对不上、没命中，
-/// 一律回与「路径不存在」一样的 404——不新增错误面。`BLOB_STORE` 关时返回 `Ok(false)`，
+/// 鉴权与镜像兜底同一套：必须带 `x-dsh-instance`，设备凭据（`X-Dsh-Device-Credential`
+/// 或 `Authorization` 的 Bearer 原文，**只有这两个头**，不读 cookie）算 sha256 后交
+/// `BlobStore::get_meta` 去比对存下的摘要。对不上、没命中，一律回与「路径不存在」
+/// 一样的 404——不新增错误面。`BLOB_STORE` 关时返回 `Ok(false)`，
 /// 让调用方按未认领路径照旧转发/404。
 async fn handle_blob_get(
     reader: &mut BufReader<TcpStream>,
@@ -458,6 +459,14 @@ async fn handle_blob_get(
     rest: &str,
 ) -> std::io::Result<bool> {
     let Some(store) = crate::blob_store() else {
+        // 开关开着、仓库却没建起来（启动时日志里那条警告）——这时候手机来拉只会
+        // 拿到 404，看起来像「历史没推上去」。只记一次，别按请求刷屏。
+        if crate::config().blob_store {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                log("blob get refused: BLOB_STORE=1 but no store on this relay");
+            });
+        }
         return Ok(false);
     };
     if head.method != "GET" {
@@ -476,7 +485,8 @@ async fn handle_blob_get(
         .trim()
         .to_string();
     // scope 只认这两档，其它值当作不存在；空 key、缺实例头同样只给 404。
-    let known_scope = scope == "messages" || scope == "file";
+    let known_scope =
+        scope == crate::blobstore::SCOPE_MESSAGES || scope == crate::blobstore::SCOPE_FILE;
     if !known_scope || key.is_empty() || instance_id.is_empty() {
         respond_text(reader, 404, NOT_FOUND).await?;
         return Ok(true);
@@ -490,6 +500,15 @@ async fn handle_blob_get(
         }
     }
     let Some((cipher, updated_at)) = hit else {
+        // 鉴权失败与「没这条」回同一个 404（不给扫描器区分），但**日志里要留一行**：
+        // 现场最常见的问题是设备凭据没跟上这一轮 creds，只看 404 分不出来。没带凭据
+        // 的请求不记——那不是鉴权失败，是还没配对。
+        if !credentials.is_empty() {
+            log(format!(
+                "blob auth failed instance={instance_id} scope={scope} credentials={}",
+                credentials.len()
+            ));
+        }
         respond_text(reader, 404, NOT_FOUND).await?;
         return Ok(true);
     };
@@ -506,7 +525,9 @@ async fn handle_blob_get(
 }
 
 /// 控制台自己的请求体上限。控制台只有被控端上报那条带体，内容是个小 JSON。
-const MAX_CONSOLE_BODY: usize = 64 * 1024;/// 插件 OTA 发布的请求体上限。发布的是**整包**（npm tgz，几百 KB 到几 MB），
+const MAX_CONSOLE_BODY: usize = 64 * 1024;
+
+/// 插件 OTA 发布的请求体上限。发布的是**整包**（npm tgz，几百 KB 到几 MB），
 /// 不能套用控制台那个 64KB。
 const MAX_OTA_PUBLISH_BODY: usize = 32 * 1024 * 1024;
 
@@ -616,12 +637,22 @@ pub async fn handle_owned_path(
             // 这个数是决定「门槛定在哪」的唯一依据，别再让它只存在于网卡速率里。
             let min_plugin = crate::config().min_plugin_version;
             let (plugins_seen, plugins_old) = crate::plugin_versions::summary(min_plugin);
+            // 历史 blob 的账：条数 / 字节 / 累计淘汰数。开关关着、或者开着但仓库没建起来时
+            // 三个数都是 0（后者另有启动那条警告，这里不重复告警）。
+            let (blob_count, blob_bytes, blob_evicted) = match crate::blob_store() {
+                Some(store) => store.stats(),
+                None => (0, 0, 0),
+            };
             let body = format!(
-                r#"{{"ok":true,"hostConnected":{},"mirror":{{"instances":{},"bytes":{},"budget":{}}},"plugins":{{"seen":{},"outdated":{},"min":{}}},"tunnelUnregisteredTimeouts":{}}}"#,
+                r#"{{"ok":true,"hostConnected":{},"mirror":{{"instances":{},"bytes":{},"budget":{}}},"blob":{{"enabled":{},"count":{},"bytes":{},"evicted":{}}},"plugins":{{"seen":{},"outdated":{},"min":{}}},"tunnelUnregisteredTimeouts":{}}}"#,
                 host_connected,
                 mirror.instances,
                 mirror.bytes,
                 mirror.budget,
+                crate::config().blob_store,
+                blob_count,
+                blob_bytes,
+                blob_evicted,
                 plugins_seen,
                 plugins_old,
                 min_plugin
@@ -684,6 +715,12 @@ pub async fn handle_owned_path(
                 .unwrap_or("ios")
                 .trim()
                 .to_string();
+            // 提醒偏好：任意 JSON，原样落表（中转只读其中的 levels / muted）。没带就
+            // 沿用旧值——不主动删，免得旧的 App 一上报就把偏好清空。
+            let prefs = request
+                .get("prefs")
+                .filter(|v| !v.is_null())
+                .map(|v| v.to_string());
             if device_id.is_empty() || token.is_empty() {
                 respond_json(reader, 400, r#"{"ok":false,"error":"deviceId and token are required"}"#).await?;
                 return Ok(true);
@@ -691,6 +728,9 @@ pub async fn handle_owned_path(
             match crate::console() {
                 Some(console) => {
                     console.store.upsert_push_token(&instance_id, &device_id, &platform, &token);
+                    if let Some(prefs) = prefs {
+                        console.store.upsert_push_prefs(&instance_id, &device_id, &prefs);
+                    }
                     respond_json(reader, 200, r#"{"ok":true}"#).await?;
                 }
                 None => respond_json(reader, 503, r#"{"ok":false,"error":"no store on this relay"}"#).await?,

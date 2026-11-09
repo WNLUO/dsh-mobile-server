@@ -40,8 +40,9 @@
 | 0x1A | pushRegister | 0 | JSON | 宿主代 App 上报/删除 iOS 推送令牌（{deviceId, platform, token} 或 {deviceId, action:'delete'}）；中转按实例落表，控制台未开时忽略 |
 | 0x1B | pushSend | 0 | JSON | 宿主请求中转发一条 APNs 推送（{deviceId, title, body, sessionId?, kind}）；只发给该实例登记过的令牌，APNs 未配置时零开销返回 |
 | 0x1C | migrate | 0 | JSON `{"to":"<新中转地址>","at":<毫秒>}` | 宿主断开旧隧道之前登记「我搬到 `to` 了」；`to` 为空串表示撤销这条记录。中转只接受这条隧道自己登记的 instanceId，按实例记 30 天 |
-| 0x1D | blobPut | 0 | JSON `{scope, key, creds, cipher}` | 宿主把用实例历史密钥（HK）加密好的历史 blob 推给中转：`scope` 为 `messages` 或 `file`，`key` 是 sessionId / fileId，`creds` 是本实例当前有效设备凭据的 sha256 hex 列表（供中转做拉取鉴权），`cipher` 是信封字节的 base64url。中转**只存密文、永不持钥、永不解密**；`BLOB_STORE` 关时直接忽略 |
+| 0x1D | blobPut | 0 | JSON `{scope, key, creds, cipher}` | 宿主把用实例历史密钥（HK）加密好的历史 blob 推给中转：`scope` 为 `messages` 或 `file`，`key` 是 sessionId / fileId，`creds` 是本实例当前有效设备凭据的 `[{hash, expiresAt}]`（sha256 hex + 过期毫秒，供中转做拉取鉴权），`cipher` 是信封字节的 base64url。`cipher` 为空串表示**只更新 creds/元数据**、不动已落盘的密文。中转**只存密文、永不持钥、永不解密**；`BLOB_STORE` 关时直接忽略 |
+| 0x1E | blobDelete | 0 | JSON `{scope, key}` 或 `{scope, keys:[...]}` | 宿主让中转删掉已推过的 blob（会话删除 / 归档清空 / 吊销全部）。只删这条隧道自己登记的 instanceId 名下的条目 |
 
 帧编号的事实源是 `protocol-types.js`；保留编号仍要与插件一致，但 Rust 中转不会将这些旧业务帧当成配对或镜像指令处理。中转侧 60 秒收不到 pong 则断开隧道，宿主侧超时为 90 秒。
 
-宿主按 `instanceId` 登记隧道，手机请求按 `X-Dsh-Instance` 分发；不存在的实例回 503。**那台实例在这条中转上留过未过期的迁移记录时**，这句 503 换成 `{"ok":false,"code":"migrated","to":"<url>","error":"that host moved to another relay"}`，并在响应头 `x-dsh-migrated-to` 带同一个地址（HTTP 与手机 WS 桥接同一条判据），手机据此自己切到新中转；没有记录时仍是原来那句 503，一个字都不变。没带实例头时，仅在恰好一台宿主在线时转发，不会在多台宿主间猜测。中转自答 `/healthz`、`/status`、`/api/mobile/v1/health` 和 `/api/mobile/v1/push-token`（推送令牌上报，判据与镜像读同一套设备凭据摘要），其余路径按规则转发；控制台路由见中转服务文档。
+宿主按 `instanceId` 登记隧道，手机请求按 `X-Dsh-Instance` 分发；不存在的实例回 503。**那台实例在这条中转上留过未过期的迁移记录时**，这句 503 换成 `{"ok":false,"code":"migrated","to":"<url>","error":"that host moved to another relay"}`，并在响应头 `x-dsh-migrated-to` 带同一个地址（HTTP 与手机 WS 桥接同一条判据），手机据此自己切到新中转；没有记录时仍是原来那句 503，一个字都不变。没带实例头时，仅在恰好一台宿主在线时转发，不会在多台宿主间猜测。中转自答 `/healthz`、`/status`、`/api/mobile/v1/health`、`/api/mobile/v1/push-token`（推送令牌上报，判据与镜像读同一套设备凭据摘要）和 `GET /api/mobile/v1/blob/<scope>/<key>`（历史 blob 拉取，只在 `BLOB_STORE` 开时认领；关着时照常转发/404），其余路径按规则转发；控制台路由见中转服务文档。

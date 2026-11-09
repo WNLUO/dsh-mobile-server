@@ -465,16 +465,37 @@ fn decode_base64_url(raw: &str) -> Option<Vec<u8>> {
         .ok()
 }
 
-/// `creds` 数组里只认 sha256 hex（64 位十六进制），别的形状整条丢掉。
-fn parse_cred_digests(value: Option<&serde_json::Value>) -> Vec<[u8; 32]> {
+/// `creds` 数组：每项 `{hash, expiresAt}`（与镜像同一形状），也认老的裸 hex 串。
+/// 形状不对的整条丢掉。
+fn parse_creds(value: Option<&serde_json::Value>) -> Vec<crate::blobstore::Cred> {
+    use crate::blobstore::Cred;
     let mut out = Vec::new();
     if let Some(list) = value.and_then(|v| v.as_array()) {
         for item in list {
             if let Some(raw) = item.as_str() {
-                if let Some(digest) = crate::blobstore::decode_hex32(raw) {
-                    out.push(digest);
+                // 老写法：直接是 sha256 hex，没有过期时刻。
+                if let Some(hash) = crate::blobstore::decode_hex32(raw) {
+                    out.push(Cred {
+                        hash,
+                        expires_at: 0,
+                    });
                 }
+                continue;
             }
+            let Some(hash) = item
+                .get("hash")
+                .and_then(|v| v.as_str())
+                .and_then(crate::blobstore::decode_hex32)
+            else {
+                continue;
+            };
+            // 缺 `expiresAt` 按 0（不过期）读，与 `mirror` 同一口径。
+            let expires_at = item
+                .get("expiresAt")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0)
+                .max(0);
+            out.push(Cred { hash, expires_at });
         }
     }
     out
@@ -771,6 +792,7 @@ pub fn handle_tunnel_frame(tunnel: &Arc<Tunnel>, instance_id: &str, frame_type: 
             let Some(console) = crate::console() else { return };
             if action == "delete" {
                 console.store.delete_push_token(instance_id, &device_id);
+                console.store.delete_push_prefs(instance_id, &device_id);
             } else {
                 let platform = value
                     .get("platform")
@@ -823,6 +845,13 @@ pub fn handle_tunnel_frame(tunnel: &Arc<Tunnel>, instance_id: &str, frame_type: 
                 .unwrap_or("")
                 .to_string();
             let interaction = value.get("interaction").cloned();
+            // 事件种类：宿主按它决定这台设备要不要这条通知（completed / failed /
+            // approval / question / plan-review）。老宿主不带 → 空串 → 照发。
+            let push_kind = value
+                .get("pushKind")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             // device_id 为空是合法值：推给该实例全部已登记令牌（宿主 push-notify
             // 就这么发「推给我所有设备」）。只有标题为空才不能成一条通知。
             if title.is_empty() {
@@ -831,6 +860,7 @@ pub fn handle_tunnel_frame(tunnel: &Arc<Tunnel>, instance_id: &str, frame_type: 
             let Some(console) = crate::console() else { return };
             let instance = instance_id.to_string();
             let tokens = console.store.push_tokens_of(&instance);
+            let prefs = console.store.push_prefs_of(&instance);
             tokio::spawn(async move {
                 crate::apns::send_completion(
                     &instance,
@@ -841,6 +871,8 @@ pub fn handle_tunnel_frame(tunnel: &Arc<Tunnel>, instance_id: &str, frame_type: 
                     &session_id,
                     &category,
                     interaction.as_ref(),
+                    &push_kind,
+                    &prefs,
                 )
                 .await;
             });
@@ -889,7 +921,7 @@ pub fn handle_tunnel_frame(tunnel: &Arc<Tunnel>, instance_id: &str, frame_type: 
             else {
                 return;
             };
-            let creds = parse_cred_digests(value.get("creds"));
+            let creds = parse_creds(value.get("creds"));
             // 记录归属取**这条隧道自己登的 instanceId**（与 migrate 同口径），不信任
             // payload 里可能出现的任何「替谁存」字段。
             let Some(instance) = tunnel.instance_id() else {
@@ -899,6 +931,53 @@ pub fn handle_tunnel_frame(tunnel: &Arc<Tunnel>, instance_id: &str, frame_type: 
                 log(format!(
                     "blob put rejected instance={instance} scope={scope} bytes={}",
                     cipher.len()
+                ));
+            }
+        }
+        t::BLOB_DELETE => {
+            // 宿主让中转删掉已推过的 blob（会话删除 / 归档清空 / 吊销全部）。
+            // payload 是 `{scope, key}` 或 `{scope, keys:[...]}`，两种都认。
+            // 归属同样取这条隧道自己登的 instanceId，删不到别家去。
+            let Some(store) = crate::blob_store() else { return };
+            let value = parse_json_value(payload);
+            let scope = value
+                .get("scope")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if scope.is_empty() {
+                return;
+            }
+            let Some(instance) = tunnel.instance_id() else {
+                return;
+            };
+            let mut keys: Vec<String> = Vec::new();
+            if let Some(key) = value.get("key").and_then(|v| v.as_str()) {
+                let key = key.trim();
+                if !key.is_empty() {
+                    keys.push(key.to_string());
+                }
+            }
+            if let Some(list) = value.get("keys").and_then(|v| v.as_array()) {
+                for item in list {
+                    if let Some(key) = item.as_str() {
+                        let key = key.trim();
+                        if !key.is_empty() {
+                            keys.push(key.to_string());
+                        }
+                    }
+                }
+            }
+            let mut removed = 0usize;
+            for key in &keys {
+                if store.delete(&instance, &scope, key) {
+                    removed += 1;
+                }
+            }
+            if removed > 0 {
+                log(format!(
+                    "blob delete instance={instance} scope={scope} removed={removed}"
                 ));
             }
         }

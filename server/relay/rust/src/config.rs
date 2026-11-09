@@ -128,8 +128,10 @@ pub struct Config {
     /// 单条 blob 上限（字节；默认 5MB，超了拒收并保留旧的）。
     ///
     /// 5MB 是「base64 塞进 JSON 帧后仍落在默认 `MAX_FRAME_BYTES`（8MB）之内」的上界：
-    /// 5MB 密文 base64 后约 6.7MB，加帧头与 creds 还有余量。调大到接近 8MB 时，必须
-    /// 同步抬高 `MAX_FRAME_BYTES`，否则这条 blobPut 会被帧解码层当超大帧清掉、静默丢。
+    /// 5MB 密文 base64 后约 6.7MB，加帧头与 creds 还有余量。它和 `MAX_FRAME_BYTES`
+    /// 是硬耦合的，`MAX_BLOB_BYTES * 4/3 + 余量` 超过帧上限时启动就报错（见
+    /// `check_limits`）——**不是静默丢弃**：帧解码层遇到超大帧会断开整条隧道
+    /// （`ws.rs` 的 `FrameTooLarge` 分支），一台宿主的 blobPut 配大了会把它的转发一起带走。
     pub max_blob_bytes: usize,
     /// 每个实例的 blob 总量上限（字节；默认 64MB）。
     pub max_blob_per_instance_bytes: usize,
@@ -205,7 +207,7 @@ fn positive_int(name: &str, fallback: usize, max: usize) -> Result<usize, String
 impl Config {
     /// 从环境变量读配置。任何一项越界都返回 Err，由 main 直接退出。
     pub fn from_env() -> Result<Self, String> {
-        Ok(Config {
+        let config = Config {
             host: env::var("HOST").unwrap_or_else(|_| "0.0.0.0".to_string()),
             port: env::var("PORT")
                 .ok()
@@ -298,7 +300,34 @@ impl Config {
                     from_env
                 }
             },
-        })
+        };
+        config.check_limits()?;
+        Ok(config)
+    }
+
+    /// 项与项之间的约束：单条 blob 上限必须装得进一帧。
+    ///
+    /// 只对「这一项真的会被用到」的组合判：`BLOB_STORE` 关着时 `MAX_BLOB_BYTES` 是个
+    /// 用不上的数，纯转发部署把它和帧上限配成什么样都不该起不来。
+    ///
+    /// 判据是 `MAX_BLOB_BYTES * 4/3 + 余量 <= MAX_FRAME_BYTES`：cipher 进帧前先 base64
+    /// （膨胀 4/3），再套上帧头与 creds 那份 JSON 要留出余量。越界不 clamp——帧解码层
+    /// 遇到超大帧是**断开整条隧道**，配错的表现不是「这条 blobPut 没进去」，而是这台
+    /// 宿主经这条中转的转发全断。
+    fn check_limits(&self) -> Result<(), String> {
+        const FRAME_OVERHEAD: usize = 64 * 1024;
+        if !self.blob_store {
+            return Ok(());
+        }
+        let needed = self.max_blob_bytes.saturating_mul(4) / 3 + FRAME_OVERHEAD;
+        if needed > self.max_frame_bytes {
+            return Err(format!(
+                "MAX_BLOB_BYTES={} 放不进 MAX_FRAME_BYTES={}：base64 后加帧头约需 {} 字节，\
+                 超帧会断开整条隧道；把 MAX_FRAME_BYTES 抬到 {} 以上，或把 MAX_BLOB_BYTES 调小",
+                self.max_blob_bytes, self.max_frame_bytes, needed, needed
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -414,5 +443,28 @@ mod tests {
         assert_eq!(config.max_blob_per_instance_bytes, 64 * 1024 * 1024);
         assert_eq!(config.max_blob_total_bytes, 512 * 1024 * 1024);
         assert_eq!(config.blob_ttl_seconds, 604_800, "blob 默认 7 天");
+    }
+
+    /// 单条 blob 上限必须装得进一帧：装不下是**启动失败**，不是静默丢帧。
+    ///
+    /// 帧解码层遇到超大帧会断开整条隧道（`ws.rs`），所以配错的表现是这台宿主的转发
+    /// 全断，而不是「这条 blobPut 没进去」——必须在加载期挡下来。
+    #[test]
+    fn blob_limit_must_fit_in_a_frame() {
+        let mut config = Config::default();
+        config.blob_store = true;
+        assert!(config.check_limits().is_ok(), "默认 5MB blob / 8MB 帧要能过");
+
+        // 关着时这一项用不上：纯转发部署怎么配都不该起不来。
+        config.blob_store = false;
+        config.max_blob_bytes = 64 * 1024 * 1024;
+        assert!(config.check_limits().is_ok(), "BLOB_STORE 关着时不判这一对");
+
+        config.blob_store = true;
+        assert!(config.check_limits().is_err(), "装不下必须报错，不能 clamp");
+
+        config.max_blob_bytes = 5 * 1024 * 1024;
+        config.max_frame_bytes = 4 * 1024 * 1024;
+        assert!(config.check_limits().is_err(), "帧上限压小时同样要报错");
     }
 }

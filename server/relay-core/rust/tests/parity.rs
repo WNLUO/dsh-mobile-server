@@ -97,6 +97,7 @@ fn encode_frame_matches_js_byte_for_byte() {
         ("pushRegister", t::PUSH_REGISTER),
         ("pushSend", t::PUSH_SEND),
         ("blobPut", t::BLOB_PUT),
+        ("blobDelete", t::BLOB_DELETE),
     ];
 
     for (name, code) in cases {
@@ -162,10 +163,21 @@ fn type_table_matches_js() {
         node_available(),
         "本机没有 node，跨语言对撞无法进行——这组测试存在的意义就是它真的跑了"
     );
-    let script = "console.log(JSON.stringify(Object.entries(t.T).sort((a,b)=>a[1]-b[1])))";
-    let Some(json) = run_node(script) else { return };
-    // 逐个名字确认 Rust 常量与 JS 表一致。
-    let pairs: &[(&str, u8)] = &[
+    // 两边**集合相等**：JS 表里多一个、少一个、或者名字/编号对不上都要红。
+    // 早先是拿每个名字去 JS 输出里找子串，漂移不会红——漏掉的帧根本没人查，
+    // 而漏掉一帧就是一条静默不通的路径。
+    let script = "for (const [name, code] of Object.entries(t.T)) console.log(name + ' ' + code)";
+    let Some(text) = run_node(script) else { return };
+    let mut js: Vec<(String, u8)> = text
+        .lines()
+        .filter_map(|line| {
+            let (name, code) = line.split_once(' ')?;
+            Some((name.to_string(), code.trim().parse::<u8>().ok()?))
+        })
+        .collect();
+    js.sort();
+
+    let mut rust: Vec<(String, u8)> = [
         ("register", t::REGISTER),
         ("registered", t::REGISTERED),
         ("updatePairing", t::UPDATE_PAIRING),
@@ -193,12 +205,14 @@ fn type_table_matches_js() {
         ("revokeAllAck", t::REVOKE_ALL_ACK),
         ("pushRegister", t::PUSH_REGISTER),
         ("pushSend", t::PUSH_SEND),
+        ("migrate", t::MIGRATE),
         ("blobPut", t::BLOB_PUT),
-    ];
-    for (name, code) in pairs {
-        assert!(
-            json.contains(&format!("[\"{name}\",{}]", *code)),
-            "{name} 的编号与 JS 表不一致（Rust 侧是 {code}）"
-        );
-    }
+        ("blobDelete", t::BLOB_DELETE),
+    ]
+    .iter()
+    .map(|(name, code)| (name.to_string(), *code))
+    .collect();
+    rust.sort();
+
+    assert_eq!(rust, js, "帧表两边必须逐条相等（名字与编号都对得上）");
 }

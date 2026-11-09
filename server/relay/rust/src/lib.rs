@@ -149,7 +149,7 @@ mod tests {
             );
         }
         // 反过来：Rust 表里的每一帧都必须在文档里有行。
-        for code in 0x01..=0x1Du8 {
+        for code in 0x01..=0x1Eu8 {
             let name = dsh_relay_protocol::t::name(code).expect("每一帧都要有名字");
             assert!(
                 documented.contains_key(&code),
