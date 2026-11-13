@@ -72,6 +72,25 @@ impl ConsoleResponse {
     }
 }
 
+/// 登录回调 / 登录入口的 `next`：只接受站内相对路径。
+///
+/// 它最后会被拼进 `Location` 响应头，控制字符（尤其 `%0d%0a` 解出来的 CR/LF）能
+/// 借此注入响应头，所以字符集收窄到字母数字与 `/ _ -`，长度也封顶；不合规退回首页。
+fn safe_next_path(next: &str) -> Option<String> {
+    let rest = next.strip_prefix('/')?;
+    if next.len() > 512 {
+        return None;
+    }
+    if rest
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '/' || c == '_' || c == '-')
+    {
+        Some(next.to_string())
+    } else {
+        None
+    }
+}
+
 /// 控制台运行时：配置 + 数据层 + OIDC 客户端。
 pub struct Console {
     pub config: ConsoleConfig,
@@ -81,6 +100,9 @@ pub struct Console {
     license_limiter: Limiter,
     /// 被控端上报的限流。正常是每 5 分钟一条，非常松。
     report_limiter: Limiter,
+    /// 登录入口的限流。`/auth/login` 匿名可调、每次往 `login_states` 插一行，
+    /// 不限的话谁都能拿它把库撑大。
+    login_limiter: Limiter,
 }
 
 impl Console {
@@ -94,6 +116,10 @@ impl Console {
             ),
             report_limiter: Limiter::new(
                 config.report_rate_limit,
+                Duration::from_secs(config.rate_limit_window_seconds),
+            ),
+            login_limiter: Limiter::new(
+                config.license_rate_limit,
                 Duration::from_secs(config.rate_limit_window_seconds),
             ),
             config,
@@ -149,23 +175,22 @@ impl Console {
             .unwrap_or(pathname)
             .to_string();
 
-        // 限流只落在两个**匿名可调**的入口上，而且必须在查库之前判——
+        // 限流只落在**匿名可调**的入口上，而且必须在查库之前判——
         // 限流的意义就是别让人无限次扫库。
-        if method == "POST" {
-            let key = ratelimit::client_key(headers, peer);
-            let limited = match sub.as_str() {
-                "/licenses/verify" | "/licenses/bind" => Some(&self.license_limiter),
-                "/nodes/report" => Some(&self.report_limiter),
-                _ => None,
-            };
-            if let Some(limiter) = limited {
-                if !limiter.allow(&key) {
-                    crate::tunnel::log(format!("限流：{sub} 来自 {key}"));
-                    return ConsoleResponse::json(
-                        429,
-                        json!({ "ok": false, "error": "too many requests, slow down" }),
-                    );
-                }
+        let key = ratelimit::client_key(headers, peer);
+        let limited = match (method, sub.as_str()) {
+            ("POST", "/licenses/verify") | ("POST", "/licenses/bind") => Some(&self.license_limiter),
+            ("POST", "/nodes/report") => Some(&self.report_limiter),
+            ("GET", "/auth/login") => Some(&self.login_limiter),
+            _ => None,
+        };
+        if let Some(limiter) = limited {
+            if !limiter.allow(&key) {
+                crate::tunnel::log(format!("限流：{sub} 来自 {key}"));
+                return ConsoleResponse::json(
+                    429,
+                    json!({ "ok": false, "error": "too many requests, slow down" }),
+                );
             }
         }
 
@@ -217,6 +242,10 @@ impl Console {
         };
 
         if method == "GET" && sub == "/overview" {
+            // 概览里有激活码数、设备数、准入模式这些管理面信息，非管理员不该看到。
+            if !user.is_admin {
+                return ConsoleResponse::json(403, json!({ "ok": false, "error": "admin only" }));
+            }
             let licenses = self.store.list_licenses(500);
             let active = licenses.iter().filter(|l| l.status == "active").count();
             let mut devices = 0;
@@ -260,6 +289,10 @@ impl Console {
 
         // ── 被控端管理（主控端视角）──────────────────────────────
         if method == "GET" && sub == "/nodes" {
+            // 被控端列表带着认领码，只有管理员能看。
+            if !user.is_admin {
+                return ConsoleResponse::json(403, json!({ "ok": false, "error": "admin only" }));
+            }
             let nodes = self.store.list_nodes(200);
             return ConsoleResponse::json(200, json!({ "ok": true, "nodes": nodes }));
         }
@@ -633,6 +666,8 @@ impl Console {
         let state = oidc::random_token(32);
         let nonce = oidc::random_token(16);
         let next = oidc::query_param(query, "next").unwrap_or_else(|| "/".to_string());
+        // 超长或含控制字符的 next 直接丢弃，退回首页——别把它存进库、更别拼进跳转。
+        let next = safe_next_path(&next).unwrap_or_else(|| "/".to_string());
         self.store.save_login_state(&state, &nonce, &pkce.verifier, &next);
         match self
             .oidc
@@ -693,10 +728,14 @@ impl Console {
         };
         let openid = if claims.openid.is_empty() { None } else { Some(claims.openid.as_str()) };
         let unionid = if claims.unionid.is_empty() { None } else { Some(claims.unionid.as_str()) };
+        // 「第一个登录的人是管理员」只在开关打开时成立，且在建号**之前**判「库里还没有用户」：
+        // 否则任何能过 OIDC 登录的人，在新部署上抢在运营者之前登录就能白拿到管理权。
+        let bootstrap_admin = self.config.bootstrap_first_admin && self.store.user_count() == 0;
         let user = self.store.upsert_user(&identity, &claims.name, &claims.picture, openid, unionid);
         // 白名单命中的直接提管理员。白名单比的是原始 sub（部署时填的就是它），
         // 所以这里用 `sub:` 前缀化的形式去对，写配置时按 `sub:<值>` 填。
-        if self.config.admin_subs.iter().any(|s| s == &identity) && !user.is_admin {
+        let by_whitelist = self.config.admin_subs.iter().any(|s| s == &identity);
+        if (bootstrap_admin || by_whitelist) && !user.is_admin {
             self.store.promote_admin(&user.id);
         }
 
@@ -712,7 +751,7 @@ impl Console {
             "{}={}; Path=/; HttpOnly; SameSite=Lax; Max-Age={}",
             self.config.session_cookie, token, self.config.session_ttl_seconds
         );
-        let target = if next_path.starts_with('/') { next_path } else { "/".to_string() };
+        let target = safe_next_path(&next_path).unwrap_or_else(|| "/".to_string());
         let mut response = ConsoleResponse::redirect_to(&format!(
             "{}{}{}",
             self.config.public_base_url, self.config.web_prefix, target
@@ -851,6 +890,7 @@ mod tests {
         Arc::new(Console {
             license_limiter: Limiter::new(config.license_rate_limit, Duration::from_secs(60)),
             report_limiter: Limiter::new(config.report_rate_limit, Duration::from_secs(60)),
+            login_limiter: Limiter::new(config.license_rate_limit, Duration::from_secs(60)),
             oidc: OidcClient::new(&config),
             config,
             store,
@@ -890,7 +930,10 @@ mod tests {
     }
 
     fn admin(console: &Console) -> crate::store::User {
-        console.store.upsert_user("sub-admin", "管理员", "", None, None)
+        // 存储层不再自动提权：测试里显式提，再取回带 is_admin 的记录。
+        let user = console.store.upsert_user("sub-admin", "管理员", "", None, None);
+        console.store.promote_admin(&user.id);
+        console.store.find_user_by_id(&user.id).unwrap_or(user)
     }
 
     fn cookie_for(console: &Console, user: &crate::store::User) -> Vec<(String, String)> {
@@ -1087,6 +1130,7 @@ mod tests {
         let console = Arc::new(Console {
             license_limiter: Limiter::new(3, Duration::from_secs(60)),
             report_limiter: Limiter::new(60, Duration::from_secs(60)),
+            login_limiter: Limiter::new(3, Duration::from_secs(60)),
             oidc: OidcClient::new(&config),
             config,
             store: Store::in_memory().unwrap(),
@@ -1151,6 +1195,24 @@ mod tests {
             );
         }
     }
+
+    /// 回调跳转的 `next` 只认站内相对路径：控制字符（`%0d%0a` 解出来的 CR/LF）
+    /// 会注入 `Location` 响应头，所以不合规一律退回首页。
+    #[test]
+    fn next_path_only_allows_safe_relative_paths() {
+        assert_eq!(safe_next_path("/"), Some("/".to_string()));
+        assert_eq!(
+            safe_next_path("/platform/nodes"),
+            Some("/platform/nodes".to_string())
+        );
+        assert_eq!(safe_next_path("/a_b-c"), Some("/a_b-c".to_string()));
+        // 换行 / 空格 / `%2F` 之外的标点都不是安全字符集，全部退回。
+        assert_eq!(safe_next_path("/a\r\nSet-Cookie: x=1"), None);
+        assert_eq!(safe_next_path("/a b"), None);
+        assert_eq!(safe_next_path("//evil.example"), None);
+        assert_eq!(safe_next_path("https://evil.example"), None);
+        assert_eq!(safe_next_path(&format!("/{}", "a".repeat(600))), None);
+    }
 }
 
 #[cfg(test)]
@@ -1167,6 +1229,7 @@ mod admission_flow {
         let console = Console {
             license_limiter: Limiter::new(config.license_rate_limit, Duration::from_secs(60)),
             report_limiter: Limiter::new(config.report_rate_limit, Duration::from_secs(60)),
+            login_limiter: Limiter::new(config.license_rate_limit, Duration::from_secs(60)),
             oidc: OidcClient::new(&config),
             config,
             store: Store::in_memory().unwrap(),

@@ -52,6 +52,21 @@ fn registered_ack(mirror_cache: bool) -> String {
     format!(r#"{{"ok":true,"mirror":{mirror_cache}}}"#)
 }
 
+/// 常量时间比较两个字节串：逐字节异或累加，长度不同也把整轮走完再判。
+///
+/// 注册密钥是「谁能代表某台宿主」的唯一凭据，用 `==` 会因为提前退出泄露前缀匹配长度。
+/// 手写就够，不为这一处引 `subtle`。
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    let mut diff = a.len() ^ b.len();
+    let len = a.len().max(b.len());
+    for i in 0..len {
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
+        diff |= (x ^ y) as usize;
+    }
+    diff == 0
+}
+
 /// 把已经读过请求头的连接接管成 WebSocket。
 async fn upgrade(reader: WsReader, head: &RequestHead) -> Option<WebSocketStream<PrefixedStream>> {
     // tokio-tungstenite 的 `from_raw_socket` 需要不含请求头的裸流；已经读掉的头不再参与
@@ -380,6 +395,28 @@ pub async fn accept_tunnel(
                     .unwrap_or_default()
                     .trim()
                     .to_string();
+                // 注册密钥：配了就必须对上，否则任何人自报一个 instanceId 就能顶掉真宿主、
+                // 把那个实例的手机请求（含凭据头）全收走。没配就维持原样放行，自建中转按需开启。
+                let expected_secret = crate::config().tunnel_register_secret.clone();
+                if let Some(expected) = expected_secret.as_deref() {
+                    let presented = request
+                        .get("secret")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default();
+                    if !constant_time_eq(presented.as_bytes(), expected.as_bytes()) {
+                        log(format!("tunnel rejected: bad registration secret instance={instance_id}"));
+                        // 文案对齐插件 `status.js` 的中转准入识别（`/bad regist\w*\s+secret/i`）。
+                        tunnel.send_json(
+                            t::WS_ERROR,
+                            0,
+                            r#"{"code":"bad_register_secret","message":"bad registration secret"}"#,
+                        );
+                        // 与版本拒绝同一套收尾：等这一帧真的写出去再断，否则宿主只看到一条
+                        // 裸 1006，分不出「密钥不对」和「网络断了」。
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        break 'tunnel Some("bad register secret".to_string());
+                    }
+                }
                 // 版本门槛：先记账，再看要不要挡。
                 //
                 // **记账排在拦之前**：挡下来的那台也得留在账上，否则手机来问时中转说不出
@@ -431,8 +468,21 @@ pub async fn accept_tunnel(
                     log("tunnel registered without instanceId; it will receive no requests");
                 } else {
                     // 身份也挂到隧道自己身上：按实例记账的地方（迁移台账）只认它，
-                    // 免得一条隧道替别家登记。这里**每次都覆盖**，跟表里的绑定一致。
-                    tunnel.bind_instance(&instance_id);
+                    // 免得一条隧道替别家登记。一条连接只认一个身份——同一连接再报一个
+                    // 不同的 instanceId 直接拒掉，否则它能自报一批实例、把那些手机请求全揽过来。
+                    if !tunnel.bind_instance(&instance_id) {
+                        log(format!(
+                            "tunnel rejected: instance change on one tunnel bound={} got={instance_id}",
+                            tunnel.instance_id().unwrap_or_default()
+                        ));
+                        tunnel.send_json(
+                            t::WS_ERROR,
+                            0,
+                            r#"{"code":"instance_mismatch","message":"一条隧道只能绑定一个实例"}"#,
+                        );
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        break 'tunnel Some("instance change on one tunnel".to_string());
+                    }
                     // 诊断（`DEBUG_SYNC_STATS=1`）：这台实例是哪个出口 IP 来的。
                     // 中转只看得见 nginx 的 loopback 端口，`x-real-ip` 是本机 nginx 覆盖写入的，
                     // 客户端伪造不了（`x-forwarded-for` 那串能随便填，不能当来源）。为的是把
@@ -729,6 +779,16 @@ mod tests {
     fn registered_ack_carries_mirror_flag() {
         assert_eq!(registered_ack(true), r#"{"ok":true,"mirror":true}"#);
         assert_eq!(registered_ack(false), r#"{"ok":true,"mirror":false}"#);
+    }
+
+    /// 注册密钥比较：同值才算过，长度或任一字节不同都必须拒绝。
+    #[test]
+    fn constant_time_eq_matches_only_identical_secrets() {
+        assert!(constant_time_eq(b"s3cret", b"s3cret"));
+        assert!(constant_time_eq(b"", b""));
+        assert!(!constant_time_eq(b"s3cret", b"s3cres"));
+        assert!(!constant_time_eq(b"s3cret", b"s3cret-longer"));
+        assert!(!constant_time_eq(b"s3cret", b""));
     }
 }
 

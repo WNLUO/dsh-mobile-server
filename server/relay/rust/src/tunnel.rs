@@ -124,15 +124,22 @@ impl Tunnel {
         })
     }
 
-    /// 记下这条隧道在 `register` 帧里自报的 instanceId（每次注册都覆盖，最新为准）。
-    pub fn bind_instance(&self, instance_id: &str) {
+    /// 记下这条隧道在 `register` 帧里自报的 instanceId。
+    ///
+    /// 一条隧道只认第一个身份：之后只允许同值重报（宿主断了重发注册就是这样）。
+    /// 返回 `false` 表示这条连接已经绑了别的实例——一条隧道只能是「一台宿主」，
+    /// 否则它自报一批 instanceId 就能把那些实例的手机请求全揽过来。空 id 不算拒绝。
+    pub fn bind_instance(&self, instance_id: &str) -> bool {
         let key = instance_id.trim();
         if key.is_empty() {
-            return;
+            return true;
         }
         let mut current = self.instance_id.lock().unwrap_or_else(|e| e.into_inner());
-        if current.as_str() != key {
+        if current.is_empty() {
             *current = key.to_string();
+            true
+        } else {
+            current.as_str() == key
         }
     }
 
@@ -383,20 +390,14 @@ impl TunnelSlot {
 
     /// 只有当 `tunnel` 仍是这个实例绑着的那条时才移除。
     ///
-    /// 被顶掉的旧连接晚一步走到清理分支时，不能把新连上的那条从表里删掉。
+    /// 被顶掉的旧连接晚一步走到清理分支时，不能把新连上的那条从表里删掉。按隧道指针删掉
+    /// 它绑过的**所有**键：一条隧道只绑一个实例（同连接改绑已被拒），但清理必须删干净，
+    /// 不能只删第一个——否则它曾登记过的键会一直指向一条死隧道。
     pub fn clear_if_current(&self, tunnel: &Arc<Tunnel>) -> bool {
         let mut map = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        // 找出**绑着这条隧道**的那个键再删。不要用「遍历全表删所有指向它的」那种写法：
-        // 一个实例重连之后，旧连接和新连接的清理会各自跑一次，按指针全表匹配容易把
-        // 别人的键一起带走。
-        let key = map
-            .iter()
-            .find(|(_, current)| Arc::ptr_eq(current, tunnel))
-            .map(|(k, _)| k.clone());
-        match key {
-            Some(key) => map.remove(&key).is_some(),
-            None => false,
-        }
+        let before = map.len();
+        map.retain(|_, current| !Arc::ptr_eq(current, tunnel));
+        map.len() != before
     }
 
     /// 代次守卫：**只有确认被取代过**才返回 false。
@@ -551,7 +552,8 @@ mod tests {
 
     /// 正常断开只移除自己，别人的隧道一条都不许动。
     #[test]
-    fn closing_one_tunnel_leaves_others_alone() {        let slot = TunnelSlot::new();
+    fn closing_one_tunnel_leaves_others_alone() {
+        let slot = TunnelSlot::new();
         let a = tunnel();
         let b = tunnel();
         slot.register("inst-a", a.clone());
@@ -561,6 +563,20 @@ mod tests {
         assert!(slot.get_for("inst-a").is_none());
         assert!(Arc::ptr_eq(&slot.get_for("inst-b").unwrap(), &b));
         assert_eq!(slot.online_count(), 1);
+    }
+
+    /// 断开清理按隧道指针删干净：这条连接登记过的所有键都要摘掉，不能只删第一个。
+    #[test]
+    fn clear_removes_every_key_bound_to_the_tunnel() {
+        let slot = TunnelSlot::new();
+        let a = tunnel();
+        slot.register("inst-a", a.clone());
+        slot.register("inst-b", a.clone());
+
+        assert!(slot.clear_if_current(&a));
+        assert!(slot.get_for("inst-a").is_none());
+        assert!(slot.get_for("inst-b").is_none());
+        assert_eq!(slot.online_count(), 0);
     }
 
     #[test]
@@ -581,21 +597,21 @@ mod tests {
         assert_eq!(tunnel.alloc_id(), 2);
     }
 
-    /// instanceId 挂在隧道自己身上：没自报家门前是 None，登记了就按最新一次算。
+    /// instanceId 挂在隧道自己身上：没自报家门前是 None，只认第一个，之后不许改成别的。
     #[test]
     fn tunnel_remembers_its_own_instance_id() {
         let (tx, _rx) = mpsc::channel(8);
         let tunnel = Tunnel::new(tx);
         assert_eq!(tunnel.instance_id(), None, "还没 register 就没有身份");
-        tunnel.bind_instance("   ");
+        assert!(tunnel.bind_instance("   "), "空 id 不算拒绝");
         assert_eq!(tunnel.instance_id(), None, "空 id 等于没登记");
-        tunnel.bind_instance("inst-a");
+        assert!(tunnel.bind_instance("inst-a"));
         assert_eq!(tunnel.instance_id().as_deref(), Some("inst-a"));
-        tunnel.bind_instance(" inst-b ");
+        assert!(!tunnel.bind_instance(" inst-b "), "一条隧道不许改成别的实例");
         assert_eq!(
             tunnel.instance_id().as_deref(),
-            Some("inst-b"),
-            "重报家门以最新一次为准（前后空白不算）"
+            Some("inst-a"),
+            "被拒之后原身份不变（前后空白不算）"
         );
     }
 

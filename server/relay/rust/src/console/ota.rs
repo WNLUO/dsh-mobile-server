@@ -120,6 +120,32 @@ pub fn handle_download(store: &Store, rest: &str) -> ConsoleResponse {
     }
 }
 
+/// 校验发布用的控制面 token。
+///
+/// 没配 token 时整个发布接口关闭（回 403），token 不对回 401。**分派处要在读 body
+/// 之前先调它**：请求体最大 32MB，不先验就会让匿名请求仅凭一个 `Content-Length`
+/// 就触发预分配并读满 32MB。
+pub fn authorize_publish(
+    config: &ConsoleConfig,
+    headers: &[(String, String)],
+) -> Result<(), ConsoleResponse> {
+    if config.ota_control_token.is_empty() {
+        return Err(ConsoleResponse::json(
+            403,
+            json!({ "ok": false, "error": "publishing is disabled (PLATFORM_OTA_CONTROL_TOKEN unset)" }),
+        ));
+    }
+    let provided = headers
+        .iter()
+        .find(|(k, _)| k == "authorization")
+        .map(|(_, v)| v.trim_start_matches("Bearer ").trim().to_string())
+        .unwrap_or_default();
+    if provided != config.ota_control_token {
+        return Err(ConsoleResponse::json(401, json!({ "ok": false, "error": "bad control token" })));
+    }
+    Ok(())
+}
+
 /// 接收一个包。请求体就是 tar.gz 本身，平台/渠道/版本走查询串。
 ///
 /// 鉴权是 Bearer 控制面 token；没配 token 时整个发布接口关闭（下载不受影响）。
@@ -130,19 +156,10 @@ pub fn handle_publish(
     headers: &[(String, String)],
     body: &[u8],
 ) -> ConsoleResponse {
-    if config.ota_control_token.is_empty() {
-        return ConsoleResponse::json(
-            403,
-            json!({ "ok": false, "error": "publishing is disabled (PLATFORM_OTA_CONTROL_TOKEN unset)" }),
-        );
-    }
-    let provided = headers
-        .iter()
-        .find(|(k, _)| k == "authorization")
-        .map(|(_, v)| v.trim_start_matches("Bearer ").trim().to_string())
-        .unwrap_or_default();
-    if provided != config.ota_control_token {
-        return ConsoleResponse::json(401, json!({ "ok": false, "error": "bad control token" }));
+    // 分派处已经先验过一次（为了不预读 body）；这里再验一次只是为了这条函数被
+    // 单独调用时也守住身份，双重校验无害。
+    if let Err(response) = authorize_publish(config, headers) {
+        return response;
     }
 
     let platform = platform_of(query);

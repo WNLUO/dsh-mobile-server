@@ -150,6 +150,15 @@ pub struct Config {
     /// 贵）。中转替宿主升不了级，能做的只是在门口把太旧的挡下来，并让手机说清原因。
     pub min_plugin_version: Option<crate::plugin_versions::PluginVersion>,
 
+    /// 隧道注册密钥（`TUNNEL_REGISTER_SECRET`，**默认空 = 不校验**）。
+    ///
+    /// 配了之后，`register` 帧里自报的 `secret` 必须与它完全相同，否则这条隧道不注册、
+    /// 直接断开。不配就维持原样：任何能连上 `/tunnel` 的人都能自报 instanceId——自建中转
+    /// 想要这一层就配上，插件侧对应配置项是 `registerSecret`（环境变量 `DSH_RELAY_REGISTER_SECRET`）。
+    ///
+    /// 只堵「冒名顶替一台正在服务的真宿主」：密钥是部署方的参数，中转不通过任何接口公开它。
+    pub tunnel_register_secret: Option<String>,
+
     // ── 自动更新 ─────────────────────────────────────────────────
     /// **默认关**。开了之后这台中转会自己升到更新源上的新版本。
     pub self_update: bool,
@@ -288,6 +297,12 @@ impl Config {
                 ),
                 _ => None,
             },
+            // 注册密钥：缺省空串就是「不校验」，与 MIN_PLUGIN_VERSION 同一套「配了才管」的
+            // 口径。原样保留，不去空白——它要和插件发来的那串逐字节相同才放行。
+            tunnel_register_secret: match env::var("TUNNEL_REGISTER_SECRET") {
+                Ok(raw) if !raw.trim().is_empty() => Some(raw),
+                _ => None,
+            },
             // 越界即失败：写 6 小时会被抬成一天的话，配置看着生效、实际不是那个数。
             self_update_interval_seconds: update_interval_seconds()?,
             // 环境变量优先；没设就用编译期烤进来的那组（官方预编译包才有），
@@ -352,6 +367,7 @@ impl Default for Config {
             debug_sse: false,
             debug_sync_stats: false,
             min_plugin_version: None,
+            tunnel_register_secret: None,
             mirror_cache: true,
             mirror_fallback_ms: 2_500,
             blob_store: false,
@@ -443,6 +459,7 @@ mod tests {
         assert_eq!(config.max_blob_per_instance_bytes, 64 * 1024 * 1024);
         assert_eq!(config.max_blob_total_bytes, 512 * 1024 * 1024);
         assert_eq!(config.blob_ttl_seconds, 604_800, "blob 默认 7 天");
+        assert!(config.tunnel_register_secret.is_none(), "注册密钥默认不校验");
     }
 
     /// 单条 blob 上限必须装得进一帧：装不下是**启动失败**，不是静默丢帧。

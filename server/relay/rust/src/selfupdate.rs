@@ -127,6 +127,31 @@ pub struct Binary {
     pub sha256: String,
 }
 
+/// 更新源与二进制下载地址必须是 https。
+///
+/// 清单和它声明的下载地址走同一条网络：允许明文 http，中间人就能把两者一起换掉，
+/// sha256 校验也就形同虚设。本机回环（自己调试用的静态目录）例外。
+fn secure_url(url: &str) -> bool {
+    let lower = url.trim().to_ascii_lowercase();
+    if lower.starts_with("https://") {
+        return true;
+    }
+    let Some(rest) = lower.strip_prefix("http://") else {
+        return false;
+    };
+    // 取 authority 段，去掉可能的 userinfo，再取出主机名（去掉端口 / IPv6 方括号）。
+    let authority = rest
+        .split(|c| c == '/' || c == '?' || c == '#')
+        .next()
+        .unwrap_or("");
+    let authority = authority.rsplit('@').next().unwrap_or(authority);
+    let host = match authority.strip_prefix('[') {
+        Some(inner) => inner.split(']').next().unwrap_or(inner),
+        None => authority.split(':').next().unwrap_or(authority),
+    };
+    host == "127.0.0.1" || host == "localhost" || host == "::1"
+}
+
 /// 从 `latest.json` 的文本里取本架构那一条。
 ///
 /// 校验和长度不对就当作没有——一个格式不对的哈希会让后面永远比对失败，
@@ -167,6 +192,12 @@ pub fn plan(current: &str, manifest_text: &str, arch: &str) -> Result<Plan, Stri
         != std::cmp::Ordering::Greater
     {
         return Ok(Plan::UpToDate);
+    }
+    if !secure_url(&binary.url) {
+        return Err(format!(
+            "latest.json 里的下载地址必须是 https：{}",
+            binary.url
+        ));
     }
     Ok(Plan::Upgrade {
         version: manifest.version,
@@ -507,6 +538,10 @@ async fn first_manifest(
     }
     let mut errors = Vec::new();
     for source in sources {
+        if !secure_url(source) {
+            errors.push(format!("更新源必须是 https（或本机回环）：{source}"));
+            continue;
+        }
         let manifest_url = format!("{}/latest.json", source.trim_end_matches('/'));
         let text = match client.get(&manifest_url).send().await {
             Ok(response) => match response.error_for_status() {
@@ -841,6 +876,28 @@ mod tests {
     fn rejects_broken_json() {
         assert!(plan("0.1.0", "not json", "x86_64").is_err());
         assert!(plan("0.1.0", r#"{"version":"0.2.0"}"#, "x86_64").is_err());
+    }
+
+    /// 更新源与下载地址只认 https（本机回环除外）：明文 http 下清单与二进制
+    /// 走同一条链路，中间人能把两者一起换掉，sha256 就形同虚设。
+    #[test]
+    fn download_urls_must_be_https() {
+        assert!(secure_url("https://example.com/x"));
+        assert!(secure_url("http://127.0.0.1:8080/x"));
+        assert!(secure_url("http://localhost/x"));
+        assert!(secure_url("http://[::1]/x"));
+        assert!(!secure_url("http://example.com/x"));
+        assert!(!secure_url("ftp://example.com/x"));
+
+        let plain = format!(
+            r#"{{"version":"0.2.0","binaries":{{"x86_64":{{"url":"http://e/x","sha256":"{HASH}"}}}}}}"#
+        );
+        assert!(
+            plan("0.1.0", &plain, "x86_64")
+                .unwrap_err()
+                .contains("https"),
+            "明文下载地址必须在决定升级之前就被挡掉"
+        );
     }
 
     #[test]

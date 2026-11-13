@@ -744,6 +744,17 @@ pub async fn handle_owned_path(
                 let Some(console) = crate::console() else {
                     return Ok(false);
                 };
+                // 发布是最贵的一条（整包最大 32MB）：**先验控制面 token 再读 body**，
+                // 免得匿名请求仅凭一个 Content-Length 就让服务端预分配并读满 32MB。
+                // 未配 token / token 不对直接回 401/403，一个字节都不读。
+                if head.method == "POST" && rest == "publish" {
+                    if let Err(response) =
+                        crate::console::ota::authorize_publish(&console.config, &head.headers)
+                    {
+                        respond_console(reader, &response).await?;
+                        return Ok(true);
+                    }
+                }
                 let body = if head.method == "POST" {
                     match read_console_body(reader, head, MAX_OTA_PUBLISH_BODY).await {
                         Ok(body) => body,

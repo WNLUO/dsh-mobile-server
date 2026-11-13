@@ -38,7 +38,9 @@ pub struct ConsoleConfig {
 
     /// 逗号分隔的 OIDC sub 白名单：命中即管理员。
     pub admin_subs: Vec<String>,
-    /// 库里一个管理员都没有时，第一个登录的人自动成为管理员。
+    /// 库里一个用户都没有时，第一个登录的人自动成为管理员。**默认关**：开着的公开中转上，
+    /// 任何能过 OIDC 登录的人抢在运营者之前登录就能白拿管理权。自建首次部署需要时显式设
+    /// `PLATFORM_BOOTSTRAP_FIRST_ADMIN=1`（或用 `PLATFORM_ADMIN_SUBS` 指定管理员）。
     pub bootstrap_first_admin: bool,
 
     // ── 主控端 / 被控端 ───────────────────────────────────────────
@@ -123,7 +125,7 @@ impl ConsoleConfig {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .collect(),
-            bootstrap_first_admin: bool_env("PLATFORM_BOOTSTRAP_FIRST_ADMIN", true),
+            bootstrap_first_admin: bool_env("PLATFORM_BOOTSTRAP_FIRST_ADMIN", false),
             master_url: str_env("PLATFORM_MASTER_URL", "")
                 .trim_end_matches('/')
                 .to_string(),

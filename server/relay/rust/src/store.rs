@@ -393,8 +393,10 @@ impl Store {
 
     /// 微信登录落地。
     ///
-    /// **第一个登录的人是管理员**：这是运营版定下的规则（冷启动首个用户即管理员），
-    /// 沿用不重新发明——中转搭起来之后，搭的人第一个登录就拿到了管理权。
+    /// 建号 / 更新资料，**不自动提权**：是否给管理员由调用方决定（控制台回调按
+    /// `PLATFORM_BOOTSTRAP_FIRST_ADMIN` 开关与 `PLATFORM_ADMIN_SUBS` 白名单显式提）。
+    /// 旧实现里「库里第一个用户无条件成管理员」等于任何能过 OIDC 登录的人，在新部署上
+    /// 抢在运营者之前登录就能白拿管理权——这个判断不该埋在存储层。
     pub fn upsert_user(
         &self,
         subject: &str,
@@ -412,7 +414,6 @@ impl Store {
             );
             return self.find_user_by_id(&existing.id).unwrap_or(existing);
         }
-        let is_first = self.user_count() == 0;
         let id = uuid::Uuid::new_v4().to_string();
         let _ = self.lock().execute(
             "INSERT INTO users (id, subject, display_name, avatar_url, openid, union_id,
@@ -425,7 +426,7 @@ impl Store {
                 avatar_url,
                 openid,
                 union_id,
-                if is_first { 1 } else { 0 },
+                0,
                 ts
             ],
         );
@@ -1376,12 +1377,17 @@ mod tests {
     }
 
     #[test]
-    fn first_user_becomes_admin() {
+    fn upsert_never_auto_promotes() {
+        // 自动提权由调用方（控制台回调）按 bootstrap 开关 / admin 白名单决定，存储层只建号。
+        // 否则任何能过 OIDC 登录的人，在新部署上抢在运营者之前登录就能无条件下拿到管理权。
         let store = Store::in_memory().unwrap();
         let first = store.upsert_user("sub-1", "甲", "", None, None);
-        assert!(first.is_admin, "第一个登录的用户必须是管理员");
+        assert!(!first.is_admin, "建号不自动提管理员");
+        store.promote_admin(&first.id);
+        let promoted = store.find_user_by_id(&first.id).unwrap();
+        assert!(promoted.is_admin, "显式 promote 之后才是管理员");
         let second = store.upsert_user("sub-2", "乙", "", None, None);
-        assert!(!second.is_admin, "后来的用户不该自动成为管理员");
+        assert!(!second.is_admin, "后来的用户也不会自动成为管理员");
     }
 
     #[test]

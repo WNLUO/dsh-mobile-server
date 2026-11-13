@@ -337,6 +337,8 @@ mod tests {
         config.master_url = "https://master.example.com".into();
         let console = crate::console::Console::new(config).unwrap();
         let admin = console.store.upsert_user("sub:admin", "管理员", "", None, None);
+        console.store.promote_admin(&admin.id);
+        let admin = console.store.find_user_by_id(&admin.id).unwrap_or(admin);
         assert!(admin.is_admin);
         assert!(!console.is_mode_controlled(), "一开始没人管");
 
