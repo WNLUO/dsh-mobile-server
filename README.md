@@ -66,6 +66,10 @@ sudo sh install-binary.sh
 - 镜像兜底：`MIRROR_CACHE=0` 关（默认开），`MIRROR_FALLBACK_MS` 调阈值。
 - **历史 blob 存储**：`BLOB_STORE=1` 开（**默认关**），只存密文——中转不持钥、不解密，取密文按设备凭据摘要放行。容量与过期：单条 `MAX_BLOB_BYTES`（默认 5MB）、每实例 `MAX_BLOB_PER_INSTANCE_BYTES`（默认 64MB）、全局 `MAX_BLOB_TOTAL_BYTES`（默认 512MB，超了按更新时间从旧到新淘汰）、`BLOB_TTL_SECONDS`（默认 7 天，读写时顺手清过期）。
 - **iOS 离线推送**：`APNS_KEY` + `APNS_KEY_ID` + `APNS_TEAM_ID` 三样都配才开。`APNS_KEY` 是苹果开发者后台生成的 `.p8` 私钥（Apple Push Notifications authentication key，ES256），接受 PEM 原文或文件路径（支持 `~/`）。不配就是关闭，转发与其它功能零影响，启动日志会有一条 `apns disabled`。
+- **隧道注册密钥**：`TUNNEL_REGISTER_SECRET=...`（**默认不设 = 不校验**）。设了之后，每台宿主的插件必须配同一个值（桌面设置里的「注册密钥」，无头部署可用环境变量 `DSH_RELAY_REGISTER_SECRET`），中转在隧道注册时核对，不一致直接拒绝这条隧道。它的作用是防止别人知道你某台机器的实例号后顶掉它的隧道、把发往那台机器的手机请求连凭据头一起截走。公用中转或多人共用的中转建议设上；不设则维持原样，任何能连上 `/tunnel` 的客户端都能自报实例号。
+- **控制台管理员**：`PLATFORM_ADMIN_SUBS` 是逗号分隔的 OIDC sub 白名单，命中即管理员。`PLATFORM_BOOTSTRAP_FIRST_ADMIN=1` 才允许「库里还没有用户时，第一个登录的人自动成为管理员」，**默认关**。首次自建部署要么显式打开这个开关，要么先把自己的人放进 `PLATFORM_ADMIN_SUBS`，否则登录进去不会自动拿到管理权（`/overview`、`/nodes` 只对管理员开放，节点清单里的认领码非管理员看不到）。
+- **OTA 发布令牌**：`PLATFORM_OTA_CONTROL_TOKEN=...`。发布插件 OTA 包时用 `Authorization: Bearer <token>` 带上它；不配则发布接口关闭（下载不受影响）。令牌在读取上传包体之前就校验，未授权请求不会占用服务端为最大 32MB 包预留的内存。
+- **自更新源**：`SELF_UPDATE_SOURCE`（逗号分隔）只接受 `https://`（本机回环 `127.0.0.1` / `localhost` 可例外，用于调试用的静态目录）。自更新的清单和它声明的二进制地址走同一条链路，明文 `http://` 等于把完整性交给链路上的中间人，因此非 https 的源会被拒绝、记一条错误并跳过。
 
 ## 关于 iOS 离线推送的一个苹果规矩
 
