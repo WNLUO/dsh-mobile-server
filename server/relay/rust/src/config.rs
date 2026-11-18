@@ -92,6 +92,12 @@ pub struct Config {
     pub ws_pong_timeout_ms: u64,
     pub tunnel_heartbeat_ms: u64,
     pub tunnel_pong_timeout_ms: u64,
+    /// 隧道连上后多久必须自报家门（毫秒；`UNREGISTERED_TIMEOUT_MS`，默认 5 秒）。
+    ///
+    /// 只收「连上后一直不说话」的连接：宿主自己的注册超时是 8 秒，正常连接远到不了这道闸。
+    /// 这类空连接白占 fd 与每连接约 150KB 的内存（美国那台实测占全部隧道的三分之一），
+    /// 所以默认从 12 秒压到 5 秒，让设备量上来时槽位周转更快；仍留了宿主 8 秒超时内的余量。
+    pub unregistered_timeout_ms: u64,
 
     pub upstream_header_timeout_ms: u64,
     pub debug_sse: bool,
@@ -246,6 +252,7 @@ impl Config {
             // 两侧超时**刻意不对称**（中转 60s < 宿主 90s）：反了会在网络抖动时互相
             // terminate 并反复重连。
             tunnel_pong_timeout_ms: positive_int("TUNNEL_PONG_TIMEOUT_MS", 60_000, 600_000)? as u64,
+            unregistered_timeout_ms: positive_int("UNREGISTERED_TIMEOUT_MS", 5_000, 60_000)? as u64,
 
             upstream_header_timeout_ms: positive_int("UPSTREAM_HEADER_TIMEOUT_MS", 30_000, 600_000)? as u64,
             debug_sse: matches!(
@@ -363,6 +370,7 @@ impl Default for Config {
             ws_pong_timeout_ms: 60_000,
             tunnel_heartbeat_ms: 15_000,
             tunnel_pong_timeout_ms: 60_000,
+            unregistered_timeout_ms: 5_000,
             upstream_header_timeout_ms: 30_000,
             debug_sse: false,
             debug_sync_stats: false,
@@ -452,6 +460,7 @@ mod tests {
         assert_eq!(config.max_sse_per_device, 3);
         assert_eq!(config.tunnel_heartbeat_ms, 15_000);
         assert_eq!(config.tunnel_pong_timeout_ms, 60_000);
+        assert_eq!(config.unregistered_timeout_ms, 5_000, "空连接默认 5 秒收尾");
         assert!(config.mirror_cache, "离线镜像兜底默认开");
         assert_eq!(config.mirror_fallback_ms, 2_500, "弱网兜底默认 2.5 秒");
         assert!(!config.blob_store, "历史 blob 仓库默认关");

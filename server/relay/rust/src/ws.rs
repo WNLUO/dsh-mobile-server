@@ -25,13 +25,12 @@ use crate::tunnel::{log, Pending, Tunnel, TunnelSlot, WsPending};
 
 type WsReader = BufReader<TcpStream>;
 
-/// 连上之后多久必须自报家门。
+/// 连上之后多久必须自报家门（`UNREGISTERED_TIMEOUT_MS`，见 `Config`）。
 ///
-/// 宿主的注册超时是 8 秒（`relay/tunnel.js` 的 `start()`），这里留 12 秒：正常连接远到不了
-/// 这一步，只有「连上以后再也没说话」的那种会撞上。不设这道闸的话，这类连接要一直挂到
-/// 对端 RST 才收尾——2026-10-27 美国那台实测一天 4,738 条（占全部隧道连接的三分之一），
-/// 全是连接重置，白占槽位、白刷一行日志。
-const UNREGISTERED_TIMEOUT_MS: u64 = 12_000;
+/// 宿主的注册超时是 8 秒（`relay/tunnel.js` 的 `start()`），正常连接远到不了这一步；
+/// 这道闸只收「连上以后再也没说话」的那种，不设的话它们要一直挂到对端 RST 才收尾——
+/// 2026-10-27 美国那台实测一天 4,738 条（占全部隧道连接的三分之一），白占槽位与内存。
+/// 默认 5 秒：这台 960MB 的机器每连接约占 150KB，空连接多留一秒就是白占一份内存。
 
 /// 累计有多少条隧道「连上但始终没自报家门」。给 `/status` 看趋势。
 static UNREGISTERED_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
@@ -299,7 +298,9 @@ pub async fn accept_tunnel(
     let mut kill_rx = kill_rx;
     // 注册截止时刻：过了点还挂着 `unregistered` 就直接收尾。守卫让注册成功的连接再也
     // 不走这个分支（`instance_label` 一改，条件就为假）。
-    let registration_deadline = tokio::time::sleep(Duration::from_millis(UNREGISTERED_TIMEOUT_MS));
+    let registration_deadline = tokio::time::sleep(Duration::from_millis(
+        crate::config().unregistered_timeout_ms,
+    ));
     tokio::pin!(registration_deadline);
     // 带标签是为了两件事能真的「断开」而不是只跳出内层 for：准入被拒要在外层的
     // 读循环上收尾（原来那个裸 break 只跳出 for，隧道其实还连着）。
