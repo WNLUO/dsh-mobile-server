@@ -1,4 +1,4 @@
 {
-  "version": "0.1.25",
-  "binaries": {"x86_64":{"url":"https://github.com/WNLUO/dsh-mobile-server/releases/download/rust-v0.1.25/dsh-relay-linux-x86_64","sha256":"092c432722d4903dfd7915eb89471db356e697297e8d98ee6d783dd06c3d1c8f"},"aarch64":{"url":"https://github.com/WNLUO/dsh-mobile-server/releases/download/rust-v0.1.25/dsh-relay-linux-aarch64","sha256":"86ab751b36af0bee4ac0f74a4f21a4981307d4d93b53b947730f469e9c44d9e0"}}
+  "version": "0.1.27",
+  "binaries": {"x86_64":{"url":"https://github.com/WNLUO/dsh-mobile-server/releases/download/rust-v0.1.27/dsh-relay-linux-x86_64","sha256":"285d82746f85f768fdabf6230f9751cb46af405fe89646affd710985784e0de7"},"aarch64":{"url":"https://github.com/WNLUO/dsh-mobile-server/releases/download/rust-v0.1.27/dsh-relay-linux-aarch64","sha256":"c96049bb3e649720ad0bf63d807937b5c21d0f911e27fe69dc85cce27211f8c1"}}
 }
