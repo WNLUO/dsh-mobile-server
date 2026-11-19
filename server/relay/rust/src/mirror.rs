@@ -1,4 +1,4 @@
-//! 宿主离线时的最后一份镜像。
+//! 保存宿主离线镜像并校验共享的设备凭据摘要与过期容差。
 //!
 //! 中转原本是纯转发：宿主那条隧道不在，手机上来的读就只有一句 503，侧栏空着、什么都
 //! 点不开。弱网与宿主刚断线的时候，人看到的正是这个。这里把宿主**自己推上来**的那份
@@ -479,6 +479,14 @@ pub(crate) fn credential_ok(instance_id: &str, credentials: &[String]) -> bool {
     creds_allow(&creds, credentials, now as i64)
 }
 
+/// 宿主与中转绝对时钟的最大容差。
+pub(crate) const CREDENTIAL_CLOCK_SKEW_MS: i64 = 5 * 60 * 1000;
+
+/// 宿主签发的绝对时间允许五分钟跨机偏差；摘要移除（撤销）仍立即生效。
+pub(crate) fn credential_not_expired(expires_at: i64, now_ms: i64) -> bool {
+    expires_at == 0 || expires_at > now_ms.saturating_sub(CREDENTIAL_CLOCK_SKEW_MS)
+}
+
 /// 这些出示的凭据里有没有一个能读缓存。`creds` 为空（老插件还没推摘要）一律不放行。
 ///
 /// 逐个按 `credentials` 的顺序试，第一个命中就放行——调用方把
@@ -497,7 +505,7 @@ pub(crate) fn creds_allow(creds: &[(String, i64)], credentials: &[String], now_m
         let digest = sha256_hex(raw);
         let hit = creds
             .iter()
-            .any(|(hash, expires_at)| (*expires_at == 0 || *expires_at > now_ms) && *hash == digest);
+            .any(|(hash, expires_at)| credential_not_expired(*expires_at, now_ms) && *hash == digest);
         if hit {
             return true;
         }
@@ -734,6 +742,20 @@ mod tests {
         // 连字段都不带的那一版同样不给。
         assert!(remember(instance, &payload(serde_json::Value::Null)));
         assert_eq!(lookup(instance, ListKind::Sessions, "", &presented(&["cred_live"])), None);
+    }
+
+    #[test]
+    fn credential_clock_tolerance_is_bounded_and_never_revives_removed_hashes() {
+        let now = 1_000_000;
+        let expiry = now - CREDENTIAL_CLOCK_SKEW_MS + 1;
+        let credentials = presented(&["clock-cred"]);
+        let creds = vec![(sha256_hex("clock-cred"), expiry)];
+        assert!(creds_allow(&creds, &credentials, now));
+        assert!(!creds_allow(&creds, &credentials, now + 1), "容差边界到点必须过期");
+        assert!(!creds_allow(&[], &credentials, now), "撤销摘要不受时钟容差影响");
+        assert!(!creds_allow(&creds, &presented(&["other-cred"]), now));
+        assert!(credential_not_expired(0, i64::MAX));
+        assert!(credential_not_expired(i64::MAX, i64::MAX));
     }
 
     #[test]

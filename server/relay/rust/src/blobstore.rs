@@ -1,4 +1,4 @@
-//! 加密历史 blob 的落盘仓库（`BLOB_STORE` 打开时才存在）。
+//! 管理加密历史 blob 的落盘、容量与设备凭据访问。
 //!
 //! 电脑侧用一把实例历史密钥（HK）把会话正文/文件封成密文 blob，经隧道推到这里；
 //! 手机离线时来拉密文，用自己那份 HK 解开。**中转不持钥、不解密**：这一层只认识
@@ -54,7 +54,7 @@ pub struct Cred {
 impl Cred {
     /// 到 `now_ms` 这一刻还有效吗。
     fn valid_at(&self, now_ms: i64) -> bool {
-        self.expires_at == 0 || self.expires_at > now_ms
+        crate::mirror::credential_not_expired(self.expires_at, now_ms)
     }
 }
 
@@ -739,7 +739,16 @@ mod tests {
         assert!(store.get("inst-1", "file", "file-1", b"device-a").is_some());
     }
 
-    /// 凭据带 `expiresAt`：过了那一刻就再也读不出来；没有这个字段的旧条目照旧有效。
+    #[test]
+    fn credential_expiry_uses_the_same_bounded_clock_tolerance_as_mirror() {
+        let credential = Cred { hash: [0; 32], expires_at: 1_000_000 };
+        assert!(credential.valid_at(1_000_000 + crate::mirror::CREDENTIAL_CLOCK_SKEW_MS - 1));
+        assert!(!credential.valid_at(1_000_000 + crate::mirror::CREDENTIAL_CLOCK_SKEW_MS));
+        assert!(!credential.valid_at(i64::MAX));
+        assert!(Cred { hash: [0; 32], expires_at: 0 }.valid_at(i64::MAX));
+    }
+
+    /// 凭据带 `expiresAt`：过期超过容差后拒绝；没有这个字段的旧条目照旧有效。
     #[test]
     fn expired_credential_stops_reading() {
         let store = BlobStore::new(temp_root(), 1024, 4096, 8192, 3600).unwrap();

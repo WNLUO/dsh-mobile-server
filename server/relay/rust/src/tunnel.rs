@@ -1,11 +1,11 @@
-//! 隧道状态与帧发送（单条隧道）。
+//! 管理单条隧道、转发名额与双向排队字节预算。
 //!
 //! 自建版没有实例注册、没有多租户：同一时刻只服务**一条**宿主隧道。新连接直接取代旧的
 //! ——旧连接上还挂着的请求会被一次性失败掉，否则那些帧会继续被处理进一个已经没人要的
 //! 隧道对象（旧连接可能还停在 OPEN，收不到 close 帧）。
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -47,6 +47,9 @@ pub struct HttpPending {
     pub idle_deadline: Option<Instant>,
     /// 收到 httpHead 之后，响应数据从这里推给写回手机的任务。
     pub chunk_tx: Option<mpsc::Sender<crate::proxy::ResponseChunk>>,
+    /// 包含正在写 socket 的那一块，写完才归还预算。
+    pub queued_bytes: Arc<AtomicUsize>,
+    pub paused_at: Option<Instant>,
 }
 
 #[derive(Debug, Clone)]
@@ -58,14 +61,52 @@ pub struct HttpHead {
 #[derive(Debug)]
 pub struct WsPending {
     /// 发往手机 WS 的通道。手机那条连接由它自己的任务读。
-    pub phone_tx: mpsc::Sender<Message>,
+    pub phone_tx: Option<mpsc::Sender<Message>>,
     /// 宿主已经确认 wsOpen。
     pub ready: bool,
     /// 未就绪时暂存的上行帧与字节数。
     pub queued: Vec<Message>,
     pub queued_bytes: usize,
+    /// 下行队列与正在写出的数据共用一个字节预算。
+    pub phone_bytes: Arc<AtomicUsize>,
     /// 手机 WS 的最近活跃时间（半开判定用）。
     pub last_active: Instant,
+}
+
+impl WsPending {
+    /// 未收到 wsOpen 的上行数据只暂存；调用者持有 pending 锁以保序。
+    pub fn queue_upstream(&mut self, message: Message, limit: usize) -> bool {
+        let bytes = message.len();
+        if self.queued.len() >= 256 || bytes > limit.saturating_sub(self.queued_bytes) {
+            return false;
+        }
+        self.queued_bytes += bytes;
+        self.queued.push(message);
+        true
+    }
+
+    pub fn send_phone(&self, message: Message, limit: usize) -> bool {
+        let Some(sender) = self.phone_tx.as_ref() else { return false };
+        let bytes = ws_data_bytes(&message);
+        if bytes > limit.saturating_sub(self.phone_bytes.load(Ordering::SeqCst)) {
+            return false;
+        }
+        self.phone_bytes.fetch_add(bytes, Ordering::SeqCst);
+        if sender.try_send(message).is_err() {
+            self.phone_bytes.fetch_sub(bytes, Ordering::SeqCst);
+            return false;
+        }
+        true
+    }
+}
+
+/// ping / pong / close 不占数据预算，仍受通道槽位限制。
+pub(crate) fn ws_data_bytes(message: &Message) -> usize {
+    match message {
+        Message::Text(text) => text.len(),
+        Message::Binary(bytes) => bytes.len(),
+        _ => 0,
+    }
 }
 
 /// 一条隧道的运行时状态。
@@ -201,6 +242,17 @@ impl Tunnel {
         sse_count < config.max_sse_connections
     }
 
+    /// HTTP 的容量检查与插入同锁，已终局但写端未退出的条目仍占名额。
+    pub fn reserve_http(&self, config: &Config, id: u64, entry: HttpPending) -> bool {
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        let sse = pending.values().filter(|item| matches!(item, Pending::Http(http) if http.sse)).count();
+        if self.is_closed() || pending.len() >= config.max_pending || (entry.sse && sse >= config.max_sse_connections) {
+            return false;
+        }
+        pending.insert(id, Pending::Http(entry));
+        true
+    }
+
     /// 在途请求数与其中的 SSE 条数。
     ///
     /// 容量拒绝必须把这两个数写进日志：只回一句 429，事后完全看不出是哪个闸满了、被谁
@@ -214,17 +266,17 @@ impl Tunnel {
         (pending.len(), sse)
     }
 
-    /// 这台设备当前占着的 SSE 条数。
+    /// 这台设备仍在接收上游数据的 SSE 条数；收尾条目仍计入总容量。
     pub fn sse_count_of_device(&self, device: &str) -> usize {
         self.pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .values()
-            .filter(|entry| matches!(entry, Pending::Http(http) if http.sse && http.device.as_deref() == Some(device)))
+            .filter(|entry| matches!(entry, Pending::Http(http) if http.sse && http.chunk_tx.is_some() && http.device.as_deref() == Some(device)))
             .count()
     }
 
-    /// 顶掉这台设备**最早**占着的那条 SSE，把它的出口交还给调用方去收尾。
+    /// 终止这台设备最早的活动 SSE，写端排空前仍保留容量占位。
     ///
     /// 「新流顶旧流」的取舍：一台设备上同时开两条 SSE 本来就不正常（正常是会话流 +
     /// 设备级流各一条），它到底是「旧的那条已经死了但没人知道」还是「两个页面在看不同的
@@ -245,15 +297,28 @@ impl Tunnel {
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         let victim = pending
             .iter()
-            .filter(|(_, entry)| matches!(entry, Pending::Http(http) if http.sse && http.device.as_deref() == Some(device)))
+            .filter(|(_, entry)| matches!(entry, Pending::Http(http) if http.sse && http.chunk_tx.is_some() && http.device.as_deref() == Some(device)))
             .map(|(id, _)| *id)
             .min()?;
-        match pending.remove(&victim) {
-            Some(Pending::Http(mut http)) => {
+        match pending.get_mut(&victim) {
+            Some(Pending::Http(http)) => {
+                http.paused_at = None;
+                http.idle_deadline = None;
                 Some((victim, http.chunk_tx.take(), http.head_tx.take()))
             }
             _ => None,
         }
+    }
+
+    /// 手机 WS 的名额检查与占位在同一把锁里完成，握手期间也占名额。
+    pub fn reserve_ws(&self, config: &Config, id: u64, entry: WsPending) -> bool {
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        let ws_count = pending.values().filter(|entry| matches!(entry, Pending::Ws(_))).count();
+        if self.is_closed() || pending.len() >= config.max_pending || ws_count >= config.max_ws_connections {
+            return false;
+        }
+        pending.insert(id, Pending::Ws(entry));
+        true
     }
 
     /// 当前挂着的手机 WS 条数。
@@ -458,6 +523,25 @@ mod tests {
     fn tunnel() -> Arc<Tunnel> {
         let (tx, _rx) = mpsc::channel::<OutFrame>(16);
         Tunnel::new(tx)
+    }
+
+    #[test]
+    fn ws_reservation_enforces_both_limits_without_adding_rejected_entries() {
+        let tunnel = tunnel();
+        let entry = || {
+            let (phone_tx, _phone_rx) = mpsc::channel(1);
+            WsPending { phone_tx: Some(phone_tx), ready: false, queued: Vec::new(), queued_bytes: 0,
+                phone_bytes: Arc::new(AtomicUsize::new(0)), last_active: Instant::now() }
+        };
+        let mut config = Config::default();
+        config.max_ws_connections = 1;
+        assert!(tunnel.reserve_ws(&config, 1, entry()));
+        assert!(!tunnel.reserve_ws(&config, 2, entry()));
+        assert_eq!(tunnel.ws_count(), 1);
+        config.max_ws_connections = 2;
+        config.max_pending = 1;
+        assert!(!tunnel.reserve_ws(&config, 3, entry()));
+        assert_eq!(tunnel.capacity_snapshot().0, 1);
     }
 
     /// 公用中转的核心：多台宿主同时在线，各占一个实例，谁都不顶掉谁。
@@ -690,6 +774,8 @@ mod tests {
                 header_deadline: None,
                 idle_deadline: None,
                 chunk_tx: Some(chunk_tx),
+                queued_bytes: Arc::new(AtomicUsize::new(0)),
+                paused_at: None,
             }),
         );
         chunk_rx
@@ -722,7 +808,9 @@ mod tests {
         assert!(chunk.is_some(), "已经开始写的流要把出口交出来收尾");
         assert!(head.is_some(), "还没等到 httpHead 的流同样要能就地失败");
 
-        assert_eq!(tunnel.sse_count_of_device("phone-a"), 1, "只少了自己那一条");
+        assert_eq!(tunnel.sse_count_of_device("phone-a"), 1, "只少了自己那条活动流");
+        assert_eq!(tunnel.capacity_snapshot().0, 3, "旧写端退出前占位不能释放");
+        assert!(tunnel.pending.lock().unwrap().contains_key(&victim));
         assert_eq!(tunnel.sse_count_of_device("phone-b"), 1, "别人那条原样在");
         assert!(tunnel.take_oldest_sse_of_device("phone-c").is_none(), "没占过的设备无可顶");
     }

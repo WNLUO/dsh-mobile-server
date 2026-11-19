@@ -1,23 +1,20 @@
-//! HTTP 转发与隧道帧分发。
+//! 按字节预算转发 HTTP / WS 帧，并管理上传错误与响应暂停恢复。
 //!
-//! 两个方向都有背压，落点不同：
-//!   - 响应方向（宿主 → 手机）：这里用有界 `mpsc` 把宿主帧接到写任务。写队列满（手机读得
-//!     慢）时**不再静默丢 chunk**，而是立即取消上游并结束这条响应，让客户端按 Last-Event-ID
-//!     重连补齐。丢一帧 SSE 等于在手机上留一个永远补不回来的洞，比断开重连糟得多。
-//!   - 请求方向（手机 → 宿主）：隧道积压到高水位就停读手机的请求体，回落到低水位再继续。
-//!     协议上不需要新帧，宿主只是暂时收不到 `httpBody`。
+//! 响应方向达到高水位先暂停宿主，回落后恢复；字节硬上限与暂停期限负责收尾。
+//! 请求方向在隧道积压时停读手机，请求体读空闲超时后取消上游并明确回包。
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
 use dsh_relay_protocol::{t, Payload};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::config::Config;
 use crate::headers::pick_forward_headers;
-use crate::http::{respond_json, respond_text, respond_with, RequestHead};
+use crate::http::{read_body_bytes, read_limited_line, respond_json, respond_text, respond_with, RequestHead, MAX_HEADER_LINE_BYTES};
 use crate::tunnel::{
     log, HttpHead, HttpPending, Pending, Tunnel, TunnelSlot, TUNNEL_FEED_HIGH_WATER_BYTES,
 };
@@ -106,11 +103,43 @@ fn log_sse_superseded(device: &str, victim: u64, limit: usize) {
 /// 隧道积压回落到低水位之后恢复读的轮询间隔。
 const FEED_RESUME_POLL_MS: u64 = 25;
 
-/// 一次 HTTP 请求的响应用途（从宿主推回来的数据写向手机）。
-struct ResponseSink<'a> {
-    writer: &'a mut (dyn tokio::io::AsyncWrite + Unpin + Send),
-    started: bool,
-    paused: bool,
+/// 每条响应的硬预算与高低水位；高水位后为已经在途的帧保留余量。
+const MAX_RESPONSE_QUEUE_BYTES: usize = 16 * 1024 * 1024;
+const RESPONSE_PAUSE_HIGH_BYTES: usize = MAX_RESPONSE_QUEUE_BYTES / 4;
+const RESPONSE_RESUME_LOW_BYTES: usize = MAX_RESPONSE_QUEUE_BYTES / 8;
+const RESPONSE_PAUSE_TIMEOUT_MS: u64 = 25_000;
+
+fn response_expired(entry: &HttpPending) -> bool {
+    if entry.chunk_tx.is_none() { return false; }
+    match entry.paused_at {
+        Some(at) => at.elapsed() >= std::time::Duration::from_millis(RESPONSE_PAUSE_TIMEOUT_MS),
+        None => entry.idle_deadline.map(|deadline| Instant::now() >= deadline).unwrap_or(false),
+    }
+}
+
+/// 取走唯一响应出口表示上游已终局；容量由持有 socket 的写任务最后释放。
+fn take_response_sender(tunnel: &Arc<Tunnel>, id: u64) -> Option<mpsc::Sender<ResponseChunk>> {
+    let mut pending = tunnel.pending.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(Pending::Http(entry)) = pending.get_mut(&id) else { return None };
+    entry.paused_at = None;
+    entry.idle_deadline = None;
+    drop(entry.head_tx.take());
+    entry.chunk_tx.take()
+}
+
+fn resume_response_if_drained(tunnel: &Arc<Tunnel>, id: u64) {
+    let mut pending = tunnel.pending.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(Pending::Http(entry)) = pending.get_mut(&id) {
+        if entry.paused_at.is_some()
+            && entry.queued_bytes.load(Ordering::SeqCst) <= RESPONSE_RESUME_LOW_BYTES
+            && entry.chunk_tx.as_ref().map(|sender| sender.capacity() >= 192).unwrap_or(false)
+        {
+            if tunnel.send_empty(t::HTTP_RESUME, id) {
+                entry.paused_at = None;
+                entry.idle_deadline = Some(Instant::now() + std::time::Duration::from_millis(SSE_IDLE_TIMEOUT_MS));
+            }
+        }
+    }
 }
 
 
@@ -146,13 +175,24 @@ pub async fn proxy_request(
     // 宿主在阈值内没回头就先拿它答手机，见下面 HeadOutcome::Mirror。
     fallback: Option<crate::mirror::Fallback>,
 ) -> std::io::Result<()> {
-    let config = crate::config();
+    proxy_request_with_config(reader, head, tunnel, fallback, crate::config()).await
+}
+
+async fn proxy_request_with_config(
+    reader: BufReader<TcpStream>, head: RequestHead, tunnel: Arc<Tunnel>,
+    fallback: Option<crate::mirror::Fallback>, config: Arc<Config>,
+) -> std::io::Result<()> {
     let is_sse = head
         .header("accept")
         .map(|v| v.to_ascii_lowercase().contains("text/event-stream"))
         .unwrap_or(false);
 
     let mut reader = reader;
+    // 声明长度已超限时不占名额、不发上游请求，也不继续读取上传。
+    if head.content_length().map(|length| length > config.max_body_bytes).unwrap_or(false) {
+        respond_text(&mut reader, 413, "body too large").await?;
+        return Ok(());
+    }
     // 这台流是哪台设备开的：`X-Dsh-Device` 是 App 一直就带的路由标识（非秘密），
     // 它缺了就退回设备凭据原文当键。两者都没有的老客户端统一落进同一个「未知设备」,
     // 于是它们之间也会互相顶——宁可让未知那堆彼此顶，也不让一台失控设备吃光全场名额。
@@ -186,7 +226,20 @@ pub async fn proxy_request(
         }
     }
 
-    if !tunnel.has_capacity(&config, is_sse) {
+    let id = tunnel.alloc_id();
+    let (head_tx, head_rx) = oneshot::channel::<HttpHead>();
+    let (chunk_tx, chunk_rx) = mpsc::channel::<ResponseChunk>(256);
+    let response_bytes = Arc::new(AtomicUsize::new(0));
+    if !tunnel.reserve_http(&config, id, HttpPending {
+        sse: is_sse,
+        device: device_key.clone(),
+        head_tx: Some(head_tx),
+        header_deadline: Some(Instant::now() + std::time::Duration::from_millis(config.upstream_header_timeout_ms)),
+        idle_deadline: None,
+        chunk_tx: Some(chunk_tx),
+        queued_bytes: response_bytes.clone(),
+        paused_at: None,
+    }) {
         // 拒绝要留痕：这条 429 过去一个字都不写，事后只能靠「响应长度 29」猜它是不是我们回的。
         // 两个数一起打，才能分辨是「长连接名额被占满」还是「在途请求堆住了」。
         let (pending, sse) = tunnel.capacity_snapshot();
@@ -208,29 +261,17 @@ pub async fn proxy_request(
         return Ok(());
     }
 
-    let id = tunnel.alloc_id();
-    let (head_tx, head_rx) = oneshot::channel::<HttpHead>();
-    // 响应通道必须**在插入 pending 时就建好**：宿主收到 httpRequest 后会立刻回
-    // httpHead、紧接着就推 chunk，而我们此刻还在等 head_rx。等 httpHead 之后再建
-    // 通道，这中间到达的数据会被整段丢掉（表现为响应体是空的）。
-    let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::channel::<ResponseChunk>(256);
-    {
-        let mut pending = tunnel.pending.lock().unwrap_or_else(|e| e.into_inner());
-        pending.insert(
-            id,
-            Pending::Http(HttpPending {
-                sse: is_sse,
-                device: device_key.clone(),
-                head_tx: Some(head_tx),
-                header_deadline: Some(
-                    Instant::now() + std::time::Duration::from_millis(config.upstream_header_timeout_ms),
-                ),
-                idle_deadline: None,
-                chunk_tx: Some(chunk_tx.clone()),
-            }),
-        );
-    }
+    // 整个连接、队列与在写数据都释放后才归还容量。
+    let result = proxy_reserved_request(reader, head, tunnel.clone(), id, head_rx, chunk_rx, response_bytes, fallback, config).await;
+    tunnel.pending.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
+    result
+}
 
+async fn proxy_reserved_request(
+    mut reader: BufReader<TcpStream>, head: RequestHead, tunnel: Arc<Tunnel>, id: u64,
+    head_rx: oneshot::Receiver<HttpHead>, chunk_rx: mpsc::Receiver<ResponseChunk>, response_bytes: Arc<AtomicUsize>,
+    fallback: Option<crate::mirror::Fallback>, config: Arc<Config>,
+) -> std::io::Result<()> {
     // 立即发请求头（不等 body 攒完）；body 随后以 httpBody 帧流式转发。
     // 路径按 `routed_path()` 取：中转前面有部署前缀时要先剥掉，否则宿主收到
     // `/relay/api/mobile/v1/...` 这种它不认识的路径，一律 404。
@@ -247,31 +288,13 @@ pub async fn proxy_request(
     })
     .to_string();
     if !tunnel.send_json(t::HTTP_REQUEST, id, &request_json) {
-        tunnel
-            .pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&id);
+        take_response_sender(&tunnel, id);
         respond_text(&mut reader, 502, "tunnel unavailable").await?;
         return Ok(());
     }
 
-    // 请求体：按 content-length 或读到结束，分块发进去。
-    if !forward_request_body(&mut reader, &head, &tunnel, id, &config).await {
-        // 上行堵死在这条隧道上。先摘掉条目再回包：宿主迟到的响应会落进一个没人等的坑，
-        // 静默丢弃比直接失败更难查。也不要再等一次响应头超时 —— 那只是把同一个失败拖长一倍。
-        let still_ours = {
-            let mut pending = tunnel.pending.lock().unwrap_or_else(|e| e.into_inner());
-            pending.remove(&id).is_some()
-        };
-        if still_ours {
-            tunnel.send_empty(t::HTTP_CANCEL, id);
-        }
-        if tunnel.is_closed() {
-            respond_text(&mut reader, 502, "tunnel unavailable").await?;
-        } else {
-            respond_text(&mut reader, 504, "upstream request stall").await?;
-        }
+    // body 错误由这条连接直接答复，不再等待已经取消的宿主回 httpHead。
+    if !forward_body_or_respond(&mut reader, &head, &tunnel, id, &config).await? {
         return Ok(());
     }
 
@@ -300,22 +323,16 @@ pub async fn proxy_request(
         HeadOutcome::Head(head) => head,
         HeadOutcome::Timeout => {
             // 超时或宿主没回：通知宿主取消，给手机 504。
-            let still_ours = {
-                let mut pending = tunnel.pending.lock().unwrap_or_else(|e| e.into_inner());
-                pending.remove(&id).is_some()
-            };
+            let still_ours = take_response_sender(&tunnel, id).is_some();
             if still_ours {
                 tunnel.send_empty(t::HTTP_CANCEL, id);
-                respond_text(&mut reader, 504, "upstream response timeout").await?;
             }
+            respond_text(&mut reader, 504, "upstream response timeout").await?;
             return Ok(());
         }
         HeadOutcome::Mirror => {
-            // 条目先摘掉：宿主那份响应之后到了也没有等待方，会被静默丢弃；再通知它收尾。
-            let still_ours = {
-                let mut pending = tunnel.pending.lock().unwrap_or_else(|e| e.into_inner());
-                pending.remove(&id).is_some()
-            };
+            // 停止上游入队；手机应答完成前仍保留容量占位。
+            let still_ours = take_response_sender(&tunnel, id).is_some();
             if still_ours {
                 tunnel.send_empty(t::HTTP_CANCEL, id);
             }
@@ -339,11 +356,30 @@ pub async fn proxy_request(
     };
 
     // 写响应头，然后把后续 chunk 流式写给手机。
-    let chunked = write_response_head(&mut reader, &http_head).await?;
+    let chunked = match write_response_head(&mut reader, &http_head).await {
+        Ok(chunked) => chunked,
+        Err(error) => {
+            if take_response_sender(&tunnel, id).is_some() { tunnel.send_empty(t::HTTP_CANCEL, id); }
+            return Err(error);
+        }
+    };
 
-    // 从这里开始由响应侧接管：等待 httpChunk / httpEnd，由 `handle_tunnel_frame` 把数据
-    // 推进同一个连接。为此需要把连接的所有权交给一个专门的写任务，主流程在这里等它结束。
-    let writer_stream = reader.into_inner();
+    write_response_body(reader.into_inner(), &tunnel, id, chunk_rx, response_bytes, chunked).await;
+    Ok(())
+}
+
+async fn write_response_body<W: tokio::io::AsyncWrite + Unpin>(
+    stream: W, tunnel: &Arc<Tunnel>, id: u64, chunk_rx: mpsc::Receiver<ResponseChunk>,
+    response_bytes: Arc<AtomicUsize>, chunked: bool,
+) {
+    write_response_chunks(stream, tunnel, id, chunk_rx, response_bytes, chunked).await;
+    tunnel.pending.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
+}
+
+async fn write_response_chunks<W: tokio::io::AsyncWrite + Unpin>(
+    mut stream: W, tunnel: &Arc<Tunnel>, id: u64, mut chunk_rx: mpsc::Receiver<ResponseChunk>,
+    response_bytes: Arc<AtomicUsize>, chunked: bool,
+) {
     {
         let mut pending = tunnel.pending.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(Pending::Http(entry)) = pending.get_mut(&id) {
@@ -361,27 +397,19 @@ pub async fn proxy_request(
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                resume_response_if_drained(&tunnel, id);
                 let expired = {
                     let pending = tunnel.pending.lock().unwrap_or_else(|e| e.into_inner());
                     match pending.get(&id) {
-                        Some(Pending::Http(entry)) => entry
-                            .idle_deadline
-                            .map(|deadline| Instant::now() >= deadline)
-                            .unwrap_or(false),
+                        Some(Pending::Http(entry)) if entry.chunk_tx.is_some() => response_expired(entry),
+                        Some(Pending::Http(_)) => return,
                         _ => return, // 条目已经不在（正常结束或被取消），哨兵退休
                     }
                 };
                 if expired {
-                    log(format!("sse idle timeout: id={id} (>{SSE_IDLE_TIMEOUT_MS}ms)"));
-                    let sender = {
-                        let mut pending = tunnel.pending.lock().unwrap_or_else(|e| e.into_inner());
-                        match pending.remove(&id) {
-                            Some(Pending::Http(entry)) => entry.chunk_tx,
-                            _ => None,
-                        }
-                    };
-                    tunnel.send_empty(t::HTTP_CANCEL, id);
-                    if let Some(sender) = sender {
+                    log(format!("response idle/pause timeout: id={id}"));
+                    if let Some(sender) = take_response_sender(&tunnel, id) {
+                        tunnel.send_empty(t::HTTP_CANCEL, id);
                         send_terminal(sender, ResponseChunk::End);
                     }
                     return;
@@ -390,18 +418,18 @@ pub async fn proxy_request(
         })
     };
 
-    let mut stream = writer_stream;
     while let Some(chunk) = chunk_rx.recv().await {
         match chunk {
             ResponseChunk::Data(bytes) => {
-                let wire = if chunked { encode_chunk(&bytes) } else { bytes.clone() };
+                let wire = if chunked { Some(encode_chunk(&bytes)) } else { None };
+                let wire = wire.as_deref().unwrap_or(&bytes);
                 // 一次写最多等 `SSE_WRITE_STALL_MS`：手机手里攥着 socket 却不再读的时候，
                 // 内核发送缓冲一满，`write_all` 就不动了；上游心跳照样在来，空闲哨兵永远
                 // 不会判它死。超时即视为这条流已经没人要了，取消上游、放手。
                 let stalled = tokio::time::timeout(
                     std::time::Duration::from_millis(SSE_WRITE_STALL_MS),
                     async {
-                        stream.write_all(&wire).await?;
+                        stream.write_all(wire).await?;
                         stream.flush().await
                     },
                 )
@@ -415,39 +443,30 @@ pub async fn proxy_request(
                         true
                     }
                 };
+                response_bytes.fetch_sub(bytes.len(), Ordering::SeqCst);
                 if failed {
-                    tunnel.send_empty(t::HTTP_CANCEL, id);
+                    if take_response_sender(tunnel, id).is_some() { tunnel.send_empty(t::HTTP_CANCEL, id); }
                     break;
                 }
+                resume_response_if_drained(&tunnel, id);
             }
-            ResponseChunk::End => {
-                if chunked {
-                    let _ = stream.write_all(b"0\r\n\r\n").await;
-                    let _ = stream.flush().await;
-                }
-                let _ = stream.shutdown().await;
-                break;
-            }
-            ResponseChunk::Error(message) => {
-                let body = format!("upstream error: {message}");
-                if chunked {
-                    let _ = stream.write_all(&encode_chunk(body.as_bytes())).await;
-                    let _ = stream.write_all(b"0\r\n\r\n").await;
-                } else {
-                    let _ = stream.write_all(body.as_bytes()).await;
-                }
-                let _ = stream.shutdown().await;
+            ResponseChunk::End | ResponseChunk::Error(_) => {
+                let _ = tokio::time::timeout(std::time::Duration::from_millis(SSE_WRITE_STALL_MS), async {
+                    if let ResponseChunk::Error(message) = chunk {
+                        let body = format!("upstream error: {message}");
+                        if chunked { stream.write_all(&encode_chunk(body.as_bytes())).await?; }
+                        else { stream.write_all(body.as_bytes()).await?; }
+                    }
+                    if chunked { stream.write_all(b"0\r\n\r\n").await?; }
+                    stream.flush().await?;
+                    stream.shutdown().await
+                }).await;
                 break;
             }
         }
     }
 
-    tunnel
-        .pending
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(&id);
-    Ok(())
+    _sentinel.abort();
 }
 
 /// 解析控制帧的 JSON 载荷（失败返回空对象），对齐 JS 侧 `parseJson`。
@@ -545,188 +564,150 @@ async fn wait_for_feed_room(tunnel: &Arc<Tunnel>, timeout_ms: u64) -> bool {
     }
 }
 
-/// 把请求体分块送进隧道，带请求方向背压。
-///
-/// 返回 false 表示上行已经堵死在这条隧道上，调用方要就地结束这次请求。
+#[derive(Debug, PartialEq)]
+enum ForwardBodyError {
+    TooLarge,
+    Timeout,
+    Malformed,
+    Upstream,
+}
+
+impl ForwardBodyError {
+    fn response(&self, tunnel_closed: bool) -> (u16, &'static str) {
+        match self {
+            Self::TooLarge => (413, "body too large"),
+            Self::Timeout => (408, "request body timeout"),
+            Self::Malformed => (400, "incomplete or malformed request body"),
+            Self::Upstream if tunnel_closed => (502, "tunnel unavailable"),
+            Self::Upstream => (504, "upstream request stall"),
+        }
+    }
+}
+
+async fn forward_body_or_respond(
+    reader: &mut BufReader<TcpStream>, head: &RequestHead, tunnel: &Arc<Tunnel>, id: u64, config: &Config,
+) -> std::io::Result<bool> {
+    match forward_request_body(reader, head, tunnel, id, config).await {
+        Ok(()) => Ok(true),
+        Err(error) => {
+            if take_response_sender(tunnel, id).is_some() { tunnel.send_empty(t::HTTP_CANCEL, id); }
+            let (status, message) = error.response(tunnel.is_closed());
+            respond_text(reader, status, message).await?;
+            Ok(false)
+        }
+    }
+}
+
+fn body_io_error(error: std::io::Error) -> ForwardBodyError {
+    if error.kind() == std::io::ErrorKind::TimedOut { ForwardBodyError::Timeout } else { ForwardBodyError::Malformed }
+}
+
+async fn send_body_part(tunnel: &Arc<Tunnel>, id: u64, bytes: &[u8], config: &Config) -> Result<(), ForwardBodyError> {
+    if !tunnel.send_frame(t::HTTP_BODY, id, Payload::Bytes(bytes.to_vec())) {
+        return Err(ForwardBodyError::Upstream);
+    }
+    if !wait_for_feed_room(tunnel, config.upstream_header_timeout_ms).await {
+        return Err(ForwardBodyError::Upstream);
+    }
+    Ok(())
+}
+
+/// 按声明长度、chunked 或 EOF 读体；读超时、超限和半截断开各有明确结果。
 async fn forward_request_body(
     reader: &mut BufReader<TcpStream>,
     head: &RequestHead,
     tunnel: &Arc<Tunnel>,
     id: u64,
     config: &Config,
-) -> bool {
-    let mut sent_bytes = 0usize;
+) -> Result<(), ForwardBodyError> {
     let mut buffer = vec![0u8; 64 * 1024];
-
-    // chunked 请求体：按 chunk 逐个解出来转发。手机 App 发的是普通请求，但任何
-    // 中转/代理层都可能改写成 chunked，不解码就是死锁（见下面的说明）。
     if head.is_chunked() {
         return forward_chunked_body(reader, tunnel, id, config, &mut buffer).await;
     }
-
     if let Some(length) = head.content_length() {
-        if length == 0 {
-            tunnel.send_frame(t::HTTP_BODY, id, Payload::Empty);
-            return true;
+        if length > config.max_body_bytes {
+            return Err(ForwardBodyError::TooLarge);
         }
         let mut remaining = length;
         while remaining > 0 {
             let want = buffer.len().min(remaining);
-            let read = match reader.read(&mut buffer[..want]).await {
-                Ok(0) => break,
-                Ok(n) => n,
-                Err(_) => {
-                    tunnel.send_empty(t::HTTP_CANCEL, id);
-                    return true;
-                }
-            };
+            let read = read_body_bytes(reader, &mut buffer[..want], config.upstream_header_timeout_ms).await.map_err(body_io_error)?;
+            if read == 0 {
+                return Err(ForwardBodyError::Malformed);
+            }
             remaining -= read;
-            sent_bytes += read;
-            if sent_bytes > config.max_body_bytes {
-                tunnel.send_empty(t::HTTP_CANCEL, id);
-                return true;
-            }
-            if !tunnel.send_frame(t::HTTP_BODY, id, Payload::Bytes(buffer[..read].to_vec())) {
-                tunnel.send_empty(t::HTTP_CANCEL, id);
-                return true;
-            }
-            // 请求方向背压：积压到高水位就等回落到低水位再继续读。
-            if !wait_for_feed_room(tunnel, config.upstream_header_timeout_ms).await {
-                tunnel.send_empty(t::HTTP_CANCEL, id);
-                return false;
-            }
+            send_body_part(tunnel, id, &buffer[..read], config).await?;
         }
-        tunnel.send_frame(t::HTTP_BODY, id, Payload::Empty);
-        return true;
-    }
-
-    // 没有 content-length 的头。GET / HEAD / DELETE / OPTIONS 这些方法按规范就没有请求体，
-    // 直接发结束帧即可——**不能**落到下面「读到连接关闭」的分支：客户端在等响应、
-    // 我们在等它的字节，两边互等就是死锁（同一个连接上也永远等不到 EOF）。
-    let bodyless = matches!(head.method.as_str(), "GET" | "HEAD" | "DELETE" | "OPTIONS" | "TRACE");
-    if bodyless && !head.is_chunked() {
-        tunnel.send_frame(t::HTTP_BODY, id, Payload::Empty);
-        return true;
-    }
-
-    // 没有 content-length 但可能带体的方法：读到连接关闭为止，受 max_body_bytes 约束。
-    loop {
-        match reader.read(&mut buffer).await {
-            Ok(0) => break,
-            Ok(n) => {
-                sent_bytes += n;
-                if sent_bytes > config.max_body_bytes {
-                    respond_body_too_large(tunnel, id);
-                    return true;
-                }
-                if !tunnel.send_frame(t::HTTP_BODY, id, Payload::Bytes(buffer[..n].to_vec())) {
-                    tunnel.send_empty(t::HTTP_CANCEL, id);
-                    return true;
-                }
+    } else if !matches!(head.method.as_str(), "GET" | "HEAD" | "DELETE" | "OPTIONS" | "TRACE") {
+        let mut total = 0usize;
+        loop {
+            let read = read_body_bytes(reader, &mut buffer, config.upstream_header_timeout_ms).await.map_err(body_io_error)?;
+            if read == 0 { break; }
+            if read > config.max_body_bytes.saturating_sub(total) {
+                return Err(ForwardBodyError::TooLarge);
             }
-            Err(_) => {
-                tunnel.send_empty(t::HTTP_CANCEL, id);
-                return true;
-            }
+            total += read;
+            send_body_part(tunnel, id, &buffer[..read], config).await?;
         }
     }
-    tunnel.send_frame(t::HTTP_BODY, id, Payload::Empty);
-    true
+    if !tunnel.send_empty(t::HTTP_BODY, id) { return Err(ForwardBodyError::Upstream); }
+    Ok(())
 }
 
-/// 解码 `Transfer-Encoding: chunked` 的请求体并逐块转发。
-///
-/// 格式：`<十六进制长度>[;扩展]\r\n<数据>\r\n` … `0\r\n\r\n`。
-/// 解出来的数据不带长度前缀，直接作为 httpBody 帧送给宿主。
+async fn read_chunk_line(reader: &mut BufReader<TcpStream>, config: &Config) -> Result<String, ForwardBodyError> {
+    let line = tokio::time::timeout(
+        std::time::Duration::from_millis(config.upstream_header_timeout_ms),
+        read_limited_line(reader, MAX_HEADER_LINE_BYTES),
+    ).await.map_err(|_| ForwardBodyError::Timeout)?.map_err(body_io_error)?;
+    if line.is_empty() { return Err(ForwardBodyError::Malformed); }
+    Ok(line)
+}
+
+/// 解码代理可能生成的 chunked 上传；chunk 扩展与 trailer 也受字节/时间上限约束。
 async fn forward_chunked_body(
     reader: &mut BufReader<TcpStream>,
     tunnel: &Arc<Tunnel>,
     id: u64,
     config: &Config,
     buffer: &mut [u8],
-) -> bool {
+) -> Result<(), ForwardBodyError> {
     let mut total = 0usize;
     loop {
-        // 读一行 chunk 头。
-        let mut line = String::new();
-        match tokio::io::AsyncBufReadExt::read_line(reader, &mut line).await {
-            Ok(0) => {
-                tunnel.send_empty(t::HTTP_CANCEL, id);
-                return true;
-            }
-            Ok(_) => {}
-            Err(_) => {
-                tunnel.send_empty(t::HTTP_CANCEL, id);
-                return true;
-            }
-        }
+        let line = read_chunk_line(reader, config).await?;
         let size_text = line.trim().split(';').next().unwrap_or("").trim();
-        let size = match usize::from_str_radix(size_text, 16) {
-            Ok(size) => size,
-            Err(_) => {
-                tunnel.send_empty(t::HTTP_CANCEL, id);
-                return true;
-            }
-        };
-        if size == 0 {
-            // 末尾可能还有 trailer，读到空行为止。
-            loop {
-                let mut trailer = String::new();
-                match tokio::io::AsyncBufReadExt::read_line(reader, &mut trailer).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => {
-                        if trailer.trim().is_empty() {
-                            break;
-                        }
-                    }
-                }
-            }
-            tunnel.send_frame(t::HTTP_BODY, id, Payload::Empty);
-            return true;
+        let size = usize::from_str_radix(size_text, 16).map_err(|_| ForwardBodyError::Malformed)?;
+        if size > config.max_body_bytes.saturating_sub(total) {
+            return Err(ForwardBodyError::TooLarge);
         }
-
+        if size == 0 {
+            let mut trailer_bytes = 0usize;
+            loop {
+                let trailer = read_chunk_line(reader, config).await?;
+                trailer_bytes += trailer.len();
+                if trailer_bytes > 256 * 1024 { return Err(ForwardBodyError::Malformed); }
+                if trailer.trim().is_empty() { break; }
+            }
+            if !tunnel.send_empty(t::HTTP_BODY, id) { return Err(ForwardBodyError::Upstream); }
+            return Ok(());
+        }
         let mut remaining = size;
         while remaining > 0 {
             let want = buffer.len().min(remaining);
-            let read = match reader.read(&mut buffer[..want]).await {
-                Ok(0) => {
-                    tunnel.send_empty(t::HTTP_CANCEL, id);
-                    return true;
-                }
-                Ok(n) => n,
-                Err(_) => {
-                    tunnel.send_empty(t::HTTP_CANCEL, id);
-                    return true;
-                }
-            };
+            let read = read_body_bytes(reader, &mut buffer[..want], config.upstream_header_timeout_ms).await.map_err(body_io_error)?;
+            if read == 0 { return Err(ForwardBodyError::Malformed); }
             remaining -= read;
             total += read;
-            if total > config.max_body_bytes {
-                tunnel.send_empty(t::HTTP_CANCEL, id);
-                return true;
-            }
-            if !tunnel.send_frame(t::HTTP_BODY, id, Payload::Bytes(buffer[..read].to_vec())) {
-                tunnel.send_empty(t::HTTP_CANCEL, id);
-                return true;
-            }
-            if !wait_for_feed_room(tunnel, config.upstream_header_timeout_ms).await {
-                tunnel.send_empty(t::HTTP_CANCEL, id);
-                return false;
-            }
+            send_body_part(tunnel, id, &buffer[..read], config).await?;
         }
-        // 吃掉 chunk 后面的 CRLF。
         let mut crlf = [0u8; 2];
-        let _ = reader.read_exact(&mut crlf).await;
+        let mut read = 0;
+        while read < crlf.len() {
+            let count = read_body_bytes(reader, &mut crlf[read..], config.upstream_header_timeout_ms).await.map_err(body_io_error)?;
+            if count == 0 { return Err(ForwardBodyError::Malformed); }
+            read += count;
+        }
+        if crlf != *b"\r\n" { return Err(ForwardBodyError::Malformed); }
     }
-}
-
-fn respond_body_too_large(tunnel: &Arc<Tunnel>, id: u64) {
-    tunnel.send_empty(t::HTTP_CANCEL, id);
-    tunnel
-        .pending
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(&id);
 }
 
 /// 写响应头。宿主给的状态与头原样带过去（逐跳头过滤后）。
@@ -999,7 +980,7 @@ pub fn handle_tunnel_frame(tunnel: &Arc<Tunnel>, instance_id: &str, frame_type: 
             let sender = {
                 let mut pending = tunnel.pending.lock().unwrap_or_else(|e| e.into_inner());
                 match pending.get_mut(&id) {
-                    Some(Pending::Http(entry)) => entry.head_tx.take(),
+                    Some(Pending::Http(entry)) if entry.chunk_tx.is_some() => entry.head_tx.take(),
                     _ => None,
                 }
             };
@@ -1008,48 +989,43 @@ pub fn handle_tunnel_frame(tunnel: &Arc<Tunnel>, instance_id: &str, frame_type: 
             }
         }
         t::HTTP_CHUNK => {
-            // 注意：**不要**在入队前刷新 idle_deadline。旧实现先刷新再 try_send，通道满、
-            // chunk 被丢掉时哨兵被喂饱，30s 空闲判定永远不触发，手机端就永久缺一段。
-            let sender = {
-                let pending = tunnel.pending.lock().unwrap_or_else(|e| e.into_inner());
-                match pending.get(&id) {
-                    Some(Pending::Http(entry)) => entry.chunk_tx.clone(),
-                    _ => None,
+            let failed = {
+                let mut pending = tunnel.pending.lock().unwrap_or_else(|e| e.into_inner());
+                let Some(Pending::Http(entry)) = pending.get_mut(&id) else { return };
+                let Some(sender) = entry.chunk_tx.as_ref() else { return };
+                let queued = entry.queued_bytes.load(Ordering::SeqCst);
+                if payload.len() > MAX_RESPONSE_QUEUE_BYTES.saturating_sub(queued) {
+                    true
+                } else {
+                    entry.queued_bytes.fetch_add(payload.len(), Ordering::SeqCst);
+                    match sender.try_send(ResponseChunk::Data(payload.to_vec())) {
+                        Ok(()) => {
+                            entry.idle_deadline = Some(Instant::now() + std::time::Duration::from_millis(SSE_IDLE_TIMEOUT_MS));
+                            // 条数水位只照顾大量小帧，内存上限始终按字节判。
+                            if entry.paused_at.is_none() && (queued + payload.len() >= RESPONSE_PAUSE_HIGH_BYTES || sender.capacity() <= 64) {
+                                if tunnel.send_empty(t::HTTP_PAUSE, id) {
+                                    entry.paused_at = Some(Instant::now());
+                                }
+                            }
+                            false
+                        }
+                        Err(_) => {
+                            entry.queued_bytes.fetch_sub(payload.len(), Ordering::SeqCst);
+                            true
+                        }
+                    }
                 }
             };
-            if let Some(sender) = sender {
-                match sender.try_send(ResponseChunk::Data(payload.to_vec())) {
-                    Ok(()) => {
-                        let mut pending = tunnel.pending.lock().unwrap_or_else(|e| e.into_inner());
-                        if let Some(Pending::Http(entry)) = pending.get_mut(&id) {
-                            entry.idle_deadline =
-                                Some(Instant::now() + std::time::Duration::from_millis(SSE_IDLE_TIMEOUT_MS));
-                        }
-                    }
-                    Err(mpsc::error::TrySendError::Full(_)) => {
-                        // 手机读得慢：不能继续静默丢帧。停掉上游、结束响应，由客户端重连重放。
-                        log(format!("response backpressure id={id}: closing response"));
-                        let removed = {
-                            let mut pending = tunnel.pending.lock().unwrap_or_else(|e| e.into_inner());
-                            pending.remove(&id).is_some()
-                        };
-                        if removed {
-                            tunnel.send_empty(t::HTTP_CANCEL, id);
-                        }
-                        send_terminal(sender, ResponseChunk::End);
-                    }
-                    Err(mpsc::error::TrySendError::Closed(_)) => {}
+            if failed {
+                log(format!("response byte/slot limit id={id}: closing response"));
+                if let Some(sender) = take_response_sender(tunnel, id) {
+                    tunnel.send_empty(t::HTTP_CANCEL, id);
+                    send_terminal(sender, ResponseChunk::End);
                 }
             }
         }
         t::HTTP_END => {
-            let sender = {
-                let mut pending = tunnel.pending.lock().unwrap_or_else(|e| e.into_inner());
-                match pending.remove(&id) {
-                    Some(Pending::Http(entry)) => entry.chunk_tx,
-                    _ => None,
-                }
-            };
+            let sender = take_response_sender(tunnel, id);
             if let Some(sender) = sender {
                 send_terminal(sender, ResponseChunk::End);
             }
@@ -1061,91 +1037,77 @@ pub fn handle_tunnel_frame(tunnel: &Arc<Tunnel>, instance_id: &str, frame_type: 
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let sender = {
-                let mut pending = tunnel.pending.lock().unwrap_or_else(|e| e.into_inner());
-                match pending.remove(&id) {
-                    Some(Pending::Http(entry)) => entry.chunk_tx,
-                    _ => None,
-                }
-            };
+            let sender = take_response_sender(tunnel, id);
             if let Some(sender) = sender {
                 send_terminal(sender, ResponseChunk::Error(message));
             }
         }
         t::WS_OPEN => {
-            let mut pending = tunnel.pending.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(Pending::Ws(entry)) = pending.get_mut(&id) {
-                entry.ready = true;
-                // 排空未就绪时暂存的上行帧。
-                for message in entry.queued.drain(..) {
-                    let _ = entry.phone_tx.try_send(message);
-                }
+            let failed = {
+                let mut pending = tunnel.pending.lock().unwrap_or_else(|e| e.into_inner());
+                let Some(Pending::Ws(entry)) = pending.get_mut(&id) else { return };
+                if entry.phone_tx.is_none() { return; }
+                // 同一把锁中按原顺序送回宿主，不能把上行数据投给 phone_tx。
+                let queued = std::mem::take(&mut entry.queued);
                 entry.queued_bytes = 0;
-            }
+                let sent = queued.into_iter().all(|message| ws::send_phone_frame(tunnel, id, message));
+                entry.ready = sent;
+                !sent
+            };
+            if failed { close_phone_ws(tunnel, id, 1013, "phone ws backpressure"); }
         }
         t::WS_TEXT | t::WS_BINARY => {
-            let sender = {
+            let failed = {
                 let pending = tunnel.pending.lock().unwrap_or_else(|e| e.into_inner());
-                match pending.get(&id) {
-                    Some(Pending::Ws(entry)) => Some(entry.phone_tx.clone()),
-                    _ => None,
-                }
-            };
-            let Some(sender) = sender else { return };
-            let message = if frame_type == t::WS_TEXT {
-                tokio_tungstenite::tungstenite::Message::Text(
-                    String::from_utf8_lossy(payload).into_owned().into(),
-                )
-            } else {
-                tokio_tungstenite::tungstenite::Message::Binary(payload.to_vec().into())
-            };
-            match sender.try_send(message) {
-                Ok(()) => {}
-                Err(mpsc::error::TrySendError::Closed(_)) => {}
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    // 手机读不动了。WS 上丢一帧就是丢了重建不回来的一段，客户端既不知道、
-                    // 宿主也没有补拉的路径 —— 换来的是「少了一截、没人发现」。整条关掉让它
-                    // 重连，比在这条连接上继续少数据强。
-                    log(format!("phone ws backpressure id={id}: closing ws"));
-                    let closed = {
-                        let mut pending = tunnel.pending.lock().unwrap_or_else(|e| e.into_inner());
-                        pending.remove(&id).is_some()
+                let Some(Pending::Ws(entry)) = pending.get(&id) else { return };
+                if entry.phone_tx.is_none() { return; }
+                let limit = crate::config().max_ws_queue_bytes;
+                if payload.len() > limit.saturating_sub(entry.phone_bytes.load(Ordering::SeqCst)) {
+                    true
+                } else {
+                    let message = if frame_type == t::WS_TEXT {
+                        tokio_tungstenite::tungstenite::Message::Text(String::from_utf8_lossy(payload).into_owned().into())
+                    } else {
+                        tokio_tungstenite::tungstenite::Message::Binary(payload.to_vec().into())
                     };
-                    if closed {
-                        tunnel.send_frame(
-                            t::WS_CLOSE,
-                            id,
-                            Payload::Bytes(dsh_relay_protocol::encode_close_payload(
-                                1013,
-                                "phone ws backpressure",
-                            )),
-                        );
-                    }
-                    // 通道本身是满的，这个关闭帧排不进去：等出空位再送，送到即收尾。
-                    tokio::spawn(async move {
-                        let _ = sender
-                            .send(ws::close_frame(1013, "phone ws backpressure"))
-                            .await;
-                    });
+                    !entry.send_phone(message, limit)
                 }
-            }
+            };
+            if failed { close_phone_ws(tunnel, id, 1013, "phone ws backpressure"); }
         }
         t::WS_CLOSE => {
-            let pending = tunnel.pending.lock().unwrap_or_else(|e| e.into_inner());
-            let message = ws::close_from_tunnel_payload(payload);
-            if let Some(Pending::Ws(entry)) = pending.get(&id) {
-                let _ = entry.phone_tx.try_send(message);
+            if let Some(sender) = take_phone_sender(tunnel, id) {
+                send_ws_terminal(sender, ws::close_from_tunnel_payload(payload));
             }
         }
-        t::WS_ERROR => {
-            let pending = tunnel.pending.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(Pending::Ws(entry)) = pending.get(&id) {
-                let _ = entry.phone_tx.try_send(ws::close_frame(1011, "upstream ws error"));
-            }
-        }
+        t::WS_ERROR => close_phone_ws(tunnel, id, 1011, "upstream ws error"),
         _ => {
             // 未知帧按 Node 版的做法静默丢弃（不报错、不回执）。
         }
+    }
+}
+
+fn send_ws_terminal(sender: mpsc::Sender<tokio_tungstenite::tungstenite::Message>, message: tokio_tungstenite::tungstenite::Message) {
+    match sender.try_send(message) {
+        Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
+        Err(mpsc::error::TrySendError::Full(message)) => {
+            tokio::spawn(async move { let _ = sender.send(message).await; });
+        }
+    }
+}
+
+fn take_phone_sender(tunnel: &Arc<Tunnel>, id: u64) -> Option<mpsc::Sender<tokio_tungstenite::tungstenite::Message>> {
+    let mut pending = tunnel.pending.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(Pending::Ws(entry)) = pending.get_mut(&id) else { return None };
+    entry.queued.clear();
+    entry.queued_bytes = 0;
+    entry.phone_tx.take()
+}
+
+pub(crate) fn close_phone_ws(tunnel: &Arc<Tunnel>, id: u64, code: u16, reason: &str) {
+    if let Some(sender) = take_phone_sender(tunnel, id) {
+        tunnel.send_frame(t::WS_CLOSE, id, Payload::Bytes(dsh_relay_protocol::encode_close_payload(code, reason)));
+        send_ws_terminal(sender, ws::close_frame(code, reason));
     }
 }
 
@@ -1154,21 +1116,18 @@ pub fn handle_tunnel_frame(tunnel: &Arc<Tunnel>, instance_id: &str, frame_type: 
 /// 不清理的后果是这些条目永久留在 pending 里：HTTP 响应永不结束、手机 WS 停在 OPEN，
 /// 客户端只能等自己的超时。
 pub fn fail_all_pending(tunnel: &Arc<Tunnel>, reason: &str) {
-    let entries: Vec<(u64, Pending)> = {
-        let mut pending = tunnel.pending.lock().unwrap_or_else(|e| e.into_inner());
-        pending.drain().collect()
-    };
-    for (_, entry) in entries {
+    let mut pending = tunnel.pending.lock().unwrap_or_else(|e| e.into_inner());
+    for entry in pending.values_mut() {
         match entry {
             Pending::Http(http) => {
                 // 已经发出响应头的，把错误写进响应体收尾。
-                if let Some(sender) = http.chunk_tx {
-                    let _ = sender.try_send(ResponseChunk::Error(format!("upstream unavailable: {reason}")));
+                if let Some(sender) = http.chunk_tx.take() {
+                    send_terminal(sender, ResponseChunk::Error(format!("upstream unavailable: {reason}")));
                 }
                 // 还在等响应头的，用一个「上游不可用」的头叫醒它——它会把这次请求结束成
                 // 502。**不能**只 drop 发送端：那会被上层当成「宿主没回」，最后报 504，
                 // 而这里不是超时，是隧道没了。
-                if let Some(sender) = http.head_tx {
+                if let Some(sender) = http.head_tx.take() {
                     let _ = sender.send(HttpHead {
                         status: 502,
                         headers: vec![(
@@ -1179,7 +1138,9 @@ pub fn fail_all_pending(tunnel: &Arc<Tunnel>, reason: &str) {
                 }
             }
             Pending::Ws(ws) => {
-                let _ = ws.phone_tx.try_send(ws::close_frame(1011, reason));
+                if let Some(sender) = ws.phone_tx.take() { send_ws_terminal(sender, ws::close_frame(1011, reason)); }
+                ws.queued.clear();
+                ws.queued_bytes = 0;
             }
             Pending::Done => {}
         }
@@ -1199,11 +1160,190 @@ pub async fn respond_no_tunnel(reader: &mut BufReader<TcpStream>) -> std::io::Re
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::Ordering;
+    use tokio::io::AsyncReadExt;
 
     fn tunnel() -> Arc<Tunnel> {
         let (tx, _rx) = mpsc::channel(8);
         Tunnel::new(tx)
+    }
+
+    fn response_entry(tunnel: &Arc<Tunnel>, id: u64) -> (mpsc::Receiver<ResponseChunk>, Arc<AtomicUsize>) {
+        let (chunk_tx, chunk_rx) = mpsc::channel(256);
+        let bytes = Arc::new(AtomicUsize::new(0));
+        tunnel.pending.lock().unwrap().insert(id, Pending::Http(HttpPending {
+            sse: true, device: None, head_tx: None, header_deadline: None, idle_deadline: None,
+            chunk_tx: Some(chunk_tx), queued_bytes: bytes.clone(), paused_at: None,
+        }));
+        (chunk_rx, bytes)
+    }
+
+    #[test]
+    fn response_pauses_at_high_water_and_resumes_only_after_drain() {
+        let (out, mut frames) = mpsc::channel(8);
+        let tunnel = Tunnel::new(out);
+        let (mut chunks, bytes) = response_entry(&tunnel, 1);
+        let data = vec![7; RESPONSE_PAUSE_HIGH_BYTES];
+        handle_tunnel_frame(&tunnel, "", t::HTTP_CHUNK, 1, &data);
+        let message = frames.try_recv().expect("high water pause");
+        assert_eq!(message.into_data().to_vec(), dsh_relay_protocol::encode_frame(t::HTTP_PAUSE, 1, &Payload::Empty).as_slice());
+        assert_eq!(bytes.load(Ordering::SeqCst), data.len());
+        resume_response_if_drained(&tunnel, 1);
+        assert!(frames.try_recv().is_err(), "数据尚未写完不能resume");
+        let ResponseChunk::Data(chunk) = chunks.try_recv().unwrap() else { panic!("data expected") };
+        bytes.fetch_sub(chunk.len(), Ordering::SeqCst);
+        resume_response_if_drained(&tunnel, 1);
+        assert_eq!(frames.try_recv().unwrap().into_data().to_vec(), dsh_relay_protocol::encode_frame(t::HTTP_RESUME, 1, &Payload::Empty).as_slice());
+        handle_tunnel_frame(&tunnel, "", t::HTTP_CHUNK, 1, b"tail");
+        handle_tunnel_frame(&tunnel, "", t::HTTP_END, 1, &[]);
+        assert!(matches!(chunks.try_recv(), Ok(ResponseChunk::Data(chunk)) if chunk == b"tail"));
+        assert!(matches!(chunks.try_recv(), Ok(ResponseChunk::End)));
+    }
+
+    #[test]
+    fn paused_response_ignores_upstream_idle_until_pause_deadline() {
+        let tunnel = tunnel();
+        let (_chunks, _bytes) = response_entry(&tunnel, 1);
+        let mut pending = tunnel.pending.lock().unwrap();
+        let Some(Pending::Http(entry)) = pending.get_mut(&1) else { panic!("HTTP missing") };
+        entry.idle_deadline = Some(Instant::now() - std::time::Duration::from_secs(1));
+        entry.paused_at = Some(Instant::now());
+        assert!(!response_expired(entry), "已暂停的宿主不会继续发keepalive，不能判上游空闲");
+        entry.paused_at = Some(Instant::now() - std::time::Duration::from_millis(RESPONSE_PAUSE_TIMEOUT_MS + 1));
+        assert!(response_expired(entry), "暂停不能无期限占名额");
+    }
+
+    #[test]
+    fn response_byte_limit_rejects_before_slot_limit() {
+        let (out, mut frames) = mpsc::channel(8);
+        let tunnel = Tunnel::new(out);
+        let (mut chunks, bytes) = response_entry(&tunnel, 1);
+        bytes.store(MAX_RESPONSE_QUEUE_BYTES, Ordering::SeqCst);
+        handle_tunnel_frame(&tunnel, "", t::HTTP_CHUNK, 1, b"x");
+        let pending = tunnel.pending.lock().unwrap();
+        assert!(matches!(pending.get(&1), Some(Pending::Http(entry)) if entry.chunk_tx.is_none()), "写端未结束仍占名额");
+        drop(pending);
+        assert_eq!(bytes.load(Ordering::SeqCst), MAX_RESPONSE_QUEUE_BYTES, "拒绝帧不记账");
+        assert!(matches!(chunks.try_recv(), Ok(ResponseChunk::End)), "超限不能投递截断的数据");
+        assert_eq!(frames.try_recv().unwrap().into_data().to_vec(), dsh_relay_protocol::encode_frame(t::HTTP_CANCEL, 1, &Payload::Empty).as_slice());
+    }
+
+    async fn request_during_response_drain(tunnel: Arc<Tunnel>, config: Arc<Config>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let head = RequestHead { method: "GET".into(), path: "/api/mobile/v1/status".into(), query: String::new(), version: "HTTP/1.1".into(), headers: Vec::new() };
+            proxy_request_with_config(BufReader::new(stream), head, tunnel, None, config).await.unwrap();
+        });
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let mut response = String::new();
+        tokio::time::timeout(std::time::Duration::from_secs(2), client.read_to_string(&mut response)).await.unwrap().unwrap();
+        server.await.unwrap();
+        response
+    }
+
+    #[tokio::test]
+    async fn response_terminal_holds_capacity_until_actual_writer_drains() {
+        for terminal in [t::HTTP_END, t::HTTP_ERROR] {
+            let (out, _frames) = mpsc::channel(16);
+            let tunnel = Tunnel::new(out);
+            let (chunks, bytes) = response_entry(&tunnel, 1);
+            let mut limits = Config::default();
+            limits.max_pending = 1;
+            let config = Arc::new(limits);
+            let body = vec![9; 512 * 1024];
+            handle_tunnel_frame(&tunnel, "", t::HTTP_CHUNK, 1, &body);
+            handle_tunnel_frame(&tunnel, "", terminal, 1, br#"{"message":"done"}"#);
+            handle_tunnel_frame(&tunnel, "", t::HTTP_CHUNK, 1, b"late");
+            handle_tunnel_frame(&tunnel, "", t::HTTP_END, 1, &[]);
+            let (mut phone, relay) = tokio::io::duplex(128);
+            let writer_tunnel = tunnel.clone();
+            let writer = tokio::spawn(async move { write_response_body(relay, &writer_tunnel, 1, chunks, bytes, false).await; });
+            tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+            assert!(!writer.is_finished());
+            assert_eq!(tunnel.capacity_snapshot().0, 1);
+            let response = request_during_response_drain(tunnel.clone(), config.clone()).await;
+            assert!(response.starts_with("HTTP/1.1 429 "), "{response}");
+            let mut written = Vec::new();
+            tokio::time::timeout(std::time::Duration::from_secs(5), phone.read_to_end(&mut written)).await.unwrap().unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(2), writer).await.unwrap().unwrap();
+            let mut expected = body;
+            if terminal == t::HTTP_ERROR { expected.extend_from_slice(b"upstream error: done"); }
+            assert_eq!(written, expected, "终局不能截断已接收数据或再接受迟到帧");
+            assert_eq!(tunnel.capacity_snapshot().0, 0);
+            assert!(tunnel.has_capacity(&config, false), "实际写完后恢复名额");
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_response_writer_releases_capacity_after_dropping_buffer() {
+        let (out, _frames) = mpsc::channel(16);
+        let tunnel = Tunnel::new(out);
+        let (chunks, bytes) = response_entry(&tunnel, 1);
+        handle_tunnel_frame(&tunnel, "", t::HTTP_CHUNK, 1, &vec![6; 512 * 1024]);
+        let (phone, relay) = tokio::io::duplex(128);
+        let writer_tunnel = tunnel.clone();
+        let writer = tokio::spawn(async move { write_response_body(relay, &writer_tunnel, 1, chunks, bytes, false).await; });
+        drop(phone);
+        tokio::time::timeout(std::time::Duration::from_secs(2), writer).await.unwrap().unwrap();
+        assert_eq!(tunnel.capacity_snapshot().0, 0);
+    }
+
+    #[tokio::test]
+    async fn full_response_queue_delivers_terminal_after_all_data() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        sender.try_send(ResponseChunk::Data(b"before".to_vec())).unwrap_or_else(|_| panic!("queue"));
+        send_terminal(sender, ResponseChunk::End);
+        assert!(matches!(receiver.recv().await, Some(ResponseChunk::Data(bytes)) if bytes == b"before"));
+        assert!(matches!(receiver.recv().await, Some(ResponseChunk::End)));
+    }
+
+    async fn body_response(raw: &[u8], headers: Vec<(String, String)>, config: Config, half_close: bool) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (out, _frames) = mpsc::channel(32);
+        let tunnel = Tunnel::new(out);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            let head = RequestHead { method: "POST".into(), path: "/api/mobile/v1/upload".into(), query: String::new(), version: "HTTP/1.1".into(), headers };
+            assert!(!forward_body_or_respond(&mut reader, &head, &tunnel, 1, &config).await.unwrap());
+        });
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client.write_all(raw).await.unwrap();
+        if half_close { client.shutdown().await.unwrap(); }
+        let mut response = String::new();
+        tokio::time::timeout(std::time::Duration::from_secs(2), client.read_to_string(&mut response)).await.unwrap().unwrap();
+        server.await.unwrap();
+        response
+    }
+
+    #[tokio::test]
+    async fn oversize_bodies_answer_413_for_each_framing() {
+        let mut config = Config::default();
+        config.max_body_bytes = 4;
+        for (body, headers) in [
+            (&b""[..], vec![("content-length".into(), "5".into())]),
+            (&b"abcde"[..], Vec::new()),
+            (&b"5\r\nabcde\r\n0\r\n\r\n"[..], vec![("transfer-encoding".into(), "chunked".into())]),
+        ] {
+            let response = body_response(body, headers, config.clone(), true).await;
+            assert!(response.starts_with("HTTP/1.1 413 Payload Too Large\r\n"), "{response}");
+        }
+    }
+
+    #[tokio::test]
+    async fn body_idle_timeout_and_short_body_answer_without_waiting_for_host() {
+        let mut config = Config::default();
+        config.upstream_header_timeout_ms = 20;
+        for (headers, raw, half_close, status) in [
+            (vec![("content-length".into(), "2".into())], &b"x"[..], false, 408),
+            (vec![("content-length".into(), "2".into())], &b"x"[..], true, 400),
+            (vec![("transfer-encoding".into(), "chunked".into())], &b"1\r\nx"[..], false, 408),
+        ] {
+            let response = body_response(raw, headers, config.clone(), half_close).await;
+            assert!(response.starts_with(&format!("HTTP/1.1 {status} ")), "{response}");
+        }
     }
 
     /// 积压一动不动时必须有期限。

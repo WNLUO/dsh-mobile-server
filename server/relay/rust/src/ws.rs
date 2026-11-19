@@ -1,4 +1,4 @@
-//! 隧道接入与手机 WebSocket 桥接。
+//! 接入宿主隧道并桥接有界、保序的手机 WebSocket 流。
 //!
 //! 两条 WS 路径：
 //!   - `/tunnel` —— 宿主的出站隧道。同一时刻只服务一条，新连接取代旧的。
@@ -7,7 +7,7 @@
 //! 心跳与半开判定对齐 Node 版：隧道 15s ping、60s 没 pong 就认定死链；手机 WS 同形，
 //! 但只 terminate **这一条**，不碰隧道。
 
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -21,7 +21,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 
 use crate::http::RequestHead;
-use crate::tunnel::{log, Pending, Tunnel, TunnelSlot, WsPending};
+use crate::tunnel::{log, ws_data_bytes, Pending, Tunnel, TunnelSlot, WsPending};
 
 type WsReader = BufReader<TcpStream>;
 
@@ -542,6 +542,12 @@ pub async fn accept_phone_ws(
     head: RequestHead,
     slot: Arc<TunnelSlot>,
 ) -> std::io::Result<()> {
+    accept_phone_ws_with_config(reader, head, slot, crate::config()).await
+}
+
+async fn accept_phone_ws_with_config(
+    reader: WsReader, head: RequestHead, slot: Arc<TunnelSlot>, config: Arc<crate::config::Config>,
+) -> std::io::Result<()> {
     // 与 HTTP 走同一套分发：手机 WS 也带着 `X-Dsh-Instance`，找不到就不接。
     let instance = head.header("x-dsh-instance").unwrap_or_default();
     let Some(tunnel) = slot.get_for(instance) else {
@@ -560,34 +566,30 @@ pub async fn accept_phone_ws(
         return Ok(());
     };
 
-    if tunnel.ws_count() >= crate::config().max_ws_connections || !tunnel.has_capacity(&crate::config(), false) {
+    let id = tunnel.alloc_id();
+    let (phone_tx, phone_rx) = mpsc::channel::<Message>(256);
+    let phone_bytes = Arc::new(AtomicUsize::new(0));
+    let reserved = tunnel.reserve_ws(&config, id, WsPending {
+        phone_tx: Some(phone_tx),
+        ready: false,
+        queued: Vec::new(),
+        queued_bytes: 0,
+        phone_bytes: phone_bytes.clone(),
+        last_active: Instant::now(),
+    });
+    if !reserved {
         let mut reader = reader;
-        let stream = reader.get_mut();
-        let response =
-            "HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\nconnection: Upgrade\r\n\r\n";
-        let _ = tokio::io::AsyncWriteExt::write_all(stream, response.as_bytes()).await;
+        crate::http::respond_with(
+            &mut reader, 503, "text/plain; charset=utf-8", b"relay resource limit exceeded",
+            &[("retry-after".to_string(), "25".to_string())],
+        ).await?;
         return Ok(());
     }
 
     let Some(ws) = upgrade(reader, &head).await else {
+        tunnel.pending.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
         return Ok(());
     };
-
-    let id = tunnel.alloc_id();
-    let (phone_tx, mut phone_rx) = mpsc::channel::<Message>(256);
-    {
-        let mut pending = tunnel.pending.lock().unwrap_or_else(|e| e.into_inner());
-        pending.insert(
-            id,
-            Pending::Ws(WsPending {
-                phone_tx: phone_tx.clone(),
-                ready: false,
-                queued: Vec::new(),
-                queued_bytes: 0,
-                last_active: Instant::now(),
-            }),
-        );
-    }
 
     // 告诉宿主：为这个 id 开一条上游 WS。
     let headers: Vec<(String, String)> = crate::headers::pick_forward_headers(
@@ -600,17 +602,39 @@ pub async fn accept_phone_ws(
         "headers": headers.iter().cloned().collect::<std::collections::BTreeMap<_, _>>(),
     })
     .to_string();
-    tunnel.send_json(t::WS_UPGRADE, id, &payload);
+    if !tunnel.send_json(t::WS_UPGRADE, id, &payload) {
+        drop(ws);
+        drop(phone_rx);
+        tunnel.pending.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
+        return Ok(());
+    }
 
+    bridge_phone_ws(ws, tunnel, id, phone_rx, phone_bytes, config).await;
+    Ok(())
+}
+
+async fn bridge_phone_ws<S>(
+    ws: WebSocketStream<S>, tunnel: Arc<Tunnel>, id: u64, phone_rx: mpsc::Receiver<Message>,
+    phone_bytes: Arc<AtomicUsize>, config: Arc<crate::config::Config>,
+) where S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static {
+    bridge_phone_io(ws, tunnel.clone(), id, phone_rx, phone_bytes, config).await;
+    tunnel.pending.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
+}
+
+async fn bridge_phone_io<S>(
+    ws: WebSocketStream<S>, tunnel: Arc<Tunnel>, id: u64, mut phone_rx: mpsc::Receiver<Message>,
+    phone_bytes: Arc<AtomicUsize>, config: Arc<crate::config::Config>,
+) where S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static {
     let (mut sink, mut source) = ws.split();
-    let phone_writer = tokio::spawn(async move {
+    let mut phone_writer = tokio::spawn(async move {
         while let Some(message) = phone_rx.recv().await {
-            if let Err(error) = sink.send(message).await {
-                log(format!("tunnel write failed: {error}"));
-                break;
-            }
+            let bytes = ws_data_bytes(&message);
+            let closing = matches!(&message, Message::Close(_));
+            let sent = tokio::time::timeout(Duration::from_secs(25), sink.send(message)).await;
+            phone_bytes.fetch_sub(bytes, Ordering::SeqCst);
+            if !matches!(sent, Ok(Ok(()))) || closing { break; }
         }
-        let _ = sink.close().await;
+        let _ = tokio::time::timeout(Duration::from_secs(1), sink.close()).await;
     });
 
     // 半开判定：15s ping，60s 既没 pong 也没上行帧就 terminate 这一条。
@@ -624,23 +648,13 @@ pub async fn accept_phone_ws(
                 let idle = {
                     let pending = tunnel.pending.lock().unwrap_or_else(|e| e.into_inner());
                     match pending.get(&id) {
-                        Some(Pending::Ws(ws)) => ws.last_active.elapsed(),
+                        Some(Pending::Ws(ws)) if ws.phone_tx.is_some() => ws.last_active.elapsed(),
                         _ => return,
                     }
                 };
                 if idle > Duration::from_millis(config.ws_pong_timeout_ms) {
                     // 半开：既没 pong 也没上行帧。只关这一条手机 WS，不碰隧道。
-                    let sender = {
-                        let mut pending = tunnel.pending.lock().unwrap_or_else(|e| e.into_inner());
-                        match pending.remove(&id) {
-                            Some(Pending::Ws(entry)) => Some(entry.phone_tx),
-                            _ => None,
-                        }
-                    };
-                    tunnel.send_frame(t::WS_CLOSE, id, Payload::Bytes(dsh_relay_protocol::encode_close_payload(1001, "ws heartbeat timeout")));
-                    if let Some(sender) = sender {
-                        let _ = sender.try_send(close_frame(1001, "ws heartbeat timeout"));
-                    }
+                    crate::proxy::close_phone_ws(&tunnel, id, 1001, "ws heartbeat timeout");
                     return;
                 }
                 // 发 WS 协议层的 ping（客户端栈会自动回 pong），不是隧道的应用层 ping：
@@ -648,7 +662,7 @@ pub async fn accept_phone_ws(
                 let sender = {
                     let pending = tunnel.pending.lock().unwrap_or_else(|e| e.into_inner());
                     match pending.get(&id) {
-                        Some(Pending::Ws(entry)) => Some(entry.phone_tx.clone()),
+                        Some(Pending::Ws(entry)) => entry.phone_tx.clone(),
                         _ => None,
                     }
                 };
@@ -659,36 +673,35 @@ pub async fn accept_phone_ws(
         })
     };
 
-    while let Some(message) = source.next().await {
-        let message = match message {
-            Ok(message) => message,
-            Err(_) => break,
+    let mut writer_finished = false;
+    loop {
+        let message = tokio::select! {
+            _ = &mut phone_writer => { writer_finished = true; break; }
+            message = source.next() => match message {
+                Some(Ok(message)) => message,
+                _ => break,
+            },
         };
-        {
+        let closing = {
             let mut pending = tunnel.pending.lock().unwrap_or_else(|e| e.into_inner());
             match pending.get_mut(&id) {
-                Some(Pending::Ws(ws)) => ws.last_active = Instant::now(),
+                Some(Pending::Ws(ws)) => {
+                    ws.last_active = Instant::now();
+                    ws.phone_tx.is_none()
+                }
                 _ => break,
             }
-        }
+        };
+        // 宿主终局后仍读手机的在途 pong；不再向宿主送新数据，也不截断下行排空。
+        if closing && !matches!(&message, Message::Close(_)) { continue; }
         match message {
-            Message::Text(text) => {
-                let bytes = text.as_bytes();
-                if bytes.len() > crate::config().max_ws_message_bytes {
-                    tunnel.send_frame(t::WS_CLOSE, id, Payload::Empty);
-                    break;
+            message @ (Message::Text(_) | Message::Binary(_)) => {
+                if message.len() > config.max_ws_message_bytes {
+                    crate::proxy::close_phone_ws(&tunnel, id, 1009, "ws message too large");
+                    continue;
                 }
-                if !tunnel.send_frame(t::WS_TEXT, id, Payload::Bytes(bytes.to_vec())) {
-                    break;
-                }
-            }
-            Message::Binary(bytes) => {
-                if bytes.len() > crate::config().max_ws_message_bytes {
-                    tunnel.send_frame(t::WS_CLOSE, id, Payload::Empty);
-                    break;
-                }
-                if !tunnel.send_frame(t::WS_BINARY, id, Payload::Bytes(bytes.to_vec())) {
-                    break;
+                if !forward_phone_data(&tunnel, id, message, config.max_ws_queue_bytes) {
+                    crate::proxy::close_phone_ws(&tunnel, id, 1013, "phone ws backpressure");
                 }
             }
             Message::Pong(_) => {
@@ -702,7 +715,7 @@ pub async fn accept_phone_ws(
                 let mut pending = tunnel.pending.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(Pending::Ws(entry)) = pending.get_mut(&id) {
                     entry.last_active = Instant::now();
-                    let _ = entry.phone_tx.try_send(Message::Pong(payload));
+                    if let Some(sender) = entry.phone_tx.as_ref() { let _ = sender.try_send(Message::Pong(payload)); }
                 }
             }
             Message::Close(frame) => {
@@ -711,8 +724,7 @@ pub async fn accept_phone_ws(
                     .as_ref()
                     .map(|f| f.reason.to_string())
                     .unwrap_or_default();
-                let payload = encode_close_payload(code, &reason);
-                tunnel.send_frame(t::WS_CLOSE, id, Payload::Bytes(payload));
+                crate::proxy::close_phone_ws(&tunnel, id, code, &reason);
                 break;
             }
             Message::Frame(_) => {}
@@ -720,13 +732,33 @@ pub async fn accept_phone_ws(
     }
 
     heartbeat.abort();
-    phone_writer.abort();
-    tunnel
-        .pending
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(&id);
-    Ok(())
+    crate::proxy::close_phone_ws(&tunnel, id, 1001, "phone ws disconnected");
+    if !writer_finished {
+        // 这里只因手机实际断开/报错退出；宿主终局会继续等写端按25s写期限排空。
+        phone_writer.abort();
+        let _ = phone_writer.await;
+    }
+    drop(source);
+    // 所有队列与socket半边释放后，调用方再统一归还名额。
+}
+
+/// pending 锁覆盖判 ready 与发帧，确保 wsOpen 排空队列时新帧不会抢先。
+fn forward_phone_data(tunnel: &Arc<Tunnel>, id: u64, message: Message, limit: usize) -> bool {
+    let mut pending = tunnel.pending.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(Pending::Ws(entry)) = pending.get_mut(&id) else { return false };
+    if entry.phone_tx.is_none() { return false; }
+    if !entry.ready {
+        return entry.queue_upstream(message, limit);
+    }
+    send_phone_frame(tunnel, id, message)
+}
+
+pub(crate) fn send_phone_frame(tunnel: &Arc<Tunnel>, id: u64, message: Message) -> bool {
+    match message {
+        Message::Text(text) => tunnel.send_frame(t::WS_TEXT, id, Payload::Bytes(text.as_bytes().to_vec())),
+        Message::Binary(bytes) => tunnel.send_frame(t::WS_BINARY, id, Payload::Bytes(bytes.to_vec())),
+        _ => false,
+    }
 }
 
 fn now_ms() -> i64 {
@@ -756,6 +788,193 @@ pub fn close_frame(code: u16, reason: &str) -> Message {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn phone_entry() -> (WsPending, mpsc::Receiver<Message>) {
+        let (phone_tx, phone_rx) = mpsc::channel(256);
+        (WsPending {
+            phone_tx: Some(phone_tx), ready: false, queued: Vec::new(), queued_bytes: 0,
+            phone_bytes: Arc::new(AtomicUsize::new(0)), last_active: Instant::now(),
+        }, phone_rx)
+    }
+
+    #[test]
+    fn phone_frames_wait_for_open_then_reach_host_in_order() {
+        let (out, mut frames) = mpsc::channel(8);
+        let tunnel = Tunnel::new(out);
+        let (entry, mut phone) = phone_entry();
+        assert!(tunnel.reserve_ws(&crate::config::Config::default(), 1, entry));
+        assert!(forward_phone_data(&tunnel, 1, Message::Text("init".into()), 16));
+        assert!(forward_phone_data(&tunnel, 1, Message::Binary(vec![1, 2].into()), 16));
+        assert!(frames.try_recv().is_err(), "wsOpen 前不能向宿主送数据");
+        crate::proxy::handle_tunnel_frame(&tunnel, "", t::WS_OPEN, 1, &[]);
+        assert!(forward_phone_data(&tunnel, 1, Message::Text("next".into()), 16));
+        for (kind, payload) in [(t::WS_TEXT, b"init".as_slice()), (t::WS_BINARY, &[1, 2][..]), (t::WS_TEXT, b"next".as_slice())] {
+            let Message::Binary(bytes) = frames.try_recv().expect("上行帧") else { panic!("binary frame expected") };
+            assert_eq!(bytes.to_vec(), dsh_relay_protocol::encode_frame(kind, 1, &Payload::Bytes(payload.to_vec())).as_slice());
+        }
+        assert!(phone.try_recv().is_err(), "上行帧不能反送手机");
+        let pending = tunnel.pending.lock().unwrap();
+        let Some(Pending::Ws(entry)) = pending.get(&1) else { panic!("WS missing") };
+        assert!(entry.ready);
+        assert!(entry.queued.is_empty());
+        assert_eq!(entry.queued_bytes, 0);
+    }
+
+    #[test]
+    fn phone_queues_enforce_bytes_and_keep_failed_send_accounting() {
+        let (mut entry, mut phone) = phone_entry();
+        assert!(entry.queue_upstream(Message::Text("éé".into()), 4));
+        assert!(!entry.queue_upstream(Message::Binary(vec![1].into()), 4));
+        assert_eq!(entry.queued_bytes, 4, "按UTF-8字节而非字符计量");
+        assert!(entry.send_phone(Message::Binary(vec![1, 2, 3, 4].into()), 4));
+        assert!(!entry.send_phone(Message::Binary(vec![5].into()), 4));
+        assert_eq!(entry.phone_bytes.load(Ordering::SeqCst), 4);
+        let message = phone.try_recv().unwrap();
+        entry.phone_bytes.fetch_sub(ws_data_bytes(&message), Ordering::SeqCst);
+        assert!(entry.send_phone(Message::Binary(vec![5].into()), 4));
+        drop(phone);
+        let before = entry.phone_bytes.load(Ordering::SeqCst);
+        assert!(!entry.send_phone(Message::Text("x".into()), 4));
+        assert_eq!(entry.phone_bytes.load(Ordering::SeqCst), before);
+    }
+
+    #[test]
+    fn ws_downstream_byte_limit_closes_only_the_overloaded_ws() {
+        let (out, mut frames) = mpsc::channel(8);
+        let tunnel = Tunnel::new(out);
+        let (entry, mut phone) = phone_entry();
+        entry.phone_bytes.store(crate::config().max_ws_queue_bytes, Ordering::SeqCst);
+        assert!(tunnel.reserve_ws(&crate::config(), 1, entry));
+        let (other, _other_phone) = phone_entry();
+        assert!(tunnel.reserve_ws(&crate::config(), 2, other));
+        crate::proxy::handle_tunnel_frame(&tunnel, "", t::WS_BINARY, 1, b"x");
+        assert!(matches!(tunnel.pending.lock().unwrap().get(&1), Some(Pending::Ws(entry)) if entry.phone_tx.is_none()), "拥塞流排空前保留占位");
+        assert!(tunnel.pending.lock().unwrap().contains_key(&2));
+        assert!(matches!(phone.try_recv(), Ok(Message::Close(Some(frame))) if u16::from(frame.code) == 1013));
+        let frame = frames.try_recv().expect("通知宿主关闭").into_data();
+        assert_eq!(frame[0], t::WS_CLOSE);
+        assert!(!tunnel.is_closed());
+    }
+
+    async fn rejected_phone_request(tunnel: Arc<Tunnel>, config: Arc<crate::config::Config>) -> String {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let slot = Arc::new(TunnelSlot::new());
+        slot.register("closing", tunnel);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let head = RequestHead { method: "GET".into(), path: "/api/mobile/v1/ws".into(), query: String::new(), version: "HTTP/1.1".into(), headers: vec![("x-dsh-instance".into(), "closing".into())] };
+            accept_phone_ws_with_config(BufReader::new(stream), head, slot, config).await.unwrap();
+        });
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let mut response = String::new();
+        tokio::time::timeout(Duration::from_secs(2), client.read_to_string(&mut response)).await.unwrap().unwrap();
+        server.await.unwrap();
+        response
+    }
+
+    #[tokio::test]
+    async fn host_close_drains_data_despite_inflight_phone_pong_and_holds_capacity() {
+        let (host_tx, mut host_frames) = mpsc::channel(16);
+        let tunnel = Tunnel::new(host_tx);
+        let mut limits = crate::config::Config::default();
+        limits.max_pending = 1;
+        limits.max_ws_connections = 1;
+        let config = Arc::new(limits);
+        let (entry, phone_rx) = phone_entry();
+        let phone_bytes = entry.phone_bytes.clone();
+        assert!(tunnel.reserve_ws(&config, 1, entry));
+        let (phone_io, relay_io) = tokio::io::duplex(128);
+        let relay = WebSocketStream::from_raw_socket(relay_io, Role::Server, None).await;
+        let mut phone = WebSocketStream::from_raw_socket(phone_io, Role::Client, None).await;
+        let bridge_tunnel = tunnel.clone();
+        let bridge_config = config.clone();
+        let bridge = tokio::spawn(async move { bridge_phone_ws(relay, bridge_tunnel, 1, phone_rx, phone_bytes, bridge_config).await; });
+        let body = vec![7; 512 * 1024];
+        crate::proxy::handle_tunnel_frame(&tunnel, "", t::WS_BINARY, 1, &body);
+        crate::proxy::handle_tunnel_frame(&tunnel, "", t::WS_CLOSE, 1, &encode_close_payload(1000, "done"));
+        crate::proxy::handle_tunnel_frame(&tunnel, "", t::WS_BINARY, 1, b"late");
+        crate::proxy::handle_tunnel_frame(&tunnel, "", t::WS_CLOSE, 1, &encode_close_payload(1000, "duplicate"));
+        let before_pong = Instant::now();
+        phone.send(Message::Pong(b"inflight".to_vec().into())).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let seen = matches!(tunnel.pending.lock().unwrap().get(&1), Some(Pending::Ws(entry)) if entry.last_active >= before_pong);
+                if seen { break; }
+                tokio::task::yield_now().await;
+            }
+        }).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert!(!bridge.is_finished(), "宿主终局后的pong不能触发1秒截断");
+        assert_eq!(tunnel.ws_count(), 1);
+        let response = rejected_phone_request(tunnel.clone(), config.clone()).await;
+        assert!(response.starts_with("HTTP/1.1 503 "), "{response}");
+        let mut data = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(message) = phone.next().await {
+                match message.unwrap() {
+                    Message::Binary(bytes) => data.extend_from_slice(&bytes),
+                    Message::Close(Some(frame)) => { assert_eq!(frame.reason.to_string(), "done"); break; }
+                    Message::Ping(_) | Message::Pong(_) => {}
+                    other => panic!("unexpected frame: {other:?}"),
+                }
+            }
+        }).await.unwrap();
+        assert_eq!(data, body, "已接受的数据必须先于Close完整写出");
+        tokio::time::timeout(Duration::from_secs(3), bridge).await.unwrap().unwrap();
+        assert_eq!(tunnel.ws_count(), 0);
+        assert!(host_frames.try_recv().is_err(), "宿主发起Close无需回声，后续pong不能重复通知宿主");
+        let (next, _next_rx) = phone_entry();
+        assert!(tunnel.reserve_ws(&config, 2, next), "排空后恢复名额");
+    }
+
+    #[tokio::test]
+    async fn phone_disconnect_releases_blocked_writer_before_capacity() {
+        let (out, mut frames) = mpsc::channel(16);
+        let tunnel = Tunnel::new(out);
+        let (entry, phone_rx) = phone_entry();
+        let bytes = entry.phone_bytes.clone();
+        assert!(tunnel.reserve_ws(&crate::config(), 1, entry));
+        let (phone_io, relay_io) = tokio::io::duplex(128);
+        let relay = WebSocketStream::from_raw_socket(relay_io, Role::Server, None).await;
+        let bridge_tunnel = tunnel.clone();
+        let bridge = tokio::spawn(async move { bridge_phone_ws(relay, bridge_tunnel, 1, phone_rx, bytes, crate::config()).await; });
+        crate::proxy::handle_tunnel_frame(&tunnel, "", t::WS_BINARY, 1, &vec![8; 512 * 1024]);
+        drop(phone_io);
+        tokio::time::timeout(Duration::from_secs(3), bridge).await.unwrap().unwrap();
+        assert_eq!(tunnel.ws_count(), 0);
+        let close = frames.try_recv().expect("手机断开通知宿主").into_data();
+        assert_eq!(close[0], t::WS_CLOSE);
+        assert!(frames.try_recv().is_err(), "手机断开只通知宿主一次");
+    }
+
+    #[tokio::test]
+    async fn full_phone_ws_capacity_returns_503_before_upgrade() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (out, _frames) = mpsc::channel(8);
+        let tunnel = Tunnel::new(out);
+        for id in 1..=crate::config().max_ws_connections {
+            let (entry, _phone) = phone_entry();
+            assert!(tunnel.reserve_ws(&crate::config(), id as u64, entry));
+        }
+        let slot = Arc::new(TunnelSlot::new());
+        slot.register("ws-full", tunnel);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            crate::http::serve_connection(stream, slot).await.unwrap();
+        });
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client.write_all(b"GET /api/mobile/v1/ws HTTP/1.1\r\nhost: relay\r\nx-dsh-instance: ws-full\r\nupgrade: websocket\r\nconnection: Upgrade\r\nsec-websocket-key: key\r\n\r\n").await.unwrap();
+        let mut response = String::new();
+        tokio::time::timeout(Duration::from_secs(2), client.read_to_string(&mut response)).await.unwrap().unwrap();
+        server.await.unwrap();
+        assert!(response.starts_with("HTTP/1.1 503 "), "{response}");
+        assert!(response.contains("retry-after: 25\r\n"), "{response}");
+        assert!(!response.contains("101 Switching"), "不能发残缺升级头");
+    }
 
     #[test]
     fn accept_key_matches_rfc_example() {

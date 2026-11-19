@@ -1,4 +1,4 @@
-//! 一个 TCP 连接上的 HTTP/1.1 处理：读请求头、判路径、分流到转发或本地应答。
+//! 有界读取 HTTP 请求并分流到转发、升级或本地应答。
 //!
 //! 不引 http 框架：中转只处理固定的几种形态（体检、状态、`/tunnel` 升级、其余转发），
 //! 手写解析比拉一个完整栈更可控，也更容易和 Node 版逐条对齐行为。
@@ -10,7 +10,7 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
 use crate::tunnel::{log, TunnelSlot};
@@ -244,28 +244,79 @@ fn normalize_path(pathname: &str) -> Option<String> {
     (out != pathname).then_some(out)
 }
 
+/// 请求行 / 单头最多 64KB，总头最多 256KB，包含重复头与空行。
+pub(crate) const MAX_HEADER_LINE_BYTES: usize = 64 * 1024;
+const MAX_HEADER_BYTES: usize = 256 * 1024;
+
+/// 按字节上限读一行，避免 read_line 在遇到换行前无界增长。
+pub(crate) async fn read_limited_line<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    limit: usize,
+) -> std::io::Result<String> {
+    let mut bytes = Vec::new();
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            if bytes.is_empty() {
+                return Ok(String::new());
+            }
+            return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+        }
+        let take = available.iter().position(|byte| *byte == b'\n').map(|at| at + 1).unwrap_or(available.len());
+        if take > limit.saturating_sub(bytes.len()) {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "header line too large"));
+        }
+        let ended = available[take - 1] == b'\n';
+        bytes.extend_from_slice(&available[..take]);
+        reader.consume(take);
+        if ended {
+            return String::from_utf8(bytes)
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid header encoding"));
+        }
+    }
+}
+
+/// 请求体每次有进展就重新计时，允许弱网持续上传，回收半开连接。
+pub(crate) async fn read_body_bytes<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    buffer: &mut [u8],
+    timeout_ms: u64,
+) -> std::io::Result<usize> {
+    tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), reader.read(buffer))
+        .await
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::TimedOut))?
+}
+
 /// 解析失败的情形。
 #[derive(Debug)]
 pub enum ParseError {
-
-    /// 连接已断或客户端主动关闭。
     Closed,
-    /// 请求格式不认识。
+    Timeout,
     Malformed(String),
 }
 
-/// 读一个请求的头。body 起点留在 reader 里，不丢。
-pub async fn read_request_head(
-    reader: &mut BufReader<TcpStream>,
+/// 读一个请求的头。总时限覆盖请求行与所有头，body 起点留在 reader 里。
+pub async fn read_request_head(reader: &mut BufReader<TcpStream>) -> Result<RequestHead, ParseError> {
+    read_request_head_with_timeout(reader, crate::config().upstream_header_timeout_ms).await
+}
+
+async fn read_request_head_with_timeout<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    timeout_ms: u64,
 ) -> Result<RequestHead, ParseError> {
-    let mut request_line = String::new();
-    let read = reader
-        .read_line(&mut request_line)
-        .await
-        .map_err(|_| ParseError::Closed)?;
-    if read == 0 {
+    tokio::time::timeout(
+        std::time::Duration::from_millis(timeout_ms),
+        parse_request_head(reader),
+    ).await.map_err(|_| ParseError::Timeout)?
+}
+
+async fn parse_request_head<R: AsyncBufRead + Unpin>(reader: &mut R) -> Result<RequestHead, ParseError> {
+    let request_line = read_limited_line(reader, MAX_HEADER_LINE_BYTES).await
+        .map_err(|error| ParseError::Malformed(error.to_string()))?;
+    if request_line.is_empty() {
         return Err(ParseError::Closed);
     }
+    let mut total = request_line.len();
     let request_line = request_line.trim_end_matches(['\r', '\n']);
     let mut parts = request_line.split_whitespace();
     let method = parts.next().ok_or_else(|| ParseError::Malformed("缺方法".into()))?;
@@ -279,10 +330,14 @@ pub async fn read_request_head(
 
     let mut headers: Vec<(String, String)> = Vec::new();
     loop {
-        let mut line = String::new();
-        let read = reader.read_line(&mut line).await.map_err(|_| ParseError::Closed)?;
-        if read == 0 {
+        let line = read_limited_line(reader, MAX_HEADER_LINE_BYTES).await
+            .map_err(|error| ParseError::Malformed(error.to_string()))?;
+        if line.is_empty() {
             return Err(ParseError::Closed);
+        }
+        total += line.len();
+        if total > MAX_HEADER_BYTES {
+            return Err(ParseError::Malformed("头太长".into()));
         }
         let line = line.trim_end_matches(['\r', '\n']);
         if line.is_empty() {
@@ -324,6 +379,8 @@ fn status_reason(status: u16) -> &'static str {
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        408 => "Request Timeout",
+        413 => "Payload Too Large",
         429 => "Too Many Requests",
         500 => "Internal Server Error",
         502 => "Bad Gateway",
@@ -531,31 +588,55 @@ const MAX_CONSOLE_BODY: usize = 64 * 1024;
 /// 不能套用控制台那个 64KB。
 const MAX_OTA_PUBLISH_BODY: usize = 32 * 1024 * 1024;
 
-/// 读请求体。上限由调用点给：控制台 64KB，OTA 发布 32MB。
-///
-/// **超限回 `Err(())` 让调用方回 413，绝不截断**：截断过去的表现是 publish 回
-/// `ok:true`、盘上只有前 64KB，客户端装到一半才报「OTA 包结构不完整」（2026-10-17
-/// 真机踩到，而接口自始至终都说成功）。
+#[derive(Debug, PartialEq)]
+enum BodyReadError {
+    TooLarge,
+    Timeout,
+    Incomplete,
+}
+
+impl BodyReadError {
+    fn status(&self) -> u16 {
+        match self {
+            Self::TooLarge => 413,
+            Self::Timeout => 408,
+            Self::Incomplete => 400,
+        }
+    }
+
+    fn message(&self) -> &'static str {
+        match self {
+            Self::TooLarge => "body too large",
+            Self::Timeout => "request body timeout",
+            Self::Incomplete => "incomplete request body",
+        }
+    }
+}
+
+/// 控制台与 OTA 保留各自上限；不把未读完的体当作空体交给业务。
 async fn read_console_body(
     reader: &mut BufReader<TcpStream>,
     head: &RequestHead,
     limit: usize,
-) -> Result<Vec<u8>, ()> {
+) -> Result<Vec<u8>, BodyReadError> {
     let Some(length) = head.content_length() else {
         return Ok(Vec::new());
     };
     if length > limit {
-        return Err(());
+        return Err(BodyReadError::TooLarge);
     }
     let mut body = vec![0u8; length];
-    // ⚠️ 必须从 **BufReader** 读，不能从 `reader.get_mut()` 读：读请求头时 BufReader
-    // 很可能已经把 body 一起预读进自己的缓冲区了，这时裸流上已经没有字节，
-    // `read_exact` 会一直等（请求挂死、服务端什么都不记）。同 A4-11 那个
-    // `into_inner()` 丢缓冲区的坑，方向相反但同一个根因。
-    match tokio::io::AsyncReadExt::read_exact(&mut *reader, &mut body).await {
-        Ok(_) => Ok(body),
-        Err(_) => Ok(Vec::new()),
+    let mut read = 0;
+    while read < length {
+        // 必须从 BufReader 读，保留读头时已预读的 body。
+        match read_body_bytes(reader, &mut body[read..], crate::config().upstream_header_timeout_ms).await {
+            Ok(0) => return Err(BodyReadError::Incomplete),
+            Ok(count) => read += count,
+            Err(error) if error.kind() == std::io::ErrorKind::TimedOut => return Err(BodyReadError::Timeout),
+            Err(_) => return Err(BodyReadError::Incomplete),
+        }
     }
+    Ok(body)
 }
 
 /// 把一个控制台应答写到连接里。
@@ -691,8 +772,9 @@ pub async fn handle_owned_path(
             }
             let body = match read_console_body(reader, head, MAX_CONSOLE_BODY).await {
                 Ok(body) => body,
-                Err(()) => {
-                    respond_json(reader, 413, r#"{"ok":false,"error":"body too large"}"#).await?;
+                Err(error) => {
+                    let body = serde_json::json!({"ok": false, "error": error.message()}).to_string();
+                    respond_json(reader, error.status(), &body).await?;
                     return Ok(true);
                 }
             };
@@ -758,13 +840,10 @@ pub async fn handle_owned_path(
                 let body = if head.method == "POST" {
                     match read_console_body(reader, head, MAX_OTA_PUBLISH_BODY).await {
                         Ok(body) => body,
-                        Err(()) => {
-                            respond_json(
-                                reader,
-                                413,
-                                r#"{"ok":false,"error":"package too large"}"#,
-                            )
-                            .await?;
+                        Err(error) => {
+                            let message = if error == BodyReadError::TooLarge { "package too large" } else { error.message() };
+                            let body = serde_json::json!({"ok": false, "error": message}).to_string();
+                            respond_json(reader, error.status(), &body).await?;
                             return Ok(true);
                         }
                     }
@@ -803,9 +882,9 @@ pub async fn handle_owned_path(
                 // 控制台要读 POST 体（只有被控端上报那条会用到，但读法统一）。
                 let body = match read_console_body(reader, head, MAX_CONSOLE_BODY).await {
                     Ok(body) => body,
-                    Err(()) => {
-                        respond_json(reader, 413, r#"{"ok":false,"error":"body too large"}"#)
-                            .await?;
+                    Err(error) => {
+                        let body = serde_json::json!({"ok": false, "error": error.message()}).to_string();
+                        respond_json(reader, error.status(), &body).await?;
                         return Ok(true);
                     }
                 };
@@ -840,8 +919,13 @@ pub async fn serve_connection(stream: TcpStream, slot: Arc<TunnelSlot>) -> std::
     let head = match read_request_head(&mut reader).await {
         Ok(head) => head,
         Err(ParseError::Closed) => return Ok(()),
+        Err(ParseError::Timeout) => {
+            respond_text(&mut reader, 408, "request header timeout").await?;
+            return Ok(());
+        }
         Err(ParseError::Malformed(reason)) => {
             log(format!("请求格式错误：{reason}"));
+            respond_text(&mut reader, 400, "bad request").await?;
             return Ok(());
         }
     };
@@ -982,6 +1066,39 @@ pub async fn serve_connection(stream: TcpStream, slot: Arc<TunnelSlot>) -> std::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn request_head_limits_count_bytes_including_duplicate_headers() {
+        let mut line = BufReader::new(std::io::Cursor::new(format!("GET / HTTP/1.1\r\nx-long: {}\r\n\r\n", "x".repeat(MAX_HEADER_LINE_BYTES)).into_bytes()));
+        assert!(matches!(parse_request_head(&mut line).await, Err(ParseError::Malformed(_))));
+        let repeated = format!("GET / HTTP/1.1\r\n{}\r\n", format!("x-same: {}\r\n", "x".repeat(60 * 1024)).repeat(5));
+        let mut total = BufReader::new(std::io::Cursor::new(repeated.into_bytes()));
+        assert!(matches!(parse_request_head(&mut total).await, Err(ParseError::Malformed(_))), "重复头也要计入总字节");
+        let mut normal = BufReader::new(std::io::Cursor::new(b"POST /api/mobile/v1/upload HTTP/1.1\r\nhost: relay\r\ncontent-length: 4\r\n\r\nbody"));
+        assert_eq!(parse_request_head(&mut normal).await.unwrap().content_length(), Some(4));
+        let mut body = String::new();
+        normal.read_to_string(&mut body).await.unwrap();
+        assert_eq!(body, "body", "读头不能丢预读请求体");
+    }
+
+    #[tokio::test]
+    async fn partial_request_head_has_an_overall_deadline() {
+        let (mut client, server) = tokio::io::duplex(128);
+        client.write_all(b"GET / HTTP/1.1\r\nx-half: ").await.unwrap();
+        let mut reader = BufReader::new(server);
+        assert!(matches!(read_request_head_with_timeout(&mut reader, 20).await, Err(ParseError::Timeout)));
+    }
+
+    #[tokio::test]
+    async fn body_idle_timeout_renews_after_each_successful_read() {
+        let (mut client, mut server) = tokio::io::duplex(128);
+        client.write_all(b"a").await.unwrap();
+        let mut byte = [0u8; 1];
+        assert_eq!(read_body_bytes(&mut server, &mut byte, 20).await.unwrap(), 1);
+        client.write_all(b"b").await.unwrap();
+        assert_eq!(read_body_bytes(&mut server, &mut byte, 20).await.unwrap(), 1);
+        assert_eq!(read_body_bytes(&mut server, &mut byte, 20).await.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+    }
 
     fn head(path: &str) -> RequestHead {
         let (pathname, query) = match path.split_once('?') {
