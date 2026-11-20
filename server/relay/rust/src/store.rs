@@ -1,8 +1,7 @@
 // 推送令牌失败回收按实例、设备与旧令牌原子匹配，不误删轮换后的新值。
-//! 控制台的数据层：SQLite 建表与查询。
+//! 控制台数据层：身份稳定匹配、有限登录事务与原子设备名额。
 //!
-//! 从 Node 运营版（`server/dsh-mobile-hub/lib/platform/`）译过来，**表结构与授权码规则
-//! 原样保留**——那些已经过验证，改结构只会制造迁移问题。
+//! 沿用 Node 运营版的授权码规则与基础表结构；新增列按已有探测补列方式升级。
 //!
 //! 约定沿用原版：
 //!   - 时间一律 UTC ISO-8601 字符串，字符串比较即时间比较；
@@ -26,6 +25,7 @@ PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS users (
   id            TEXT PRIMARY KEY,
   subject       TEXT NOT NULL UNIQUE,
+  oidc_sub      TEXT,
   display_name  TEXT NOT NULL DEFAULT '',
   avatar_url    TEXT NOT NULL DEFAULT '',
   openid        TEXT,
@@ -54,6 +54,7 @@ CREATE TABLE IF NOT EXISTS login_states (
   state         TEXT PRIMARY KEY,
   nonce         TEXT NOT NULL,
   code_verifier TEXT NOT NULL,
+  attempts_left INTEGER NOT NULL DEFAULT 3,
   redirect_uri  TEXT NOT NULL,
   next_path     TEXT NOT NULL DEFAULT '/',
   created_at    TEXT NOT NULL,
@@ -173,9 +174,17 @@ CREATE TABLE IF NOT EXISTS nodes (
 /// 给老库补列。`CREATE TABLE IF NOT EXISTS` 不会改动已经存在的表——加字段只能 ALTER，
 /// 否则老库一直在用缺列的表，新代码一查就报 `no such column`。
 ///
-/// 判据是「查一下这一列在不在」，不是版本号：只有一个列要补，不值得为它引入迁移框架。
+/// 判据是列是否存在，沿用现有方式逐列补齐。
 fn ensure_columns(conn: &Connection) {
     for (probe, ddl) in [
+        (
+            "SELECT oidc_sub FROM users LIMIT 1",
+            "ALTER TABLE users ADD COLUMN oidc_sub TEXT",
+        ),
+        (
+            "SELECT attempts_left FROM login_states LIMIT 1",
+            "ALTER TABLE login_states ADD COLUMN attempts_left INTEGER NOT NULL DEFAULT 3",
+        ),
         (
             "SELECT desired_mode FROM nodes LIMIT 1",
             "ALTER TABLE nodes ADD COLUMN desired_mode TEXT NOT NULL DEFAULT ''",
@@ -434,6 +443,77 @@ impl Store {
         self.find_user_by_id(&id).expect("刚插入的用户读不回来")
     }
 
+    /// 只按同类型标识匹配一个用户；冲突不归并，已有 subject 与权限保持稳定。
+    pub fn upsert_oidc_user(
+        &self,
+        sub: Option<&str>,
+        openid: Option<&str>,
+        union_id: Option<&str>,
+        display_name: &str,
+        avatar_url: &str,
+    ) -> Result<User, String> {
+        let sub = sub.filter(|v| !v.is_empty());
+        let openid = openid.filter(|v| !v.is_empty());
+        let union_id = union_id.filter(|v| !v.is_empty());
+        let subject = sub.map(|v| format!("sub:{v}"))
+            .or_else(|| union_id.map(|v| format!("unionid:{v}")))
+            .or_else(|| openid.map(|v| format!("openid:{v}")))
+            .ok_or_else(|| "登录系统没有返回可用的身份标识".to_string())?;
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        let mut candidates = Vec::new();
+        {
+            let mut stmt = tx.prepare(
+                "SELECT * FROM users WHERE
+                 (?1 IS NOT NULL AND (oidc_sub = ?1 OR subject = 'sub:' || ?1)) OR
+                 (?2 IS NOT NULL AND (openid = ?2 OR subject = 'openid:' || ?2)) OR
+                 (?3 IS NOT NULL AND (union_id = ?3 OR subject = 'unionid:' || ?3))"
+            ).map_err(|e| e.to_string())?;
+            let rows = stmt.query_map(params![sub, openid, union_id], map_user).map_err(|e| e.to_string())?;
+            for row in rows { candidates.push(row.map_err(|e| e.to_string())?); }
+        }
+        if candidates.len() > 1 {
+            return Err("登录身份标识对应多个账号，请联系管理员处理".into());
+        }
+        let ts = now_iso();
+        let id = if let Some(user) = candidates.first() {
+            let stored_sub: Option<String> = tx.query_row(
+                "SELECT oidc_sub FROM users WHERE id = ?1", params![user.id], |row| row.get(0)
+            ).map_err(|e| e.to_string())?;
+            for (incoming, stored, prefix) in [
+                (sub, stored_sub.as_deref(), "sub:"),
+                (openid, user.openid.as_deref(), "openid:"),
+                (union_id, user.union_id.as_deref(), "unionid:"),
+            ] {
+                let stored = stored.filter(|v| !v.is_empty()).or_else(|| user.subject.strip_prefix(prefix));
+                if matches!((incoming, stored), (Some(a), Some(b)) if a != b) {
+                    return Err("登录身份标识与已有账号冲突，请联系管理员处理".into());
+                }
+            }
+            tx.execute(
+                "UPDATE users SET oidc_sub = COALESCE(?1, oidc_sub), openid = COALESCE(?2, openid),
+                 union_id = COALESCE(?3, union_id), display_name = ?4, avatar_url = ?5,
+                 last_login_at = ?6, updated_at = ?6 WHERE id = ?7",
+                params![sub, openid, union_id, display_name, avatar_url, ts, user.id],
+            ).map_err(|e| e.to_string())?;
+            user.id.clone()
+        } else {
+            let id = uuid::Uuid::new_v4().to_string();
+            tx.execute(
+                "INSERT INTO users (id, subject, oidc_sub, openid, union_id, display_name, avatar_url,
+                 is_admin, status, created_at, updated_at, last_login_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 'active', ?8, ?8, ?8)",
+                params![id, subject, sub, openid, union_id, display_name, avatar_url, ts],
+            ).map_err(|e| e.to_string())?;
+            id
+        };
+        let user = tx.query_row("SELECT * FROM users WHERE id = ?1", params![id], map_user)
+            .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(user)
+    }
+
     /// 把用户提成管理员（`PLATFORM_ADMIN_SUBS` 白名单命中时用）。
     pub fn promote_admin(&self, id: &str) {
         let _ = self.lock().execute(
@@ -445,7 +525,7 @@ impl Store {
     // ── login_states（OIDC 授权事务）─────────────────────────────
 
     /// 记一次登录事务。顺手清掉过期的，别让它们堆着（与 Node 版同一做法）。
-    pub fn save_login_state(&self, state: &str, nonce: &str, verifier: &str, next_path: &str) {
+    pub fn save_login_state(&self, state: &str, nonce: &str, verifier: &str, next_path: &str, ttl_seconds: i64) {
         let conn = self.lock();
         let _ = conn.execute(
             "DELETE FROM login_states WHERE expires_at < ?1",
@@ -460,36 +540,27 @@ impl Store {
                 verifier,
                 next_path,
                 now_iso(),
-                iso_after_seconds(600)
+                iso_after_seconds(ttl_seconds)
             ],
         );
     }
 
-    /// 取出一次登录事务。返回 (code_verifier, next_path)。
-    ///
-    /// **查到不删**（2026-10-17 改）。原来这里是「查到即删」的一次性消费，结果线上
-    /// 出过一次真故障：回调请求被上游重发了一次（第一次 502、第二次才到），第一次
-    /// 已经把 state 删了，于是重试报「登录状态无效」——用户永远登不进去。
-    ///
-    /// 现在只在**换 token 成功之后**删（见 `finish_login_state`）。失败时 state 留着，
-    /// 重试还能接着用；反正 `expires_at` 到了自己就作废，过期行由 `save_login_state`
-    /// 顺手清掉。防重放靠的是有效期，不是「删得早」。
+    /// 外呼前原子占用一次尝试；最多三次，保留短暂失败后的有限重试。
     pub fn take_login_state(&self, state: &str) -> Option<(String, String)> {
-        let conn = self.lock();
-        let row: Option<(String, String, String)> = conn
-            .query_row(
-                "SELECT code_verifier, next_path, expires_at FROM login_states WHERE state = ?1",
-                params![state],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
-            .optional()
-            .ok()
-            .flatten();
-        let (verifier, next_path, expires_at) = row?;
-        if expires_at < now_iso() {
-            return None;
-        }
-        Some((verifier, next_path))
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).ok()?;
+        let updated = tx.execute(
+            "UPDATE login_states SET attempts_left = attempts_left - 1
+             WHERE state = ?1 AND expires_at > ?2 AND attempts_left > 0",
+            params![state, now_iso()],
+        ).ok()?;
+        if updated != 1 { return None; }
+        let result = tx.query_row(
+            "SELECT code_verifier, next_path FROM login_states WHERE state = ?1",
+            params![state], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).ok()?;
+        tx.commit().ok()?;
+        Some(result)
     }
 
     /// 登录成功之后把这条事务删掉。迟到的重试会拿到 None，这是对的。
@@ -649,36 +720,42 @@ impl Store {
         platform: &str,
     ) -> Result<Device, String> {
         let ts = now_iso();
-        if let Some(existing) = self.find_device(license_id, device_id) {
-            let _ = self.lock().execute(
-                "UPDATE devices SET device_name = ?1, platform = ?2, status = 'active', last_seen_at = ?3
-                 WHERE id = ?4",
-                params![
-                    if device_name.is_empty() { existing.device_name.clone() } else { device_name.to_string() },
-                    if platform.is_empty() { existing.platform.clone() } else { platform.to_string() },
-                    ts,
-                    existing.id
-                ],
-            );
-            return self
-                .find_device(license_id, device_id)
-                .ok_or_else(|| "设备更新后读不回来".to_string());
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        let existing = tx.query_row(
+            "SELECT * FROM devices WHERE license_id = ?1 AND device_id = ?2",
+            params![license_id, device_id], map_device,
+        ).optional().map_err(|e| e.to_string())?;
+        if existing.as_ref().map(|d| d.status != "active").unwrap_or(true) {
+            let limit: i64 = tx.query_row(
+                "SELECT device_limit FROM licenses WHERE id = ?1", params![license_id], |row| row.get(0),
+            ).map_err(|e| e.to_string())?;
+            let count: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM devices WHERE license_id = ?1 AND status = 'active'",
+                params![license_id], |row| row.get(0),
+            ).map_err(|e| e.to_string())?;
+            if count >= limit { return Err("device limit reached".into()); }
         }
-        let limit = self
-            .find_license_by_id(license_id)
-            .map(|l| l.device_limit)
-            .unwrap_or(1);
-        if self.count_active_devices(license_id) >= limit {
-            return Err("device limit reached".to_string());
+        if let Some(existing) = existing {
+            tx.execute(
+                "UPDATE devices SET device_name = ?1, platform = ?2, status = 'active', last_seen_at = ?3 WHERE id = ?4",
+                params![if device_name.is_empty() { existing.device_name.as_str() } else { device_name },
+                    if platform.is_empty() { existing.platform.as_str() } else { platform }, ts, existing.id],
+            ).map_err(|e| e.to_string())?;
+        } else {
+            tx.execute(
+                "INSERT INTO devices (id, license_id, device_id, device_name, platform, status, bound_at, last_seen_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, ?6)",
+                params![uuid::Uuid::new_v4().to_string(), license_id, device_id, device_name, platform, ts],
+            ).map_err(|e| e.to_string())?;
         }
-        let id = uuid::Uuid::new_v4().to_string();
-        let _ = self.lock().execute(
-            "INSERT INTO devices (id, license_id, device_id, device_name, platform, status, bound_at, last_seen_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, ?6)",
-            params![id, license_id, device_id, device_name, platform, ts],
-        );
-        self.find_device(license_id, device_id)
-            .ok_or_else(|| "设备插入后读不回来".to_string())
+        let device = tx.query_row(
+            "SELECT * FROM devices WHERE license_id = ?1 AND device_id = ?2",
+            params![license_id, device_id], map_device,
+        ).map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(device)
     }
 
     pub fn touch_device(&self, license_id: &str, device_id: &str) {
@@ -887,8 +964,8 @@ impl Store {
     // 按返回的下载地址拿包。**不做增量、不做多插件矩阵**——那套归 npm 市场，
     // 这里是救急用的临时通道，够用就停。
     //
-    // 包文件落在 `PLATFORM_OTA_ROOT` 下按 `<platform>/<channel>/<version>.tar.gz` 存，
-    // 库里只记路径与大小。
+    // 包文件落在 `PLATFORM_OTA_ROOT/<platform>/<channel>/` 下；索引记录本次发布的
+    // 独立文件路径、大小与摘要，外部下载 URL 仍按版本号查索引。
 
     /// 登记一个包，并让它成为该平台/渠道的最新版。
     pub fn put_ota_release(
@@ -899,8 +976,8 @@ impl Store {
         package_path: &str,
         size: i64,
         sha256: &str,
-    ) {
-        let _ = self.lock().execute(
+    ) -> Result<(), String> {
+        self.lock().execute(
             "INSERT INTO ota_releases (id, platform, channel, version, package_path, size, sha256, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(platform, channel, version) DO UPDATE SET
@@ -916,7 +993,7 @@ impl Store {
                 sha256,
                 now_iso()
             ],
-        );
+        ).map(|_| ()).map_err(|error| format!("登记 OTA 版本失败: {error}"))
     }
 
     /// 某个平台/渠道的最新版。没有就 None——客户端据此判「没有更新」。
@@ -1080,16 +1157,17 @@ impl Store {
 
     // ── audit ─────────────────────────────────────────────────────
 
-    pub fn audit(&self, actor_id: Option<&str>, action: &str, target: &str, detail: &str) {
+    pub fn audit(&self, actor_id: Option<&str>, action: &str, target: &str, detail: &str, ip: Option<&str>) {
         let _ = self.lock().execute(
-            "INSERT INTO audit_logs (id, actor_id, action, target, detail, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO audit_logs (id, actor_id, action, target, detail, ip, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 uuid::Uuid::new_v4().to_string(),
                 actor_id,
                 action,
                 target,
                 detail,
+                ip,
                 now_iso()
             ],
         );
@@ -1316,7 +1394,7 @@ pub fn iso_after_seconds(seconds: i64) -> String {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    epoch_to_iso((now + seconds.max(0)) as u64)
+    epoch_to_iso(now.saturating_add(seconds.max(0)) as u64)
 }
 
 /// 秒级时间戳 → `YYYY-MM-DDTHH:MM:SS.000Z`。
@@ -1428,12 +1506,160 @@ mod tests {
         assert_eq!(store.count_active_devices(&license.id), 1);
     }
 
+    async fn publish_with_read_only_database_keeps_previous_release(replace_same_version: bool) {
+        let store = Store::in_memory().unwrap();
+        let root = std::env::temp_dir().join(format!("dsh-ota-read-only-{}", uuid::Uuid::new_v4()));
+        let mut config = crate::console::config::ConsoleConfig::from_env();
+        config.ota_root = root.to_string_lossy().into();
+        config.ota_control_token = "tok".into();
+        let headers = vec![("authorization".into(), "Bearer tok".into())];
+        let original = vec![0x1f, 0x8b, 7, 8, 9];
+        let published = crate::console::ota::handle_publish(
+            &store, &config, "platform=darwin&version=1.0.0", &headers, original.clone(),
+        ).await;
+        assert_eq!(published.status, 200);
+        let previous = store.latest_for_exact("darwin", "stable", "1.0.0").unwrap();
+        let previous_json = serde_json::to_value(&previous).unwrap();
+        // 使用真实 SQLite 只读写入错误，包目录仍然可写。
+        store.lock().execute_batch("PRAGMA query_only = ON").unwrap();
+        let version = if replace_same_version { "1.0.0" } else { "1.0.1" };
+        let failed = crate::console::ota::handle_publish(
+            &store, &config, &format!("platform=darwin&version={version}"), &headers, vec![0x1f, 0x8b, 1, 2],
+        ).await;
+        assert_eq!(failed.status, 500, "数据库写失败不能报告发布成功");
+        let error: serde_json::Value = serde_json::from_slice(&failed.body).unwrap();
+        assert_eq!(error["ok"], false);
+        let retained = store.latest_ota_release("darwin", "stable").unwrap();
+        assert_eq!(serde_json::to_value(&retained).unwrap(), previous_json, "旧索引全部元数据必须保留");
+        assert_eq!(std::fs::read(&previous.package_path).unwrap(), original);
+        if !replace_same_version {
+            assert!(store.latest_for_exact("darwin", "stable", version).is_none());
+        }
+        let mut download = crate::console::ota::handle_download(&store, "darwin/stable/1.0.0").await.ok().unwrap();
+        assert_eq!(download.sha256, previous.sha256);
+        let (next, bytes) = download.read_chunk().await.unwrap();
+        download = next;
+        assert_eq!(bytes, original, "发布失败后旧版本仍能按原摘要下载");
+        drop(download);
+        let files: Vec<_> = std::fs::read_dir(root.join("darwin/stable")).unwrap().collect();
+        assert_eq!(files.len(), 1, "失败候选包必须清理");
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn new_ota_release_database_failure_keeps_existing_latest_and_cleans_candidate() {
+        publish_with_read_only_database_keeps_previous_release(false).await;
+    }
+
+    #[tokio::test]
+    async fn same_version_ota_database_failure_keeps_original_package_and_metadata() {
+        publish_with_read_only_database_keeps_previous_release(true).await;
+    }
+
+    #[test]
+    fn oidc_identifiers_keep_existing_user_and_admin_across_field_changes() {
+        let store = Store::in_memory().unwrap();
+        let first = store.upsert_user("openid:wx-a", "旧名字", "", Some("wx-a"), None);
+        store.promote_admin(&first.id);
+        let enriched = store.upsert_oidc_user(Some("subject-a"), Some("wx-a"), Some("union-a"), "新名字", "avatar").unwrap();
+        assert_eq!(enriched.id, first.id);
+        assert!(enriched.is_admin);
+        assert_eq!(enriched.subject, "openid:wx-a", "旧 subject 不漂移");
+        let only_sub = store.upsert_oidc_user(Some("subject-a"), None, None, "再次登录", "").unwrap();
+        assert_eq!(only_sub.id, first.id);
+        let only_union = store.upsert_oidc_user(None, None, Some("union-a"), "", "").unwrap();
+        assert_eq!(only_union.id, first.id);
+        assert_eq!(store.user_count(), 1);
+    }
+
+    #[test]
+    fn oidc_never_merges_conflicting_or_cross_type_identities() {
+        let store = Store::in_memory().unwrap();
+        let a = store.upsert_oidc_user(Some("same"), Some("openid-a"), None, "同名", "").unwrap();
+        let b = store.upsert_oidc_user(None, Some("same"), None, "同名", "").unwrap();
+        assert_ne!(a.id, b.id, "同字串不同标识类型不是同一人");
+        assert!(store.upsert_oidc_user(Some("same"), Some("same"), None, "同名", "").is_err());
+        assert!(store.upsert_oidc_user(Some("changed-sub"), Some("openid-a"), None, "同名", "").is_err());
+        assert_eq!(store.user_count(), 2);
+        assert_eq!(store.find_user_by_id(&a.id).unwrap().openid.as_deref(), Some("openid-a"));
+        assert!(store.upsert_oidc_user(None, None, None, "同名", "").is_err());
+    }
+
+    #[test]
+    fn old_identity_and_login_tables_gain_columns_without_losing_rows() {
+        let path = std::env::temp_dir().join(format!("dsh-store-login-{}.db", uuid::Uuid::new_v4()));
+        {
+            let conn = Connection::open(&path).unwrap();
+            let legacy = SCHEMA.replace("  oidc_sub      TEXT,\n", "")
+                .replace("  attempts_left INTEGER NOT NULL DEFAULT 3,\n", "");
+            conn.execute_batch(&legacy).unwrap();
+            conn.execute("INSERT INTO users (id,subject,is_admin,created_at,updated_at) VALUES ('old-admin','openid:old',1,'2026-01-01','2026-01-01')", []).unwrap();
+            conn.execute("INSERT INTO login_states (state,nonce,code_verifier,redirect_uri,created_at,expires_at) VALUES ('old-state','n','v','','2026-01-01','2999-01-01T00:00:00.000Z')", []).unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let user = store.upsert_oidc_user(Some("new-sub"), Some("old"), None, "", "").unwrap();
+        assert_eq!(user.id, "old-admin");
+        assert!(user.is_admin);
+        for _ in 0..3 { assert!(store.take_login_state("old-state").is_some()); }
+        assert!(store.take_login_state("old-state").is_none());
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn login_state_attempt_budget_is_atomic_and_ttl_is_used() {
+        let store = Store::in_memory().unwrap();
+        store.save_login_state("limited", "nonce", "verifier", "/", 1800);
+        let (created, expires): (String, String) = store.lock().query_row(
+            "SELECT created_at, expires_at FROM login_states WHERE state = 'limited'", [], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert!(expires > created);
+        assert!(expires >= iso_after_seconds(1798), "有效期必须使用传入值");
+        let gate = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let threads: Vec<_> = (0..8).map(|_| {
+            let (store, gate) = (store.clone(), gate.clone());
+            std::thread::spawn(move || { gate.wait(); store.take_login_state("limited").is_some() })
+        }).collect();
+        let allowed = threads.into_iter().map(|t| t.join().unwrap() as usize).sum::<usize>();
+        assert_eq!(allowed, 3, "并发也只能占用三次外呼额度");
+        assert!(store.take_login_state("limited").is_none());
+        store.save_login_state("zero-ttl", "n", "v", "/", 0);
+        assert!(store.take_login_state("zero-ttl").is_none());
+    }
+
+    #[test]
+    fn concurrent_binding_cannot_exceed_device_limit() {
+        let store = Store::in_memory().unwrap();
+        let license = store.create_license(None, "");
+        let gate = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let threads: Vec<_> = (0..8).map(|i| {
+            let (store, gate, license) = (store.clone(), gate.clone(), license.id.clone());
+            std::thread::spawn(move || { gate.wait(); store.bind_device(&license, &format!("device-{i}"), "", "ios").is_ok() })
+        }).collect();
+        let accepted = threads.into_iter().map(|t| t.join().unwrap() as usize).sum::<usize>();
+        assert_eq!(accepted, 1);
+        assert_eq!(store.count_active_devices(&license.id), 1);
+    }
+
+    #[test]
+    fn audit_records_given_source_ip_and_background_can_omit_it() {
+        let store = Store::in_memory().unwrap();
+        store.audit(Some("admin"), "license.create", "code", "", Some("203.0.113.8"));
+        store.audit(None, "settings.admission_mode", "open", "master", None);
+        let conn = store.lock();
+        let ip: String = conn.query_row("SELECT ip FROM audit_logs WHERE actor_id = 'admin'", [], |row| row.get(0)).unwrap();
+        assert_eq!(ip, "203.0.113.8");
+        let ip: Option<String> = conn.query_row("SELECT ip FROM audit_logs WHERE actor_id IS NULL", [], |row| row.get(0)).unwrap();
+        assert_eq!(ip, None);
+    }
+
     #[test]
     fn login_state_survives_until_explicitly_finished() {
         // 线上真故障的回归：回调被上游重发时，第一次失败不能把 state 弄丢，
         // 否则重试只会拿到「登录状态无效」。
         let store = Store::in_memory().unwrap();
-        store.save_login_state("state-1", "nonce-1", "verifier-1", "/");
+        store.save_login_state("state-1", "nonce-1", "verifier-1", "/", 600);
 
         // 第一次：取得到
         let first = store.take_login_state("state-1");
@@ -1458,7 +1684,7 @@ mod tests {
     #[test]
     fn expired_login_state_is_rejected() {
         let store = Store::in_memory().unwrap();
-        store.save_login_state("state-old", "nonce", "verifier", "/");
+        store.save_login_state("state-old", "nonce", "verifier", "/", 600);
         // 手动把过期时间拨到过去
         let conn = store.lock();
         let _ = conn.execute(
@@ -1488,8 +1714,8 @@ mod tests {
         let user = store.upsert_user("sub-1", "甲", "", None, None);
         store.create_session(&user.id, "hash-old", "1970-01-01T00:00:00.000Z");
         store.create_session(&user.id, "hash-new", "2999-01-01T00:00:00.000Z");
-        store.save_login_state("st-old", "nonce", "verifier", "/");
-        store.save_login_state("st-new", "nonce", "verifier", "/");
+        store.save_login_state("st-old", "nonce", "verifier", "/", 600);
+        store.save_login_state("st-new", "nonce", "verifier", "/", 600);
 
         // 手工把一条说过期：save_login_state 自己算的是未来时间。
         {

@@ -1,4 +1,4 @@
-//! 插件 OTA 的**临时通道**。
+//! 插件 OTA 临时通道：需要 PLATFORM_ENABLED，下载分块读取，发布磁盘工作移到阻塞池。
 //!
 //! 正式分发归 npm 插件市场（`dsh-mobile-plugin/lib/shell/updater.js`）；这里只服务
 //! 宿主里那条救急通道（`lib/shell/device-ota.js`）：
@@ -10,8 +10,8 @@
 //!   POST /api/desktop-plugins/ota/publish   （Bearer 控制面 token）
 //!        → 登记一个包并让它成为该平台/渠道的最新版
 //!
-//! **刻意比运营版简单**：不再有 manifest 校验、content hash、增量发布、多插件矩阵——
-//! 那套是给「正式分发」设计的，而这边是临时救急：把某个版本塞给某台机器。客户端
+//! 保留发布摘要与客户端包校验，不接运营版的增量发布、多插件矩阵。
+//! 这边是临时救急：把某个版本塞给某台机器。客户端
 //! （`device-ota.js`）只读得到那五个字段（version / platform / channel / packageUrl / sha256）。
 //!
 //! 包格式必须与客户端的解包器对得上：tar 里条目以 `package/` 打头，且包含
@@ -49,6 +49,12 @@ fn channel_of(query: &str) -> String {
 
 fn platform_of(query: &str) -> String {
     super::oidc::query_param(query, "platform").unwrap_or_default()
+}
+
+/// 索引切换与打开文件保持同一快照，旧文件在新索引成功后才清理。
+fn package_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
 }
 
 /// 客户端问「该装哪个版本」。没有匹配的版本就回 `ok:false` 让客户端判「没有更新」。
@@ -94,29 +100,47 @@ pub fn handle_latest(
 }
 
 /// 下载一个包。路径结构 `<platform>/<channel>/<version>`（`.tar.gz` 后缀可省）。
-pub fn handle_download(store: &Store, rest: &str) -> ConsoleResponse {
+pub struct OtaDownload {
+    pub file: std::fs::File,
+    pub size: u64,
+    pub sha256: String,
+}
+
+/// 打开固定文件句柄，后续同版本发布替换路径不改变这次下载的文件。
+pub async fn handle_download(store: &Store, rest: &str) -> Result<OtaDownload, ConsoleResponse> {
     let trimmed = rest.trim_end_matches(".tar.gz");
     let mut parts = trimmed.split('/');
     let (Some(platform), Some(channel), Some(version)) = (parts.next(), parts.next(), parts.next())
     else {
-        return ConsoleResponse::text(404, "not found\n");
+        return Err(ConsoleResponse::text(404, "not found\n"));
     };
     if parts.next().is_some() || !safe_segment(platform) || !safe_segment(channel) || !valid_version(version) {
-        return ConsoleResponse::text(404, "not found\n");
+        return Err(ConsoleResponse::text(404, "not found\n"));
     }
-    let Some(release) = store.latest_for_exact(platform, channel, version) else {
-        return ConsoleResponse::text(404, "not found\n");
-    };
-    match std::fs::read(&release.package_path) {
-        Ok(bytes) => ConsoleResponse {
-            status: 200,
-            content_type: "application/gzip",
-            body: bytes,
-            set_cookie: None,
-            redirect: None,
-        },
-        // 库里有记录、盘上没文件：说明运维动过目录，如实回 404 而不是空 200。
-        Err(_) => ConsoleResponse::text(404, "package missing on disk\n"),
+    let store = store.clone();
+    let (platform, channel, version) = (platform.to_string(), channel.to_string(), version.to_string());
+    tokio::task::spawn_blocking(move || {
+        let _guard = package_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let release = store.latest_for_exact(&platform, &channel, &version)
+            .ok_or_else(|| ConsoleResponse::text(404, "not found\n"))?;
+        let file = std::fs::File::open(&release.package_path)
+            .map_err(|_| ConsoleResponse::text(404, "package missing on disk\n"))?;
+        let size = file.metadata().map_err(|_| ConsoleResponse::text(404, "package missing on disk\n"))?.len();
+        Ok(OtaDownload { file, size, sha256: release.sha256 })
+    }).await.unwrap_or_else(|_| Err(ConsoleResponse::text(500, "package open failed\n")))
+}
+
+/// 固定大小缓冲区；每次磁盘读取都离开 async 执行线程。
+impl OtaDownload {
+    pub async fn read_chunk(self) -> std::io::Result<(Self, Vec<u8>)> {
+        tokio::task::spawn_blocking(move || {
+            use std::io::Read;
+            let mut download = self;
+            let mut buffer = vec![0; 64 * 1024];
+            let count = download.file.read(&mut buffer)?;
+            buffer.truncate(count);
+            Ok((download, buffer))
+        }).await.map_err(|error| std::io::Error::other(error.to_string()))?
     }
 }
 
@@ -149,19 +173,22 @@ pub fn authorize_publish(
 /// 接收一个包。请求体就是 tar.gz 本身，平台/渠道/版本走查询串。
 ///
 /// 鉴权是 Bearer 控制面 token；没配 token 时整个发布接口关闭（下载不受影响）。
-pub fn handle_publish(
+pub async fn handle_publish(
     store: &Store,
     config: &ConsoleConfig,
     query: &str,
     headers: &[(String, String)],
-    body: &[u8],
+    body: Vec<u8>,
 ) -> ConsoleResponse {
-    // 分派处已经先验过一次（为了不预读 body）；这里再验一次只是为了这条函数被
-    // 单独调用时也守住身份，双重校验无害。
-    if let Err(response) = authorize_publish(config, headers) {
-        return response;
-    }
+    if let Err(response) = authorize_publish(config, headers) { return response; }
+    let store = store.clone();
+    let config = config.clone();
+    let query = query.to_string();
+    tokio::task::spawn_blocking(move || publish_package(&store, &config, &query, &body))
+        .await.unwrap_or_else(|_| ConsoleResponse::text(500, "package publish failed\n"))
+}
 
+fn publish_package(store: &Store, config: &ConsoleConfig, query: &str, body: &[u8]) -> ConsoleResponse {
     let platform = platform_of(query);
     let channel = channel_of(query);
     let version = super::oidc::query_param(query, "version").unwrap_or_default();
@@ -170,6 +197,9 @@ pub fn handle_publish(
             400,
             json!({ "ok": false, "error": "platform / channel / version (X.Y.Z) are required" }),
         );
+    }
+    if body.len() > 32 * 1024 * 1024 {
+        return ConsoleResponse::json(413, json!({ "ok": false, "error": "package too large" }));
     }
     if body.is_empty() {
         return ConsoleResponse::json(400, json!({ "ok": false, "error": "empty package" }));
@@ -191,23 +221,30 @@ pub fn handle_publish(
             json!({ "ok": false, "error": format!("创建目录失败: {error}") }),
         );
     }
-    let file = dir.join(format!("{version}.tar.gz"));
+    // 候选文件不覆盖旧路径；数据库单条写入成功才发布这个文件。
+    let file = dir.join(format!("{version}.{}.tar.gz", uuid::Uuid::new_v4()));
     if let Err(error) = std::fs::write(&file, body) {
-        return ConsoleResponse::json(
-            500,
-            json!({ "ok": false, "error": format!("写包失败: {error}") }),
-        );
+        let _ = std::fs::remove_file(&file);
+        return ConsoleResponse::json(500, json!({ "ok": false, "error": format!("写包失败: {error}") }));
     }
-    // 哈希在这里算：客户端下载后会核对，半个包 / 被中间层改过的包在激活之前就会被挡下。
     let sha256 = format!("{:x}", Sha256::digest(body));
-    store.put_ota_release(
+    let _guard = package_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let previous = store.latest_for_exact(&platform, &channel, &version);
+    if let Err(error) = store.put_ota_release(
         &platform,
         &channel,
         &version,
         &file.to_string_lossy(),
         body.len() as i64,
         &sha256,
-    );
+    ) {
+        let _ = std::fs::remove_file(&file);
+        return ConsoleResponse::json(500, json!({ "ok": false, "error": error }));
+    }
+    // 索引已原子切换后才清旧路径；已打开的下载句柄仍可完整读完。
+    if let Some(previous) = previous {
+        let _ = std::fs::remove_file(&previous.package_path);
+    }
     ConsoleResponse::json(
         200,
         json!({
@@ -248,8 +285,8 @@ mod tests {
         assert_eq!(body["ok"], false, "没发过包时必须是 ok:false，客户端据此判没有更新");
     }
 
-    #[test]
-    fn publish_then_latest_returns_download_url() {
+    #[tokio::test]
+    async fn publish_then_latest_returns_download_url() {
         let store = Store::in_memory().unwrap();
         let config = config();
         let dir = std::env::temp_dir().join(format!("dsh-ota-test-{}", std::process::id()));
@@ -263,8 +300,8 @@ mod tests {
             &config,
             "platform=darwin&channel=stable&version=0.1.61",
             &headers,
-            &[0x1f, 0x8b, 0x08, 0x00],
-        );
+            vec![0x1f, 0x8b, 0x08, 0x00],
+        ).await;
         assert_eq!(published.status, 200, "{:?}", String::from_utf8_lossy(&published.body));
         let published_body: serde_json::Value = serde_json::from_slice(&published.body).unwrap();
         assert_eq!(published_body["data"]["size"].as_u64().unwrap(), 4, "回执里的 size 必须是真收下的字节数");
@@ -293,11 +330,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn publish_requires_token() {
+    #[tokio::test]
+    async fn publish_requires_token() {
         let store = Store::in_memory().unwrap();
         let config = config();
-        let body = handle_publish(&store, &config, "platform=darwin&channel=stable&version=1.0.0", &[], &[0x1f, 0x8b]);
+        let body = handle_publish(&store, &config, "platform=darwin&channel=stable&version=1.0.0", &[], vec![0x1f, 0x8b]).await;
         assert_eq!(body.status, 401, "没有 Bearer token 必须拒");
 
         let wrong = handle_publish(
@@ -305,38 +342,68 @@ mod tests {
             &config,
             "platform=darwin&channel=stable&version=1.0.0",
             &[("authorization".to_string(), "Bearer nope".to_string())],
-            &[0x1f, 0x8b],
-        );
+            vec![0x1f, 0x8b],
+        ).await;
         assert_eq!(wrong.status, 401);
 
         // 没配 token 时整个发布关闭
         let mut disabled = config.clone();
         disabled.ota_control_token = String::new();
-        let closed = handle_publish(&store, &disabled, "platform=darwin&channel=stable&version=1.0.0", &[], &[0x1f, 0x8b]);
+        let closed = handle_publish(&store, &disabled, "platform=darwin&channel=stable&version=1.0.0", &[], vec![0x1f, 0x8b]).await;
         assert_eq!(closed.status, 403);
     }
 
-    #[test]
-    fn only_latest_version_is_served() {
+    #[tokio::test]
+    async fn streamed_download_is_bounded_and_survives_same_version_republish() {
+        let store = Store::in_memory().unwrap();
+        let mut config = config();
+        let dir = std::env::temp_dir().join(format!("dsh-ota-stream-{}", uuid::Uuid::new_v4()));
+        config.ota_root = dir.to_string_lossy().into();
+        let headers = vec![("authorization".into(), "Bearer tok".into())];
+        let mut original = vec![7; 200_000];
+        original[..2].copy_from_slice(&[0x1f, 0x8b]);
+        assert_eq!(handle_publish(&store, &config, "platform=darwin&version=1.0.0", &headers, original.clone()).await.status, 200);
+        let mut download = handle_download(&store, "darwin/stable/1.0.0").await.ok().unwrap();
+        assert_eq!(download.size, original.len() as u64);
+        assert_eq!(download.sha256, format!("{:x}", Sha256::digest(&original)));
+        let replacement = vec![0x1f, 0x8b, 1, 2];
+        assert_eq!(handle_publish(&store, &config, "platform=darwin&version=1.0.0", &headers, replacement.clone()).await.status, 200);
+        let mut received = Vec::new();
+        loop {
+            let (next, chunk) = download.read_chunk().await.unwrap();
+            download = next;
+            assert!(chunk.len() <= 64 * 1024);
+            if chunk.is_empty() { break; }
+            received.extend_from_slice(&chunk);
+        }
+        assert_eq!(received, original, "同版本覆盖不截断已打开的下载");
+        let next = handle_download(&store, "darwin/stable/1.0.0").await.ok().unwrap();
+        let (_, bytes) = next.read_chunk().await.unwrap();
+        assert_eq!(bytes, replacement);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn only_latest_version_is_served() {
         let store = Store::in_memory().unwrap();
         let mut config = config();
         let dir = std::env::temp_dir().join(format!("dsh-ota-test2-{}", std::process::id()));
         config.ota_root = dir.to_string_lossy().to_string();
         let headers = vec![("authorization".to_string(), "Bearer tok".to_string())];
 
-        handle_publish(&store, &config, "platform=darwin&channel=stable&version=1.0.0", &headers, &[0x1f, 0x8b, 0]);
-        handle_publish(&store, &config, "platform=darwin&channel=stable&version=1.0.1", &headers, &[0x1f, 0x8b, 0]);
+        handle_publish(&store, &config, "platform=darwin&channel=stable&version=1.0.0", &headers, vec![0x1f, 0x8b, 0]).await;
+        handle_publish(&store, &config, "platform=darwin&channel=stable&version=1.0.1", &headers, vec![0x1f, 0x8b, 0]).await;
 
         let latest = handle_latest(&store, &config, "platform=darwin&channel=stable");
         let body: serde_json::Value = serde_json::from_slice(&latest.body).unwrap();
         assert_eq!(body["data"]["version"], "1.0.1", "latest 必须是最后发的那个");
 
         // 老版本仍可下载（客户端可能拿着旧链接）。
-        assert_eq!(handle_download(&store, "darwin/stable/1.0.0").status, 200);
+        assert!(handle_download(&store, "darwin/stable/1.0.0").await.is_ok());
         // 不存在的版本 404。
-        assert_eq!(handle_download(&store, "darwin/stable/9.9.9").status, 404);
+        assert_eq!(handle_download(&store, "darwin/stable/9.9.9").await.err().unwrap().status, 404);
         // 路径穿越 404。
-        assert_eq!(handle_download(&store, "darwin/stable/../../etc/passwd").status, 404);
+        assert_eq!(handle_download(&store, "darwin/stable/../../etc/passwd").await.err().unwrap().status, 404);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -1,4 +1,4 @@
-// blob 读取在阻塞线程执行；来源解析与控制面共用可信代理规则。
+// blob/OTA 分块读取在阻塞线程执行；控制面共用可信代理规则。
 //! 有界读取 HTTP 请求并分流到转发、升级或本地应答。
 //!
 //! 不引 http 框架：中转只处理固定的几种形态（体检、状态、`/tunnel` 升级、其余转发），
@@ -638,6 +638,27 @@ pub async fn respond_console(
     .await
 }
 
+/// 包读取与网络写入分开背压，内存只持有一个固定大小块。
+async fn respond_ota_download<S: AsyncRead + tokio::io::AsyncWrite + Unpin>(
+    reader: &mut BufReader<S>,
+    mut download: crate::console::ota::OtaDownload,
+) -> std::io::Result<()> {
+    let head = format!("HTTP/1.1 200 OK\r\ncontent-type: application/gzip\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", download.size);
+    reader.get_mut().write_all(head.as_bytes()).await?;
+    let mut remaining = download.size;
+    while remaining > 0 {
+        let (next, bytes) = download.read_chunk().await?;
+        download = next;
+        if bytes.is_empty() {
+            return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "OTA package truncated"));
+        }
+        let count = bytes.len().min(remaining as usize);
+        reader.get_mut().write_all(&bytes[..count]).await?;
+        remaining -= count as u64;
+    }
+    reader.get_mut().flush().await
+}
+
 /// 中转自己认领的路径。返回 `true` 表示已经应答、别再转发。
 pub async fn handle_owned_path(
     reader: &mut BufReader<TcpStream>,
@@ -794,8 +815,8 @@ pub async fn handle_owned_path(
             Ok(true)
         }
         other => {
-            // 插件 OTA 临时通道：`/api/desktop-plugins/ota/**`。它独立于控制台开关
-            // （宿主可能没开控制台但仍在用这条救急通道），所以单独判。
+            // 插件 OTA 临时通道共用控制台数据库，需要 PLATFORM_ENABLED=1。
+            // 单独匹配宿主救急路径，不额外开启独立服务。
             if let Some(rest) = other.strip_prefix("/api/desktop-plugins/ota/") {
                 let Some(console) = crate::console() else {
                     return Ok(false);
@@ -824,6 +845,13 @@ pub async fn handle_owned_path(
                 } else {
                     Vec::new()
                 };
+                if head.method == "GET" && rest.starts_with("download/") {
+                    match crate::console::ota::handle_download(&console.store, rest.trim_start_matches("download/")).await {
+                        Ok(download) => respond_ota_download(reader, download).await?,
+                        Err(response) => respond_console(reader, &response).await?,
+                    }
+                    return Ok(true);
+                }
                 let response = match (head.method.as_str(), rest) {
                     ("GET", "latest") => {
                         crate::console::ota::handle_latest(&console.store, &console.config, &head.query)
@@ -833,14 +861,8 @@ pub async fn handle_owned_path(
                         &console.config,
                         &head.query,
                         &head.headers,
-                        &body,
-                    ),
-                    ("GET", download) if download.starts_with("download/") => {
-                        crate::console::ota::handle_download(
-                            &console.store,
-                            download.trim_start_matches("download/"),
-                        )
-                    }
+                        body,
+                    ).await,
                     _ => crate::console::ConsoleResponse::text(404, "not found\n"),
                 };
                 respond_console(reader, &response).await?;
@@ -1040,6 +1062,28 @@ pub async fn serve_connection(stream: TcpStream, slot: Arc<TunnelSlot>) -> std::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn ota_response_streams_exact_length_through_network_backpressure() {
+        let path = std::env::temp_dir().join(format!("dsh-ota-http-{}", uuid::Uuid::new_v4()));
+        let payload = vec![42; 200_000];
+        std::fs::write(&path, &payload).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let download = crate::console::ota::OtaDownload { file, size: payload.len() as u64, sha256: String::new() };
+        let (mut client, server) = tokio::io::duplex(1024);
+        let sending = tokio::spawn(async move {
+            let mut reader = BufReader::new(server);
+            respond_ota_download(&mut reader, download).await.unwrap();
+        });
+        let mut wire = Vec::new();
+        client.read_to_end(&mut wire).await.unwrap();
+        sending.await.unwrap();
+        let split = wire.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+        let head = String::from_utf8_lossy(&wire[..split]);
+        assert!(head.contains("content-length: 200000"));
+        assert_eq!(&wire[split + 4..], payload.as_slice());
+        let _ = std::fs::remove_file(path);
+    }
 
     #[tokio::test]
     async fn request_head_limits_count_bytes_including_duplicate_headers() {

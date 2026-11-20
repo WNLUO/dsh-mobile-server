@@ -1,4 +1,4 @@
-//! 微信登录（OIDC）：接一套标准 OIDC 聚合登录系统（基址由 `PLATFORM_OIDC_ISSUER` 给）。
+//! 微信 OIDC 登录：保留所有同类型身份标识，交存储层稳定匹配。
 //!
 //! 与 Node 运营版（`lib/platform/oidc.js`）同一个客户端注册、同一套约束，**逐条搬**：
 //!   - `/oauth2/token` 只吃 `application/x-www-form-urlencoded`，不是 JSON；
@@ -70,9 +70,8 @@ struct Discovery {
 /// 所以这里**一次把所有坑封掉**：字段可能是字符串、`null`、数字、对象……统一过
 /// `as_str()`，取不到就当空串。将来它多发或互换类型都不会再让登录失败。
 ///
-/// 身份标识按优先级取：`sub`（OIDC 标准）→ `unionid`（微信跨应用稳定）→ `openid`。
-/// 取到哪个都加前缀，**不能混用**——同一个人的 sub 与 openid 是两个不同字符串，
-/// 混着用会让同一个人被当成两个账号。
+/// 首次建号的 subject 优先级为 sub → unionid → openid；所有实际提供的标识
+/// 都交给存储层按同类型匹配，字段增减不改变已有用户 ID。
 #[derive(Debug, Clone, Default)]
 pub struct Claims {
     pub sub: String,
@@ -103,7 +102,14 @@ impl Claims {
         }
     }
 
-    /// 这个人是谁。返回 `(前缀化后的稳定键, 用的是哪个字段)`。
+    /// 不跨类型比较标识；白名单可匹配本次上游实际提供的任一标识。
+    pub fn identity_keys(&self) -> Vec<String> {
+        [("sub", &self.sub), ("unionid", &self.unionid), ("openid", &self.openid)]
+            .into_iter().filter(|(_, value)| !value.is_empty())
+            .map(|(kind, value)| format!("{kind}:{value}")).collect()
+    }
+
+    /// 首次建号时的首选 subject；后续查号使用全部同类型标识。
     pub fn identity_key(&self) -> Option<(String, &'static str)> {
         if !self.sub.is_empty() {
             return Some((format!("sub:{}", self.sub), "sub"));
@@ -432,6 +438,14 @@ mod tests {
             parse(r#"{"openid":"oY","name":123,"picture":{}}"#).identity_key(),
             Some(("openid:oY".into(), "openid"))
         );
+    }
+
+    #[test]
+    fn all_present_identifiers_remain_available_when_preferred_field_changes() {
+        let claims = parse(r#"{"sub":"s","openid":"o","unionid":"u"}"#);
+        assert_eq!(claims.identity_keys(), vec!["sub:s", "unionid:u", "openid:o"]);
+        let claims = parse(r#"{"openid":"s"}"#);
+        assert_eq!(claims.identity_keys(), vec!["openid:s"]);
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! 控制台的配置：从环境变量读，前缀 `PLATFORM_`。
+//! 控制台配置与登录事务期限；HTTPS 会话使用 Secure Cookie。
 //!
 //! 与 Node 运营版（`server/dsh-mobile-hub/lib/platform/config.js`）的变量名保持一致，
 //! 这样线上那份 `/etc/dsh-platform.env` 可以原样继续用，不用重新配一遍。
@@ -13,7 +13,7 @@ use std::env;
 pub struct ConsoleConfig {
     /// 控制台总开关。`PLATFORM_ENABLED=1` 才开。
     pub enabled: bool,
-    /// 对外可访问的基址，用来拼 redirect_uri 与面板链接。
+    /// 对外可访问的基址，用来拼 redirect_uri 与面板链接；生产部署使用 HTTPS。
     pub public_base_url: String,
     /// 面板的挂载前缀，前端静态资源在这里。
     pub web_prefix: String,
@@ -24,7 +24,6 @@ pub struct ConsoleConfig {
     /// 面板静态产物目录；缺省时只提供 API，不吐前端。
     pub web_root: String,
 
-    pub session_secret: String,
     pub session_cookie: String,
     pub session_ttl_seconds: i64,
 
@@ -111,7 +110,6 @@ impl ConsoleConfig {
             api_prefix: "/api/platform/v1".to_string(),
             db_path: str_env("PLATFORM_DB_PATH", "data/console.db"),
             web_root: str_env("PLATFORM_WEB_ROOT", ""),
-            session_secret: str_env("PLATFORM_SESSION_SECRET", ""),
             session_cookie: str_env("PLATFORM_SESSION_COOKIE", "dsh_platform_session"),
             session_ttl_seconds: int_env("PLATFORM_SESSION_TTL_SECONDS", 30 * 24 * 3600),
             oidc_issuer,
@@ -166,15 +164,19 @@ impl ConsoleConfig {
         }
     }
 
+    /// 会话令牌为随机值，库内只存摘要；不需要另配签名 secret。
+    pub fn secure_cookie(&self) -> bool {
+        self.public_base_url.split_once("://")
+            .map(|(scheme, _)| scheme.eq_ignore_ascii_case("https"))
+            .unwrap_or(false)
+    }
+
     /// 生产环境该补的配置。返回问题列表而不是直接崩：少了登录配置时中转照样该转发，
     /// 只是控制台不可用。
     pub fn problems(&self) -> Vec<String> {
         let mut problems = Vec::new();
         if !self.enabled {
             return problems;
-        }
-        if self.session_secret.len() < 16 {
-            problems.push("PLATFORM_SESSION_SECRET 未设置或过短（需 >= 16 字符）".to_string());
         }
         if self.oidc_client_secret.is_empty() {
             problems.push("PLATFORM_OIDC_CLIENT_SECRET 未设置".to_string());
@@ -202,6 +204,18 @@ mod tests {
         assert!(!config.enabled || env::var("PLATFORM_ENABLED").is_ok());
         assert_eq!(config.api_prefix, "/api/platform/v1");
         assert_eq!(config.session_cookie, "dsh_platform_session");
+    }
+
+    #[test]
+    fn cookies_follow_public_scheme_and_unused_secret_is_not_required() {
+        let mut config = ConsoleConfig::from_env();
+        config.enabled = true;
+        config.oidc_client_secret = "configured".into();
+        config.public_base_url = "https://relay.example.com".into();
+        assert!(config.secure_cookie());
+        assert!(config.problems().is_empty());
+        config.public_base_url = "http://127.0.0.1:8700".into();
+        assert!(!config.secure_cookie(), "回环 HTTP 保持可登录");
     }
 
     #[test]

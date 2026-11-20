@@ -1,4 +1,4 @@
-//! 公开接口的限流。
+//! 公开接口的固定窗口限流；来源与审计共用可信代理解析。
 //!
 //! 只挡一类事：**有人拿公开端点当免费查询服务无限地打**。这些端点必须匿名可调
 //! （激活码校验要手机在配对前就能问，被控端上报没有账号），所以挡不住就不挡了，
@@ -18,13 +18,11 @@
 //!
 //! ## 按什么分桶
 //!
-//! 优先取 nginx 传进来的 `x-real-ip`，没有就用连接的对端地址。**不能只取
-//! `x-forwarded-for` 的第一段**——那是客户端自己填的，随便伪造；
-//! 而 `x-real-ip` 是本机 nginx 覆盖写入的（`proxy_set_header X-Real-IP $remote_addr`），
-//! 客户端改不了。
+//! 调用方传入共享来源解析结果：只信显式可信代理的严格单 IP `x-real-ip`，
+//! 其余连接使用对端地址；未知来源共用一个桶，不跳过限流。
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::IpAddr;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -81,23 +79,9 @@ impl Limiter {
     }
 }
 
-/// 从请求里取客户端 IP。
-///
-/// 顺序：`x-real-ip`（nginx 覆盖写入，可信）→ 连接对端。都没有就归到一个公共桶
-/// ——宁可共用一个额度，也不要因为拿不到 IP 就整个不限。
-pub fn client_key(headers: &[(String, String)], peer: Option<SocketAddr>) -> String {
-    if let Some(value) = headers
-        .iter()
-        .find(|(k, _)| k == "x-real-ip")
-        .map(|(_, v)| v.trim())
-        .filter(|v| !v.is_empty())
-    {
-        return value.to_string();
-    }
-    match peer {
-        Some(addr) => addr.ip().to_string(),
-        None => "unknown".to_string(),
-    }
+/// 未知来源归入公共桶，与有来源请求一样受限。
+pub fn client_key(ip: Option<IpAddr>) -> String {
+    ip.map(|ip| ip.to_string()).unwrap_or_else(|| "unknown".into())
 }
 
 #[cfg(test)]
@@ -129,13 +113,17 @@ mod tests {
     }
 
     #[test]
-    fn prefers_real_ip_then_peer() {
-        let peer = Some("9.9.9.9:1234".parse().unwrap());
-        assert_eq!(client_key(&headers("1.2.3.4"), peer), "1.2.3.4", "有 x-real-ip 就信它");
-        // 只带 x-forwarded-for 时**不当真**：那是客户端自己填的。
-        let spoofed = vec![("x-forwarded-for".to_string(), "6.6.6.6".to_string())];
-        assert_eq!(client_key(&spoofed, peer), "9.9.9.9", "伪造的 forwarded-for 不许当 IP");
-        assert_eq!(client_key(&[], None), "unknown");
-        assert_eq!(client_key(&headers("   "), peer), "9.9.9.9", "空的 x-real-ip 落到对端");
+    fn uses_shared_trusted_source_and_keeps_unknown_limited() {
+        let proxies = crate::headers::default_trusted_proxies();
+        let direct = Some("9.9.9.9:1234".parse().unwrap());
+        let local = Some("127.0.0.1:1234".parse().unwrap());
+        let key = |peer, headers: &[(String, String)]| client_key(crate::headers::client_ip(peer, headers, &proxies));
+        // CONSOLE05：直连携带可伪造头也只能落在对端桶。
+        assert_eq!(key(direct, &headers("1.2.3.4")), "9.9.9.9");
+        assert_eq!(key(direct, &headers("5.6.7.8")), "9.9.9.9");
+        assert_eq!(key(local, &headers("1.2.3.4")), "1.2.3.4");
+        assert_eq!(key(local, &headers("1.2.3.4, 5.6.7.8")), "127.0.0.1");
+        assert_eq!(key(None, &headers("1.2.3.4")), "unknown");
+        assert!(!Limiter::new(0, Duration::from_secs(60)).allow(&client_key(None)));
     }
 }

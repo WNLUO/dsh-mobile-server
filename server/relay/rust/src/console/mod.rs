@@ -1,4 +1,4 @@
-//! 中转控制台：管理面、准入、账号与激活码。
+//! 中转控制台：有限登录事务、稳定身份、可信来源审计与准入管理。
 //!
 //! 从 Node 运营版（`server/dsh-mobile-hub/`）译过来。与转发路径的关系只有一处：
 //! 隧道接入前的**准入校验**。转发本身仍然不碰数据库。
@@ -103,6 +103,7 @@ pub struct Console {
     /// 登录入口的限流。`/auth/login` 匿名可调、每次往 `login_states` 插一行，
     /// 不限的话谁都能拿它把库撑大。
     login_limiter: Limiter,
+    callback_limiter: Limiter,
 }
 
 impl Console {
@@ -119,6 +120,10 @@ impl Console {
                 Duration::from_secs(config.rate_limit_window_seconds),
             ),
             login_limiter: Limiter::new(
+                config.license_rate_limit,
+                Duration::from_secs(config.rate_limit_window_seconds),
+            ),
+            callback_limiter: Limiter::new(
                 config.license_rate_limit,
                 Duration::from_secs(config.rate_limit_window_seconds),
             ),
@@ -177,11 +182,14 @@ impl Console {
 
         // 限流只落在**匿名可调**的入口上，而且必须在查库之前判——
         // 限流的意义就是别让人无限次扫库。
-        let key = ratelimit::client_key(headers, peer);
+        let source_ip = crate::headers::client_ip(peer, headers, &crate::config().trusted_proxy_cidrs);
+        let key = ratelimit::client_key(source_ip);
+        let audit_ip = source_ip.map(|ip| ip.to_string());
         let limited = match (method, sub.as_str()) {
             ("POST", "/licenses/verify") | ("POST", "/licenses/bind") => Some(&self.license_limiter),
             ("POST", "/nodes/report") => Some(&self.report_limiter),
             ("GET", "/auth/login") => Some(&self.login_limiter),
+            ("GET", "/auth/callback") => Some(&self.callback_limiter),
             _ => None,
         };
         if let Some(limiter) = limited {
@@ -225,7 +233,7 @@ impl Console {
             // 被控端上报：**不走登录**。被控端没有微信账号，它只认认领码。
             // 这一条是主控端唯一对外的写入口，所以只需校验认领码。
             ("POST", "/nodes/report") => self.handle_report(headers, body).await,
-            _ => self.handle_rest(method, &sub, query, headers),
+            _ => self.handle_rest(method, &sub, query, headers, audit_ip.as_deref()),
         }
     }
 
@@ -236,6 +244,7 @@ impl Console {
         sub: &str,
         query: &str,
         headers: &[(String, String)],
+        audit_ip: Option<&str>,
     ) -> ConsoleResponse {
         let Some(user) = self.current_user(headers) else {
             return ConsoleResponse::json(401, json!({ "ok": false, "error": "not signed in" }));
@@ -302,16 +311,16 @@ impl Console {
             }
             let node = self.store.create_node("");
             self.store
-                .audit(Some(&user.id), "node.create", &node.claim_code, "");
+                .audit(Some(&user.id), "node.create", &node.claim_code, "", audit_ip);
             return ConsoleResponse::json(201, json!({ "ok": true, "node": node }));
         }
-        if method == "DELETE" && sub.starts_with("/nodes/") {
+        if method == "DELETE" && sub.starts_with("/nodes/") && !sub.ends_with("/forget") {
             if !user.is_admin {
                 return ConsoleResponse::json(403, json!({ "ok": false, "error": "admin only" }));
             }
             let id = sub.trim_start_matches("/nodes/");
             self.store.revoke_node(id);
-            self.store.audit(Some(&user.id), "node.revoke", id, "");
+            self.store.audit(Some(&user.id), "node.revoke", id, "", audit_ip);
             // 记录留着（`revokedAt` 有值），面板上显示成「已移除」。
             // 被控端那边之后上报会拿到 403，日志里写「被主控端移除」——
             // 光是 404 的话，它分不清是自己码错了还是真被移掉了。
@@ -331,7 +340,7 @@ impl Console {
                 .trim_end_matches("/forget")
                 .trim_end_matches('/');
             self.store.forget_node(id);
-            self.store.audit(Some(&user.id), "node.forget", id, "");
+            self.store.audit(Some(&user.id), "node.forget", id, "", audit_ip);
             return ConsoleResponse::json(200, json!({ "ok": true }));
         }
 
@@ -381,6 +390,7 @@ impl Console {
                 "node.mode",
                 id,
                 desired.unwrap_or("auto"),
+                audit_ip,
             );
             return ConsoleResponse::json(200, json!({ "ok": true, "desiredMode": desired.unwrap_or("") }));
         }
@@ -393,14 +403,14 @@ impl Console {
         if method == "POST" && sub == "/licenses" {
             let license = self.store.create_license(Some(&user.id), "");
             self.store
-                .audit(Some(&user.id), "license.create", &license.code, "");
+                .audit(Some(&user.id), "license.create", &license.code, "", audit_ip);
             return ConsoleResponse::json(201, json!({ "ok": true, "license": license }));
         }
 
         // 改准入模式：POST /settings/mode?mode=open|restricted
         if method == "POST" && sub == "/settings/mode" {
             let mode = oidc::query_param(query, "mode").unwrap_or_default();
-            return self.set_admission_mode(&user, &mode);
+            return self.set_admission_mode(&user, &mode, audit_ip);
         }
 
         if method == "GET" && sub == "/settings" {
@@ -426,7 +436,7 @@ impl Console {
             };
             self.store.set_license_status(id, next);
             self.store
-                .audit(Some(&user.id), "license.status", &license.code, next);
+                .audit(Some(&user.id), "license.status", &license.code, next, audit_ip);
             return ConsoleResponse::json(200, json!({ "ok": true, "status": next }));
         }
 
@@ -447,7 +457,7 @@ impl Console {
                 let removed = self.store.unbind_device(id, device_id);
                 if removed {
                     self.store
-                        .audit(Some(&user.id), "device.unbind", device_id, id);
+                        .audit(Some(&user.id), "device.unbind", device_id, id, audit_ip);
                 }
                 return ConsoleResponse::json(200, json!({ "ok": true, "removed": removed }));
             }
@@ -572,15 +582,8 @@ impl Console {
             }
         };
         match node::apply_report(&self.store, &self.config, &claim, &token, &report) {
-            // `admissionMode` 是我们希望被控端用的模式，被控端下一次上报时取走。
-            // 没有就不带这个字段——被控端看到缺字段会保持自己本地的设置不动。
-            Ok(desired) => {
-                let mut payload = json!({ "ok": true });
-                if let Some(mode) = desired {
-                    payload["admissionMode"] = json!(mode);
-                }
-                ConsoleResponse::json(200, payload)
-            }
+            // null 明确交还管理权；旧主控缺字段仍保留被控端原有状态。
+            Ok(desired) => ConsoleResponse::json(200, json!({ "ok": true, "admissionMode": desired })),
             Err((status, message)) => {
                 ConsoleResponse::json(status, json!({ "ok": false, "error": message }))
             }
@@ -629,7 +632,7 @@ impl Console {
     }
 
     /// 改准入模式。
-    pub fn set_admission_mode(&self, actor: &crate::store::User, mode: &str) -> ConsoleResponse {
+    pub fn set_admission_mode(&self, actor: &crate::store::User, mode: &str, audit_ip: Option<&str>) -> ConsoleResponse {
         if !actor.is_admin {
             return ConsoleResponse::json(403, json!({ "ok": false, "error": "admin only" }));
         }
@@ -656,7 +659,7 @@ impl Console {
         }
         self.store.set_setting("admission_mode", normalized);
         self.store
-            .audit(Some(&actor.id), "settings.admission_mode", normalized, "");
+            .audit(Some(&actor.id), "settings.admission_mode", normalized, "", audit_ip);
         ConsoleResponse::json(200, json!({ "ok": true, "admissionMode": normalized }))
     }
 
@@ -668,7 +671,7 @@ impl Console {
         let next = oidc::query_param(query, "next").unwrap_or_else(|| "/".to_string());
         // 超长或含控制字符的 next 直接丢弃，退回首页——别把它存进库、更别拼进跳转。
         let next = safe_next_path(&next).unwrap_or_else(|| "/".to_string());
-        self.store.save_login_state(&state, &nonce, &pkce.verifier, &next);
+        self.store.save_login_state(&state, &nonce, &pkce.verifier, &next, self.config.oidc_state_ttl_seconds);
         match self
             .oidc
             .authorize_url(&state, &nonce, &pkce.challenge)
@@ -687,18 +690,14 @@ impl Console {
         let Some(state) = oidc::query_param(query, "state") else {
             return ConsoleResponse::json(400, json!({ "ok": false, "error": "missing state" }));
         };
+        if let Some(error) = oidc::query_param(query, "error") {
+            self.store.finish_login_state(&state);
+            return Self::callback_error(&format!("登录被拒绝：{error}"));
+        }
         let Some(code) = oidc::query_param(query, "code") else {
             return ConsoleResponse::json(400, json!({ "ok": false, "error": "missing code" }));
         };
-        if let Some(error) = oidc::query_param(query, "error") {
-            return ConsoleResponse::json(
-                400,
-                json!({ "ok": false, "error": format!("登录被拒绝：{error}") }),
-            );
-        }
-        // 取事务，**先不删**：换 token 失败时（上游重发、登录系统抖动）这条还要留着给
-        // 重试。只在成功落地会话之后才 `finish_login_state`。原来这里是查到即删，
-        // 第一次回调 502 之后重试就永远报「无效」——线上真踩过。
+        // 出站前原子扣减一次额度，最多三次；短暂失败能重试，耗尽后不再外呼。
         let Some((verifier, next_path)) = self.store.take_login_state(&state) else {
             return ConsoleResponse::json(
                 400,
@@ -723,7 +722,7 @@ impl Console {
             Err(error) => return Self::callback_error(&error),
         };
 
-        let Some((identity, _source)) = claims.identity_key() else {
+        let Some(_) = claims.identity_key() else {
             return Self::callback_error("登录系统没有返回可用的身份标识");
         };
         let openid = if claims.openid.is_empty() { None } else { Some(claims.openid.as_str()) };
@@ -731,10 +730,14 @@ impl Console {
         // 「第一个登录的人是管理员」只在开关打开时成立，且在建号**之前**判「库里还没有用户」：
         // 否则任何能过 OIDC 登录的人，在新部署上抢在运营者之前登录就能白拿到管理权。
         let bootstrap_admin = self.config.bootstrap_first_admin && self.store.user_count() == 0;
-        let user = self.store.upsert_user(&identity, &claims.name, &claims.picture, openid, unionid);
-        // 白名单命中的直接提管理员。白名单比的是原始 sub（部署时填的就是它），
-        // 所以这里用 `sub:` 前缀化的形式去对，写配置时按 `sub:<值>` 填。
-        let by_whitelist = self.config.admin_subs.iter().any(|s| s == &identity);
+        let sub = if claims.sub.is_empty() { None } else { Some(claims.sub.as_str()) };
+        let user = match self.store.upsert_oidc_user(sub, openid, unionid, &claims.name, &claims.picture) {
+            Ok(user) => user,
+            Err(error) => return Self::callback_error(&error),
+        };
+        // 白名单仍按带类型前缀的身份键比较，不随本次首选字段变化而漏掉管理员。
+        let identities = claims.identity_keys();
+        let by_whitelist = self.config.admin_subs.iter().any(|s| identities.contains(s));
         if (bootstrap_admin || by_whitelist) && !user.is_admin {
             self.store.promote_admin(&user.id);
         }
@@ -747,10 +750,7 @@ impl Console {
         // 到这里才算真的用完了：会话已落地，把这条事务删掉，迟到的重试会拿到 400。
         self.store.finish_login_state(&state);
 
-        let cookie = format!(
-            "{}={}; Path=/; HttpOnly; SameSite=Lax; Max-Age={}",
-            self.config.session_cookie, token, self.config.session_ttl_seconds
-        );
+        let cookie = self.session_cookie(&token, self.config.session_ttl_seconds);
         let target = safe_next_path(&next_path).unwrap_or_else(|| "/".to_string());
         let mut response = ConsoleResponse::redirect_to(&format!(
             "{}{}{}",
@@ -765,6 +765,12 @@ impl Console {
         ConsoleResponse::json(200, json!({ "ok": false, "error": message }))
     }
 
+    fn session_cookie(&self, token: &str, max_age: i64) -> String {
+        format!("{}={}; Path=/; HttpOnly; SameSite=Lax; Max-Age={}{}",
+            self.config.session_cookie, token, max_age,
+            if self.config.secure_cookie() { "; Secure" } else { "" })
+    }
+
     fn logout(&self, headers: &[(String, String)]) -> ConsoleResponse {
         if let Some(token) = self.cookie_value(headers) {
             self.store.delete_session(&oidc::sha256_hex(&token));
@@ -773,10 +779,7 @@ impl Console {
             status: 204,
             content_type: "text/plain; charset=utf-8",
             body: Vec::new(),
-            set_cookie: Some(format!(
-                "{}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0",
-                self.config.session_cookie
-            )),
+            set_cookie: Some(self.session_cookie("", 0)),
             redirect: None,
         };
         response.body.clear();
@@ -891,6 +894,7 @@ mod tests {
             license_limiter: Limiter::new(config.license_rate_limit, Duration::from_secs(60)),
             report_limiter: Limiter::new(config.report_rate_limit, Duration::from_secs(60)),
             login_limiter: Limiter::new(config.license_rate_limit, Duration::from_secs(60)),
+            callback_limiter: Limiter::new(config.license_rate_limit, Duration::from_secs(60)),
             oidc: OidcClient::new(&config),
             config,
             store,
@@ -1119,6 +1123,123 @@ mod tests {
         );
     }
 
+    #[test]
+    fn callback_is_rate_limited_before_state_or_upstream_work() {
+        let mut config = ConsoleConfig::from_env();
+        config.db_path = ":memory:".into();
+        config.license_rate_limit = 1;
+        let console = Console::new(config).unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let peer = Some("203.0.113.7:1234".parse().unwrap());
+        let first = runtime.block_on(console.handle_api("GET", "/api/platform/v1/auth/callback", "", &[], &[], peer));
+        assert_eq!(first.status, 400);
+        let spoofed = vec![("x-real-ip".into(), "198.51.100.4".into())];
+        let second = runtime.block_on(console.handle_api("GET", "/api/platform/v1/auth/callback", "", &spoofed, &[], peer));
+        assert_eq!(second.status, 429, "直连换头不能绕过回调限流");
+    }
+
+    #[tokio::test]
+    async fn repeated_state_can_only_trigger_three_upstream_attempts() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let count = Arc::new(AtomicUsize::new(0));
+        let requests = count.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                loop {
+                    let mut byte = [0; 1];
+                    if stream.read(&mut byte).await.unwrap() == 0 { break; }
+                    bytes.push(byte[0]);
+                    if bytes.ends_with(b"\r\n\r\n") { break; }
+                }
+                let first_line = String::from_utf8_lossy(&bytes);
+                let body = if first_line.starts_with("GET /.well-known/") {
+                    json!({ "authorization_endpoint": format!("http://{address}/authorize"),
+                        "token_endpoint": format!("http://{address}/token"), "userinfo_endpoint": format!("http://{address}/userinfo") }).to_string()
+                } else {
+                    requests.fetch_add(1, Ordering::SeqCst);
+                    r#"{"error":"invalid_grant"}"#.into()
+                };
+                let reply = format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}", body.len(), body);
+                stream.write_all(reply.as_bytes()).await.unwrap();
+            }
+        });
+        let mut config = ConsoleConfig::from_env();
+        config.db_path = ":memory:".into();
+        config.oidc_issuer = format!("http://{address}");
+        config.license_rate_limit = 100;
+        let console = Console::new(config).unwrap();
+        console.store.save_login_state("replayed", "nonce", "verifier", "/", 600);
+        for attempt in 0..5 {
+            let reply = console.handle_api("GET", "/api/platform/v1/auth/callback", "state=replayed&code=bad", &[], &[], None).await;
+            assert_eq!(reply.status, if attempt < 3 { 200 } else { 400 });
+        }
+        assert_eq!(count.load(Ordering::SeqCst), 3, "耗尽 state 后不能再外呼 token 端点");
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[test]
+    fn login_and_logout_cookies_share_secure_policy() {
+        for (base, secure) in [("https://relay.example.com", true), ("http://127.0.0.1:8700", false)] {
+            let mut config = ConsoleConfig::from_env();
+            config.db_path = ":memory:".into();
+            config.public_base_url = base.into();
+            let console = Console::new(config).unwrap();
+            assert_eq!(console.session_cookie("token", 600).contains("; Secure"), secure);
+            assert_eq!(console.logout(&[]).set_cookie.unwrap().contains("; Secure"), secure);
+        }
+    }
+
+    #[test]
+    fn node_forget_route_reaches_forget_instead_of_generic_revoke() {
+        let console = console();
+        let user = admin(&console);
+        let headers = cookie_for(&console, &user);
+        let node = console.store.create_node("old");
+        console.store.revoke_node(&node.id);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let response = runtime.block_on(console.handle_api("DELETE", &format!("/api/platform/v1/nodes/{}/forget", node.id), "", &headers, &[], None));
+        assert_eq!(response.status, 200);
+        assert!(console.store.find_node_by_id(&node.id).is_none());
+    }
+
+    #[test]
+    fn management_audit_uses_same_trusted_source_as_rate_limit() {
+        let path = std::env::temp_dir().join(format!("dsh-audit-{}.db", uuid::Uuid::new_v4()));
+        let mut config = ConsoleConfig::from_env();
+        config.db_path = path.to_string_lossy().into();
+        let console = Console::new(config).unwrap();
+        let user = admin(&console);
+        let mut headers = cookie_for(&console, &user);
+        headers.push(("x-real-ip".into(), "198.51.100.8".into()));
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        for (peer, expected) in [("203.0.113.8:1234", "203.0.113.8"), ("127.0.0.1:1234", "198.51.100.8")] {
+            let created = runtime.block_on(console.handle_api("POST", "/api/platform/v1/licenses", "", &headers, &[], Some(peer.parse().unwrap())));
+            let value: Value = serde_json::from_slice(&created.body).unwrap();
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            let ip: String = conn.query_row("SELECT ip FROM audit_logs WHERE target = ?1", rusqlite::params![value["license"]["code"].as_str().unwrap()], |row| row.get(0)).unwrap();
+            assert_eq!(ip, expected);
+        }
+        drop(console);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn reports_explicitly_return_mode_control_to_slave() {
+        let console = console();
+        let node = console.store.create_node("slave");
+        let headers = vec![("x-dsh-claim".into(), node.claim_code)];
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let reply = runtime.block_on(console.handle_report(&headers, br#"{}"#));
+        let value: Value = serde_json::from_slice(&reply.body).unwrap();
+        assert!(value.get("admissionMode").unwrap().is_null(), "CONSOLE02 使用显式 null");
+    }
+
     /// 激活码校验不限次数的话，等于给了一个免费的查询服务。
     #[test]
     fn verify_is_rate_limited_per_client() {
@@ -1131,6 +1252,7 @@ mod tests {
             license_limiter: Limiter::new(3, Duration::from_secs(60)),
             report_limiter: Limiter::new(60, Duration::from_secs(60)),
             login_limiter: Limiter::new(3, Duration::from_secs(60)),
+            callback_limiter: Limiter::new(3, Duration::from_secs(60)),
             oidc: OidcClient::new(&config),
             config,
             store: Store::in_memory().unwrap(),
@@ -1144,7 +1266,7 @@ mod tests {
                 "",
                 &headers,
                 br#"{"code":"DSH-NOPE-NOPE-NOPE-NOPE"}"#,
-                None,
+                Some("1.2.3.4:1234".parse().unwrap()),
             ))
         };
         for i in 0..3 {
@@ -1160,7 +1282,7 @@ mod tests {
             "",
             &other,
             br#"{"code":"DSH-NOPE-NOPE-NOPE-NOPE"}"#,
-            None,
+            Some("5.6.7.8:1234".parse().unwrap()),
         ));
         assert_eq!(ok.status, 200, "别的来源不该被连坐");
     }
@@ -1169,10 +1291,10 @@ mod tests {
     fn admission_mode_toggles() {
         let console = console();
         let user = admin(&console);
-        let response = console.set_admission_mode(&user, "restricted");
+        let response = console.set_admission_mode(&user, "restricted", None);
         assert_eq!(response.status, 200);
         assert_eq!(console.admission_mode(), "restricted");
-        let bad = console.set_admission_mode(&user, "nonsense");
+        let bad = console.set_admission_mode(&user, "nonsense", None);
         assert_eq!(bad.status, 400);
     }
 
@@ -1230,6 +1352,7 @@ mod admission_flow {
             license_limiter: Limiter::new(config.license_rate_limit, Duration::from_secs(60)),
             report_limiter: Limiter::new(config.report_rate_limit, Duration::from_secs(60)),
             login_limiter: Limiter::new(config.license_rate_limit, Duration::from_secs(60)),
+            callback_limiter: Limiter::new(config.license_rate_limit, Duration::from_secs(60)),
             oidc: OidcClient::new(&config),
             config,
             store: Store::in_memory().unwrap(),

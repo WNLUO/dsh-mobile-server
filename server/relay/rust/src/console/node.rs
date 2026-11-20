@@ -1,4 +1,4 @@
-//! 主控端 / 被控端。
+//! 主控端 / 被控端：显式交还准入管理权，周期上报加入抖动。
 //!
 //! 一套代码两种角色，按配置决定：
 //!   - 配了 `PLATFORM_MASTER_URL` → 这台是**被控端**，定期向主控端报到；
@@ -50,6 +50,7 @@ pub fn spawn_reporter(config: ConsoleConfig, store: Store) {
                 return;
             }
         };
+        tokio::time::sleep(report_delay(interval, true, rand::random())).await;
         loop {
             let report = collect_report(&config, &store);
             let url = format!("{}/api/platform/v1/nodes/report", config.master_url.trim_end_matches('/'));
@@ -93,9 +94,18 @@ pub fn spawn_reporter(config: ConsoleConfig, store: Store) {
                     store.set_setting("master_last_error", &format!("不可达：{error}"));
                 }
             }
-            tokio::time::sleep(interval).await;
+            tokio::time::sleep(report_delay(interval, false, rand::random())).await;
         }
     });
+}
+
+/// 首报延迟 0～10% 周期，后续周期 ±10%；随机值由调用方提供便于固定边界验证。
+fn report_delay(interval: Duration, first: bool, sample: u64) -> Duration {
+    let millis = interval.as_millis().min(u64::MAX as u128) as u64;
+    let spread = millis / 10;
+    let width = if first { spread } else { spread.saturating_mul(2) };
+    let offset = sample % width.saturating_add(1);
+    Duration::from_millis(if first { offset } else { millis.saturating_sub(spread).saturating_add(offset) })
 }
 
 /// 每天清一次过期会话与过期登录事务，由 `main` 在控制台启动后 spawn。
@@ -117,13 +127,17 @@ pub fn spawn_housekeeping(store: Store) {
 
 /// 把主控端回包里的 `admissionMode` 落到本地设置上。
 ///
-/// 没有这个字段、或者值不认识，一律**什么都不做**——主控端没表态就等于不管这台，
-/// 本地自己设的模式继续作数。这样「主控端挂了 / 从没配过」的机器行为完全不变。
+/// null 只解除管理锁，不改变当前模式；旧主控缺字段或给出未知值时保留本地状态。
 ///
 /// 返回是否真的改了，方便调用方记日志。
 pub fn apply_desired_mode(store: &Store, body: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(body).ok()?;
-    let wanted = value.get("admissionMode")?.as_str()?.trim();
+    let mode = value.get("admissionMode")?;
+    if mode.is_null() {
+        store.set_setting("master_manages_mode", "0");
+        return None;
+    }
+    let wanted = mode.as_str()?.trim();
     if wanted != "open" && wanted != "restricted" {
         return None;
     }
@@ -138,7 +152,7 @@ pub fn apply_desired_mode(store: &Store, body: &str) -> Option<String> {
         return None;
     }
     store.set_setting("admission_mode", wanted);
-    store.audit(None, "settings.admission_mode", wanted, "由主控端下发");
+    store.audit(None, "settings.admission_mode", wanted, "由主控端下发", None);
     crate::tunnel::log(format!("主控端下发准入模式：{current} → {wanted}"));
     Some(wanted.to_string())
 }
@@ -162,6 +176,7 @@ fn collect_report(config: &ConsoleConfig, store: &Store) -> NodeReport {
         tunnel_online: crate::tunnel_connected(),
         status_json: json!({
             "version": env!("CARGO_PKG_VERSION"),
+            "reportIntervalSeconds": config.report_interval_seconds,
             "admissionMode": admission_mode,
             "licenseCount": licenses.len(),
             "deviceCount": devices,
@@ -211,7 +226,7 @@ pub fn apply_report(
         return Err((403, "this node was removed by the master".into()));
     }
     store.touch_node(&node.id, report);
-    // 回包带上主控端希望它用的模式。没配过就是空串——被控端看到空串什么都不做。
+    // 无期望值时由 API 序列化为 null，明确把管理权交回被控端。
     let desired = store.desired_mode_of(&node.id);
     Ok(if desired == "open" || desired == "restricted" {
         Some(desired)
@@ -230,6 +245,25 @@ mod tests {
         config.master_url = String::new();
         config.accepts_reports = true;
         config
+    }
+
+    #[test]
+    fn report_jitter_and_snapshot_use_each_nodes_interval() {
+        let interval = Duration::from_secs(300);
+        assert_eq!(report_delay(interval, true, 0), Duration::ZERO);
+        assert_eq!(report_delay(interval, true, 30_000), Duration::from_secs(30));
+        assert_eq!(report_delay(interval, false, 0), Duration::from_secs(270));
+        assert_eq!(report_delay(interval, false, 60_000), Duration::from_secs(330));
+        let store = Store::in_memory().unwrap();
+        let mut slave = master_config();
+        slave.report_interval_seconds = 42;
+        let report = collect_report(&slave, &store);
+        let node = store.create_node("slave");
+        apply_report(&store, &master_config(), &node.claim_code, "", &report).unwrap();
+        let snapshot = store.find_node_by_id(&node.id).unwrap();
+        let status: serde_json::Value = serde_json::from_str(&snapshot.status_json).unwrap();
+        assert_eq!(status["reportIntervalSeconds"], 42);
+        assert!(snapshot.last_seen_at.is_some());
     }
 
     #[test]
@@ -342,17 +376,24 @@ mod tests {
         assert!(admin.is_admin);
         assert!(!console.is_mode_controlled(), "一开始没人管");
 
-        assert_eq!(console.set_admission_mode(&admin, "restricted").status, 200);
+        assert_eq!(console.set_admission_mode(&admin, "restricted", None).status, 200);
 
         // 主控端下发了一次，哪怕结果和本地一样，也算「接管了」。
         apply_desired_mode(&console.store, r#"{"ok":true,"admissionMode":"restricted"}"#);
         assert!(console.is_mode_controlled());
         assert_eq!(
-            console.set_admission_mode(&admin, "open").status,
+            console.set_admission_mode(&admin, "open", None).status,
             409,
             "被接管之后本地不许改"
         );
         assert_eq!(console.admission_mode(), "restricted", "本地设置不能被改动");
+        // CONSOLE02：旧主控缺字段不解锁，新主控显式 null 只清锁。
+        apply_desired_mode(&console.store, r#"{"ok":true}"#);
+        assert!(console.is_mode_controlled());
+        apply_desired_mode(&console.store, r#"{"ok":true,"admissionMode":null}"#);
+        assert!(!console.is_mode_controlled());
+        assert_eq!(console.admission_mode(), "restricted");
+        assert_eq!(console.set_admission_mode(&admin, "open", None).status, 200);
     }
 
     #[test]
@@ -395,14 +436,14 @@ mod tests {
         apply_report(&store, &master, &node.claim_code, "", &report).expect("没配 token 时不要求");
     }
 
-    /// 主控端没表态时，回包里不能有 `admissionMode`——被控端看到缺字段就不动本地设置。
+    /// CONSOLE02：None 由 API 序列化为 null，明确解除被控端管理锁。
     #[test]
-    fn report_reply_carries_no_mode_until_master_sets_one() {
+    fn report_reply_returns_local_control_without_desired_mode() {
         let store = Store::in_memory().unwrap();
         let master = master_config();
         let node = store.create_node("x");
         let reply = apply_report(&store, &master, &node.claim_code, "", &NodeReport::default()).unwrap();
-        assert_eq!(reply, None, "没设过期望模式时什么都不许带");
+        assert_eq!(reply, None, "无期望值时由本地管理");
     }
 
     /// 主控端设了之后，每次上报都能把它取回去。
@@ -417,7 +458,7 @@ mod tests {
         let reply = apply_report(&store, &master, &node.claim_code, "", &report).unwrap();
         assert_eq!(reply.as_deref(), Some("restricted"));
 
-        // 交回给被控端自己决定之后，回包又不带字段了。
+        // 交回后由 API 发出 admissionMode:null。
         assert!(store.set_desired_mode(&node.id, None));
         let reply = apply_report(&store, &master, &node.claim_code, "", &report).unwrap();
         assert_eq!(reply, None);
