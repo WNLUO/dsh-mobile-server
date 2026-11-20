@@ -555,8 +555,11 @@ async function runConsoleChecks(binary, check) {
     // ── 主控端下发准入模式 ────────────────────────────────────
     // 管理接口要登录，e2e 里造不出微信会话，所以期望值直接写库；验的是**回包**这一环：
     // 被控端就是靠每次上报的响应把模式取回去的。
-    check('主控端没表态时，上报回包不带 admissionMode',
-      !reported.body.includes('admissionMode') && JSON.parse(reported.body).ok === true,
+    // CONSOLE02：没有期望值时回的是**显式 null**（“明确交还管理权”，见 console/mod.rs 的
+    // reports_explicitly_return_mode_control_to_slave 单测），不是省略字段。旧断言按“不带字段”
+    // 写，与实现/单测的契约对不上，这里核对显式 null。
+    check('主控端没表态时，上报回包带 admissionMode: null（显式交还管理权）',
+      JSON.parse(reported.body).ok === true && JSON.parse(reported.body).admissionMode === null,
       reported.body);
 
     const setMode = new DatabaseSync(env.PLATFORM_DB_PATH);
@@ -571,8 +574,8 @@ async function runConsoleChecks(binary, check) {
     backToAuto.exec("UPDATE nodes SET desired_mode = '' WHERE id = 'n1'");
     backToAuto.close();
     const auto = await post('/api/platform/v1/nodes/report', { 'x-dsh-claim': 'NODE-ABCD-EFGH' }, {});
-    check('交还给被控端自己决定之后，回包又不带模式',
-      !auto.body.includes('admissionMode'), auto.body);
+    check('交还给被控端自己决定之后，回包带 admissionMode: null（显式交还）',
+      JSON.parse(auto.body).admissionMode === null, auto.body);
 
     // ── 公开接口限流 ─────────────────────────────────────────
     // 激活码校验匿名可调，不限次数就等于送了一个免费查询服务。
