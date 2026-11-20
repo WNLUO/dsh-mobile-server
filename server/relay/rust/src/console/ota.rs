@@ -1,4 +1,4 @@
-//! 插件 OTA 临时通道：需要 PLATFORM_ENABLED，下载分块读取，发布磁盘工作移到阻塞池。
+//! 插件 OTA 临时通道：固定句柄分块下载与单段 Range，发布磁盘工作移到阻塞池。
 //!
 //! 正式分发归 npm 插件市场（`dsh-mobile-plugin/lib/shell/updater.js`）；这里只服务
 //! 宿主里那条救急通道（`lib/shell/device-ota.js`）：
@@ -130,8 +130,53 @@ pub async fn handle_download(store: &Store, rest: &str) -> Result<OtaDownload, C
     }).await.unwrap_or_else(|_| Err(ConsoleResponse::text(500, "package open failed\n")))
 }
 
-/// 固定大小缓冲区；每次磁盘读取都离开 async 执行线程。
+/// 只支持单段字节范围；无效、多段与越界请求都不退回整包。
+#[derive(Debug, PartialEq)]
+pub struct ByteRange {
+    pub start: u64,
+    pub length: u64,
+}
+
+pub fn byte_range(value: &str, size: u64) -> Result<ByteRange, ()> {
+    let value = value.strip_prefix("bytes=").ok_or(())?;
+    let (start, end) = value.split_once('-').ok_or(())?;
+    let number = |text: &str| -> Result<u64, ()> {
+        if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) { return Err(()); }
+        text.parse().map_err(|_| ())
+    };
+    if size == 0 { return Err(()); }
+    if start.is_empty() {
+        let suffix = number(end)?;
+        if suffix == 0 { return Err(()); }
+        let length = suffix.min(size);
+        return Ok(ByteRange { start: size - length, length });
+    }
+    let start = number(start)?;
+    if start >= size { return Err(()); }
+    let end = if end.is_empty() { size - 1 } else { number(end)?.min(size - 1) };
+    if end < start { return Err(()); }
+    Ok(ByteRange { start, length: end - start + 1 })
+}
+
+/// 固定大小缓冲区；每次磁盘读取与定位都离开 async 执行线程。
 impl OtaDownload {
+    pub fn etag(&self) -> Option<String> {
+        // 历史包可能没有摘要；不额外读文件计算，也不伪造验证器。
+        if self.sha256.len() != 64 || !self.sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        Some(format!("\"{}\"", self.sha256))
+    }
+
+    pub async fn seek(self, offset: u64) -> std::io::Result<Self> {
+        tokio::task::spawn_blocking(move || {
+            use std::io::{Seek, SeekFrom};
+            let mut download = self;
+            download.file.seek(SeekFrom::Start(offset))?;
+            Ok(download)
+        }).await.map_err(|error| std::io::Error::other(error.to_string()))?
+    }
+
     pub async fn read_chunk(self) -> std::io::Result<(Self, Vec<u8>)> {
         tokio::task::spawn_blocking(move || {
             use std::io::Read;
@@ -257,6 +302,19 @@ fn publish_package(store: &Store, config: &ConsoleConfig, query: &str, body: &[u
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn single_byte_ranges_cover_closed_open_and_suffix_forms() {
+        assert_eq!(byte_range("bytes=2-5", 10), Ok(ByteRange { start: 2, length: 4 }));
+        assert_eq!(byte_range("bytes=7-", 10), Ok(ByteRange { start: 7, length: 3 }));
+        assert_eq!(byte_range("bytes=-4", 10), Ok(ByteRange { start: 6, length: 4 }));
+        assert_eq!(byte_range("bytes=-100", 10), Ok(ByteRange { start: 0, length: 10 }));
+        assert_eq!(byte_range("bytes=7-99", 10), Ok(ByteRange { start: 7, length: 3 }));
+        for value in ["bytes=10-", "bytes=5-2", "bytes=-0", "bytes=", "bytes=0-1,3-4", "items=0-1", "bytes=+1-2", "bytes=18446744073709551616-"] {
+            assert_eq!(byte_range(value, 10), Err(()), "{value}");
+        }
+        assert_eq!(byte_range("bytes=0-", 0), Err(()));
+    }
 
     fn config() -> ConsoleConfig {
         let mut config = ConsoleConfig::from_env();

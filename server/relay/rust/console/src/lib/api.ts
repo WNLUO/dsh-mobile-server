@@ -1,5 +1,5 @@
 /**
- * 控制台的接口层。
+ * 控制台的接口层：同源会话请求统一超时、取消和响应校验。
  *
  * 所有请求都走中转自己（同源），不带任何 token —— 登录态是**同站 Cookie**，
  * 由中转在登录回调里种下。所以这里不需要 `authHeaders`，也不该往 localStorage 塞东西。
@@ -51,13 +51,15 @@ export interface Node {
   publicUrl: string
   /** 它**实际在用的**模式（被控端自己报上来的）。 */
   admissionMode: string
-  /** 主控端希望它用的模式：'open' / 'restricted'；空串＝主控端不管，由它自己决定。 */
-  desiredMode: string
+  /** 主控端希望它用的模式；空值表示交还被控端自己决定。 */
+  desiredMode: string | null
   /** 被主控端移除的时间。有值只剩一条记录给人看，不能再下发任何东西。 */
   revokedAt: string | null
   licenseCount: number
   deviceCount: number
   tunnelOnline: boolean
+  /** 与 lastSeenAt 来自同一次上报；旧节点未报告时为空。 */
+  reportIntervalSeconds: number | null
   lastSeenAt: string | null
   createdAt: string
 }
@@ -104,96 +106,129 @@ export class ApiError extends Error {
   }
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(`${API}${path}`, {
-    ...init,
-    credentials: 'same-origin',
-    headers: {
-      accept: 'application/json',
-      ...(init?.body ? { 'content-type': 'application/json' } : {}),
-      ...init?.headers,
-    },
-  })
-  if (response.status === 401) throw new ApiError(401, 'not signed in')
-  const text = await response.text()
-  let body: unknown = null
+/** 网络失败可能发生在服务端已接收写入之后，调用方不能自动重发。 */
+export class NetworkError extends Error {}
+
+export function isCancelled(error: unknown): boolean {
+  return error instanceof Error && error.name === 'AbortError'
+}
+
+async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
+  const controller = new AbortController()
+  const cancel = () => controller.abort()
+  const external = init.signal
+  let timedOut = false
+  if (external?.aborted) controller.abort()
+  else external?.addEventListener('abort', cancel, { once: true })
+  const timer = setTimeout(() => {
+    timedOut = true
+    controller.abort()
+  }, 15_000)
   try {
-    body = text ? JSON.parse(text) : null
-  } catch {
-    body = null
-  }
-  if (!response.ok) {
-    let message = `HTTP ${response.status}`
-    if (body && typeof body === 'object' && 'error' in body) {
-      const raw = (body as { error: unknown }).error
-      if (typeof raw === 'string' && raw) message = raw
+    const response = await fetch(`${API}${path}`, {
+      ...init,
+      signal: controller.signal,
+      credentials: 'same-origin',
+      cache: 'no-store',
+      headers: {
+        accept: 'application/json',
+        ...(init.body ? { 'content-type': 'application/json' } : {}),
+        ...init.headers,
+      },
+    })
+    if (controller.signal.aborted) throw new DOMException('请求已取消', 'AbortError')
+    if (response.status === 401) throw new ApiError(401, '登录已过期，请重新登录。')
+    if (response.status === 204) return undefined as T
+    // 超时覆盖正文读取，不能只等到响应头就撤掉计时器。
+    const text = await response.text()
+    if (controller.signal.aborted) throw new DOMException('请求已取消', 'AbortError')
+    let body: unknown = null
+    try {
+      body = text ? JSON.parse(text) : null
+    } catch {
+      if (response.ok) throw new NetworkError('响应不是有效的 JSON，请重试。')
     }
-    throw new ApiError(response.status, message)
+    if (!response.ok) {
+      let message = `HTTP ${response.status}`
+      if (body && typeof body === 'object' && 'error' in body) {
+        const raw = (body as { error: unknown }).error
+        if (typeof raw === 'string' && raw) message = raw
+      }
+      throw new ApiError(response.status, message)
+    }
+    if (!body || typeof body !== 'object' || Array.isArray(body)) {
+      throw new NetworkError('响应内容不完整，请重试。')
+    }
+    return body as T
+  } catch (error) {
+    if (external?.aborted) throw new DOMException('请求已取消', 'AbortError')
+    if (timedOut) throw new NetworkError('请求超时，请重试。')
+    if (error instanceof ApiError || error instanceof NetworkError) throw error
+    throw new NetworkError('网络异常，请重试。')
+  } finally {
+    clearTimeout(timer)
+    external?.removeEventListener('abort', cancel)
+    controller.abort()
   }
-  return body as T
 }
 
 /** 当前登录用户；没登录抛 `ApiError(401)`。 */
-export function fetchMe(): Promise<{ ok: true; user: User }> {
-  return request('/me')
+export function fetchMe(signal?: AbortSignal): Promise<{ ok: true; user: User }> {
+  return request('/me', { signal })
 }
 
-export function fetchOverview(): Promise<Overview> {
-  return request('/overview')
+export function fetchOverview(signal?: AbortSignal): Promise<Overview> {
+  return request('/overview', { signal })
 }
 
-export function fetchLicenses(): Promise<{ ok: true; licenses: License[] }> {
-  return request('/licenses')
+export function fetchLicenses(signal?: AbortSignal): Promise<{ ok: true; licenses: License[] }> {
+  return request('/licenses', { signal })
 }
 
-export function createLicense(): Promise<{ ok: true; license: License }> {
-  return request('/licenses', { method: 'POST' })
+export function createLicense(signal?: AbortSignal): Promise<{ ok: true; license: License }> {
+  return request('/licenses', { method: 'POST', signal })
 }
 
-export function toggleLicense(licenseId: string): Promise<{ ok: true; status: string }> {
-  return request(`/licenses/${licenseId}/status`, { method: 'POST' })
+export function toggleLicense(licenseId: string, signal?: AbortSignal): Promise<{ ok: true; status: string }> {
+  return request(`/licenses/${licenseId}/status`, { method: 'POST', signal })
 }
 
-export function fetchDevices(licenseId: string): Promise<{ ok: true; devices: Device[] }> {
-  return request(`/licenses/${licenseId}/devices`)
+export function fetchDevices(licenseId: string, signal?: AbortSignal): Promise<{ ok: true; devices: Device[] }> {
+  return request(`/licenses/${licenseId}/devices`, { signal })
 }
 
-export function unbindDevice(licenseId: string, deviceId: string): Promise<{ ok: true; removed: boolean }> {
-  return request(`/licenses/${licenseId}/devices/${encodeURIComponent(deviceId)}`, { method: 'DELETE' })
+export function unbindDevice(licenseId: string, deviceId: string, signal?: AbortSignal): Promise<{ ok: true; removed: boolean }> {
+  return request(`/licenses/${licenseId}/devices/${encodeURIComponent(deviceId)}`, { method: 'DELETE', signal })
 }
 
-export function fetchNodes(): Promise<{ ok: true; nodes: Node[] }> {
-  return request('/nodes')
+export function fetchNodes(signal?: AbortSignal): Promise<{ ok: true; nodes: Node[] }> {
+  return request('/nodes', { signal })
 }
 
-export function createNode(): Promise<{ ok: true; node: Node }> {
-  return request('/nodes', { method: 'POST' })
+export function createNode(signal?: AbortSignal): Promise<{ ok: true; node: Node }> {
+  return request('/nodes', { method: 'POST', signal })
 }
 
-export function revokeNode(nodeId: string): Promise<{ ok: true }> {
-  return request(`/nodes/${nodeId}`, { method: 'DELETE' })
+export function revokeNode(nodeId: string, signal?: AbortSignal): Promise<{ ok: true }> {
+  return request(`/nodes/${nodeId}`, { method: 'DELETE', signal })
 }
 
-/**
- * 让某台被控端换准入模式。`auto` 是把决定权交回它自己。
- *
- * 只写主控端这边的期望值，**真正生效要等它下一次上报**（最长 5 分钟）——
- * 主控端从不主动连被控端，做不到即时。
- */
 /** 把一条已移除的记录彻底删掉。只在确认那台再也不会回来时用。 */
-export function forgetNode(nodeId: string): Promise<{ ok: true }> {
-  return request(`/nodes/${nodeId}/forget`, { method: 'DELETE' })
+export function forgetNode(nodeId: string, signal?: AbortSignal): Promise<{ ok: true }> {
+  return request(`/nodes/${nodeId}/forget`, { method: 'DELETE', signal })
 }
 
+/** 只写期望值，真正生效要等被控端下一次上报；auto 把决定权交回它自己。 */
 export function setNodeMode(
   nodeId: string,
   mode: 'open' | 'restricted' | 'auto',
+  signal?: AbortSignal,
 ): Promise<{ ok: true; desiredMode: string }> {
-  return request(`/nodes/${nodeId}/mode?mode=${mode}`, { method: 'POST' })
+  return request(`/nodes/${nodeId}/mode?mode=${mode}`, { method: 'POST', signal })
 }
 
-export function setAdmissionMode(mode: 'open' | 'restricted'): Promise<{ ok: true; admissionMode: string }> {
-  return request(`/settings/mode?mode=${mode}`, { method: 'POST' })
+export function setAdmissionMode(mode: 'open' | 'restricted', signal?: AbortSignal): Promise<{ ok: true; admissionMode: string }> {
+  return request(`/settings/mode?mode=${mode}`, { method: 'POST', signal })
 }
 
 /** 登录：整页跳走，不走 fetch（要跟随 302 到登录系统）。 */
@@ -201,6 +236,6 @@ export function loginUrl(next = '/'): string {
   return `${API}/auth/login?next=${encodeURIComponent(next)}`
 }
 
-export async function logout(): Promise<void> {
-  await fetch(`${API}/auth/logout`, { method: 'POST', credentials: 'same-origin' })
+export async function logout(signal?: AbortSignal): Promise<void> {
+  await request('/auth/logout', { method: 'POST', signal })
 }

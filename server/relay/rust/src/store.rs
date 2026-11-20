@@ -1,4 +1,4 @@
-// 推送令牌失败回收按实例、设备与旧令牌原子匹配，不误删轮换后的新值。
+// 时间读取只告警真实异常；节点在线判断使用同次上报保存的周期与时间。
 //! 控制台数据层：身份稳定匹配、有限登录事务与原子设备名额。
 //!
 //! 沿用 Node 运营版的授权码规则与基础表结构；新增列按已有探测补列方式升级。
@@ -328,6 +328,7 @@ pub struct Store {
 impl Store {
     /// 打开数据库并建表。`:memory:` 用于测试。
     pub fn open(path: &Path) -> Result<Self, String> {
+        checked_system_time();
         if let Some(dir) = path.parent() {
             if !dir.as_os_str().is_empty() {
                 std::fs::create_dir_all(dir)
@@ -1195,6 +1196,9 @@ pub struct Node {
     pub device_count: i64,
     #[serde(rename = "tunnelOnline")]
     pub tunnel_online: bool,
+    /// 与 last_seen_at 同行的状态快照；老节点缺失时不猜测周期。
+    #[serde(rename = "reportIntervalSeconds")]
+    pub report_interval_seconds: Option<u64>,
     #[serde(rename = "lastSeenAt")]
     pub last_seen_at: Option<String>,
     /// 被主控端移除的时间。有值＝已移除，但记录留着给人看。
@@ -1274,6 +1278,10 @@ pub fn normalize_claim_code(input: &str) -> String {
 }
 
 fn map_node(row: &rusqlite::Row<'_>) -> rusqlite::Result<Node> {
+    let status: String = row.get("status_json")?;
+    let report_interval_seconds = serde_json::from_str::<serde_json::Value>(&status).ok()
+        .and_then(|value| value.get("reportIntervalSeconds").and_then(|value| value.as_u64()))
+        .filter(|seconds| *seconds > 0);
     Ok(Node {
         id: row.get("id")?,
         claim_code: row.get("claim_code")?,
@@ -1284,6 +1292,7 @@ fn map_node(row: &rusqlite::Row<'_>) -> rusqlite::Result<Node> {
         license_count: row.get("license_count")?,
         device_count: row.get("device_count")?,
         tunnel_online: row.get::<_, i64>("tunnel_online")? != 0,
+        report_interval_seconds,
         last_seen_at: row.get("last_seen_at")?,
         revoked_at: row.get("revoked_at")?,
         created_at: row.get("created_at")?,
@@ -1376,24 +1385,58 @@ pub fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
     std::cmp::Ordering::Equal
 }
 
+/// 只观察本机时钟，不修改时钟，也不把相对稳定误称为已经与外部时间同步。
+#[derive(Default)]
+struct ClockWatch {
+    previous: Option<(std::time::SystemTime, std::time::Instant)>,
+}
+
+impl ClockWatch {
+    fn observe(&mut self, wall: std::time::SystemTime, monotonic: std::time::Instant) -> Option<&'static str> {
+        use std::time::{Duration, UNIX_EPOCH};
+        let previous = self.previous.replace((wall, monotonic));
+        let Some((old_wall, old_monotonic)) = previous else {
+            // 2020 年以前不可能是当前部署时间；不设随日历过时的“未来年份”阈值。
+            return match wall.duration_since(UNIX_EPOCH) {
+                Ok(age) if age.as_secs() >= 1_577_836_800 => None,
+                _ => Some("系统日期早于 2020-01-01，会话过期与时间排序可能不可靠，请检查系统时间同步。"),
+            };
+        };
+        let elapsed = monotonic.saturating_duration_since(old_monotonic);
+        let drift = match wall.duration_since(old_wall) {
+            Ok(wall_elapsed) => wall_elapsed.abs_diff(elapsed),
+            Err(backward) => backward.duration().saturating_add(elapsed),
+        };
+        if drift > Duration::from_secs(60) {
+            Some("墙钟与单调计时相差超过 60 秒（时间跳变或进程休眠）；会话过期与时间排序可能受影响，请检查系统时间。")
+        } else { None }
+    }
+}
+
+fn checked_system_time() -> std::time::SystemTime {
+    use std::sync::OnceLock;
+    static WATCH: OnceLock<Mutex<ClockWatch>> = OnceLock::new();
+    let mut watch = WATCH.get_or_init(|| Mutex::new(ClockWatch::default()))
+        .lock().unwrap_or_else(|e| e.into_inner());
+    let wall = std::time::SystemTime::now();
+    if let Some(warning) = watch.observe(wall, std::time::Instant::now()) {
+        crate::tunnel::log(format!("[clock] WARNING: {warning}"));
+    }
+    wall
+}
+
 /// 当前时间的 UTC ISO-8601 字符串。与 Node 版 `new Date().toISOString()` 同形，
 /// 这样两份实现写进库里的时间可以直接字符串比较。
 pub fn iso_now() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let secs = checked_system_time().duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs()).unwrap_or(0);
     epoch_to_iso(secs)
 }
 
 /// 当前时间往后若干秒的 UTC ISO 字符串。会话过期与登录事务有效期都用它。
 pub fn iso_after_seconds(seconds: i64) -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
+    let now = checked_system_time().duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64).unwrap_or(0);
     epoch_to_iso(now.saturating_add(seconds.max(0)) as u64)
 }
 
@@ -1422,6 +1465,43 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clock_watch_reports_only_observed_anomalies() {
+        use std::time::{Duration, Instant, UNIX_EPOCH};
+        let wall = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let monotonic = Instant::now();
+        let mut clock = ClockWatch::default();
+        assert!(clock.observe(wall, monotonic).is_none());
+        assert!(clock.observe(wall + Duration::from_secs(20), monotonic + Duration::from_secs(20)).is_none());
+        assert!(clock.observe(wall + Duration::from_secs(21), monotonic + Duration::from_secs(200)).is_some(), "实际回拨/时基差异必须报警");
+        assert!(clock.observe(wall + Duration::from_secs(22), monotonic + Duration::from_secs(201)).is_none(), "跳变后正常推进不能反复报警");
+        assert!(clock.observe(wall + Duration::from_secs(400), monotonic + Duration::from_secs(202)).is_some(), "前跳必须报警");
+        let mut early = ClockWatch::default();
+        assert!(early.observe(UNIX_EPOCH, monotonic).is_some());
+        assert!(early.observe(UNIX_EPOCH + Duration::from_secs(1), monotonic + Duration::from_secs(1)).is_none(), "启动日期告警只报一次");
+        let mut backward = ClockWatch::default();
+        backward.observe(wall, monotonic);
+        assert!(backward.observe(wall - Duration::from_secs(120), monotonic + Duration::from_secs(1)).is_some());
+    }
+
+    #[test]
+    fn node_report_period_is_read_from_the_same_snapshot_as_last_seen() {
+        let store = Store::in_memory().unwrap();
+        let node = store.create_node("test");
+        assert_eq!(node.report_interval_seconds, None);
+        store.touch_node(&node.id, &NodeReport {
+            tunnel_online: true, status_json: r#"{"reportIntervalSeconds":45}"#.to_string(), ..NodeReport::default()
+        });
+        let reported = store.list_nodes(10).remove(0);
+        assert_eq!(reported.report_interval_seconds, Some(45));
+        assert!(reported.last_seen_at.is_some());
+        assert_eq!(serde_json::to_value(&reported).unwrap()["reportIntervalSeconds"], 45);
+        for status in ["{}", r#"{"reportIntervalSeconds":0}"#, r#"{"reportIntervalSeconds":-2}"#, "invalid"] {
+            store.touch_node(&node.id, &NodeReport { status_json: status.to_string(), ..NodeReport::default() });
+            assert_eq!(store.find_node_by_id(&node.id).unwrap().report_interval_seconds, None);
+        }
+    }
 
     #[test]
     fn invalid_push_token_does_not_remove_replacement_or_other_instance() {

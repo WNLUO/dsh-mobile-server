@@ -1,16 +1,10 @@
+/** 控制台沿用既有外观，登录、刷新与写操作共用可取消的请求生命周期。 */
 import { Spinner } from '@appica/ui-react/spinner'
-import { useCallback, useEffect, useState } from 'react'
 
 import { admissionText, admissionTone, licenseText, licenseTone, timeText } from './lib/format.ts'
 import {
-  ApiError,
   createLicense,
-  fetchDevices,
-  fetchLicenses,
   createNode,
-  fetchMe,
-  fetchNodes,
-  fetchOverview,
   forgetNode,
   revokeNode,
   loginUrl,
@@ -22,8 +16,8 @@ import {
   type License,
   type Node,
   type Overview,
-  type User,
 } from './lib/api.ts'
+import { nodeStatus, useConsole, type ConsoleAction } from './lib/useConsole.ts'
 import { Card, Dot, Empty, InfoList, InfoRow, ToneValue } from './components/blocks.tsx'
 
 /**
@@ -36,74 +30,36 @@ import { Card, Dot, Empty, InfoList, InfoRow, ToneValue } from './components/blo
  * （中转端 `upsert_user` 定的规则），这一页不重复判断权限，403 由接口回。
  */
 export function App() {
-  const [user, setUser] = useState<User | null>(null)
-  const [checking, setChecking] = useState(true)
-  const [overview, setOverview] = useState<Overview | null>(null)
-  const [licenses, setLicenses] = useState<License[]>([])
-  const [busy, setBusy] = useState(false)
-  const [error, setError] = useState('')
-  const [selected, setSelected] = useState<License | null>(null)
-  const [nodes, setNodes] = useState<Node[]>([])
+  const {
+    user, signedOut, checking, overview, licenses, nodes, selected, devices, error, now,
+    busy, working, refreshing, refresh, run, chooseLicense, signOut,
+  } = useConsole()
 
-  // 被主控端接管准入模式时，本地面板不许再改——改了下一轮也会被掰回去，
-  // 「点了没反应」比灰着更难理解。
+  // 被主控端接管时，本地修改下一轮也会被覆盖。
   const controlled = overview?.modeControlled === true
-
-  const load = useCallback(async () => {
-    setError('')
-    try {
-      const [nextOverview, nextLicenses] = await Promise.all([fetchOverview(), fetchLicenses()])
-      setOverview(nextOverview)
-      setLicenses(nextLicenses.licenses)
-      // 被控端列表只有这台是「主控端」时才有意义；被控端自己的库是空的。
-      const nextNodes = nextOverview.role === 'master' ? await fetchNodes() : { nodes: [] }
-      setNodes(nextNodes.nodes)
-    } catch (e) {
-      if (e instanceof ApiError && e.status === 403) {
-        setError('这个账号不是管理员，看不到激活码。让搭建这台中转的人登录来管。')
-        return
-      }
-      setError(e instanceof Error ? e.message : String(e))
-    }
-  }, [])
-
-  useEffect(() => {
-    let alive = true
-    void (async () => {
-      try {
-        const me = await fetchMe()
-        if (!alive) return
-        setUser(me.user)
-        await load()
-      } catch {
-        if (alive) setUser(null)
-      } finally {
-        if (alive) setChecking(false)
-      }
-    })()
-    return () => {
-      alive = false
-    }
-  }, [load])
-
-  async function run(action: () => Promise<void>) {
-    setBusy(true)
-    setError('')
-    try {
-      await action()
-      await load()
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
-    } finally {
-      setBusy(false)
-    }
-  }
 
   if (checking) {
     return (
       <main className="flex min-h-screen items-center justify-center gap-2 p-6 text-sm text-foreground-muted">
         <Spinner />
         正在读取控制台…
+      </main>
+    )
+  }
+
+  if (!user && !signedOut) {
+    return (
+      <main className="mx-auto flex min-h-screen max-w-md flex-col justify-center gap-4 p-6">
+        <h1 className="text-2xl font-semibold text-foreground-strong">DSH 中转控制台</h1>
+        <p className="text-sm text-foreground-muted">{error || '暂时无法读取登录状态，请重试。'}</p>
+        <button
+          className="rounded-lg border border-border px-3 py-1.5 text-xs text-foreground-muted"
+          type="button"
+          onClick={() => void refresh()}
+          disabled={refreshing}
+        >
+          重试
+        </button>
       </main>
     )
   }
@@ -138,10 +94,18 @@ export function App() {
         <button
           className="rounded-lg border border-border px-3 py-1.5 text-xs text-foreground-muted"
           type="button"
-          onClick={() => void run(load)}
-          disabled={busy}
+          onClick={() => void refresh()}
+          disabled={working || refreshing}
         >
           刷新
+        </button>
+        <button
+          className="rounded-lg border border-border px-3 py-1.5 text-xs text-foreground-muted"
+          type="button"
+          onClick={() => void signOut()}
+          disabled={working}
+        >
+          退出登录
         </button>
       </header>
 
@@ -152,7 +116,7 @@ export function App() {
       <Card title="运行状态" description="这一页只说明中转活着没、宿主连上没，不显示任何密钥。">
         <InfoList>
           <InfoRow label="中转服务">
-            <ToneValue tone="ok" text="在线" detail={overview ? `版本 ${overview.version}` : undefined} />
+            <ToneValue tone={overview ? 'ok' : 'off'} text={overview ? '在线' : '状态未读到'} detail={overview ? `版本 ${overview.version}` : undefined} />
           </InfoRow>
           <InfoRow label="自动更新">
             <SelfUpdateValue selfUpdate={overview?.selfUpdate} />
@@ -188,7 +152,7 @@ export function App() {
             className="rounded-lg border border-border px-3 py-1.5 text-xs"
             type="button"
             disabled={busy || !user.isAdmin || controlled}
-            onClick={() => void run(async () => void (await setAdmissionMode('open')))}
+            onClick={() => void run(async (signal) => void (await setAdmissionMode('open', signal)))}
           >
             设为开放
           </button>
@@ -196,7 +160,7 @@ export function App() {
             className="rounded-lg border border-border px-3 py-1.5 text-xs"
             type="button"
             disabled={busy || !user.isAdmin || controlled}
-            onClick={() => void run(async () => void (await setAdmissionMode('restricted')))}
+            onClick={() => void run(async (signal) => void (await setAdmissionMode('restricted', signal)))}
           >
             设为限制
           </button>
@@ -216,7 +180,7 @@ export function App() {
             className="rounded-lg bg-accent px-3 py-1.5 text-xs font-semibold text-accent-foreground"
             type="button"
             disabled={busy || !user.isAdmin}
-            onClick={() => void run(async () => void (await createLicense()))}
+            onClick={() => void run(async (signal) => void (await createLicense(signal)))}
           >
             生成激活码
           </button>
@@ -243,7 +207,7 @@ export function App() {
                     className="rounded-md border border-border px-2 py-1 text-xs"
                     type="button"
                     disabled={busy}
-                    onClick={() => setSelected(license)}
+                    onClick={() => chooseLicense(license)}
                   >
                     看设备
                   </button>
@@ -251,7 +215,7 @@ export function App() {
                     className="rounded-md border border-border px-2 py-1 text-xs"
                     type="button"
                     disabled={busy}
-                    onClick={() => void run(async () => void (await toggleLicense(license.id)))}
+                    onClick={() => void run(async (signal) => void (await toggleLicense(license.id, signal)))}
                   >
                     {license.status === 'active' ? '吊销' : '恢复'}
                   </button>
@@ -299,7 +263,7 @@ export function App() {
               className="rounded-lg bg-accent px-3 py-1.5 text-xs font-semibold text-accent-foreground"
               type="button"
               disabled={busy || !user.isAdmin}
-              onClick={() => void run(async () => void (await createNode()))}
+              onClick={() => void run(async (signal) => void (await createNode(signal)))}
             >
               生成认领码
             </button>
@@ -317,9 +281,9 @@ export function App() {
                       {node.revokedAt ? <span className="ml-2 text-xs text-foreground-muted">已移除</span> : null}
                     </span>
                     <span className="inline-flex items-center gap-2 text-xs">
-                      <Dot tone={node.tunnelOnline ? 'ok' : 'off'} />
-                      <span className={node.tunnelOnline ? 'text-success' : 'text-foreground-muted'}>
-                        {node.tunnelOnline ? '隧道在线' : '隧道离线'}
+                      <Dot tone={nodeStatus(node, now).online ? 'ok' : 'off'} />
+                      <span className={nodeStatus(node, now).online ? 'text-success' : 'text-foreground-muted'}>
+                        {nodeStatus(node, now).text}
                       </span>
                     </span>
                   </div>
@@ -336,7 +300,7 @@ export function App() {
                         className="rounded-md border border-border px-2 py-1"
                         type="button"
                         disabled={busy || !user.isAdmin}
-                        onClick={() => void run(async () => void (await forgetNode(node.id)))}
+                        onClick={() => void run(async (signal) => void (await forgetNode(node.id, signal)))}
                       >
                         彻底删除这条记录
                       </button>
@@ -349,7 +313,7 @@ export function App() {
                       className="mt-2 rounded-md border border-border px-2 py-1 text-xs"
                       type="button"
                       disabled={busy}
-                      onClick={() => void run(async () => void (await revokeNode(node.id)))}
+                      onClick={() => void run(async (signal) => void (await revokeNode(node.id, signal)))}
                     >
                       移除这台
                     </button>
@@ -361,7 +325,9 @@ export function App() {
         </Card>
       )}
 
-      {selected ? <DevicePanel license={selected} onClose={() => setSelected(null)} onChanged={load} /> : null}
+      {selected ? (
+        <DevicePanel license={selected} devices={devices} busy={busy} error={error} onClose={() => chooseLicense(null)} onRun={run} />
+      ) : null}
     </main>
   )
 }
@@ -397,7 +363,7 @@ function SelfUpdateValue({ selfUpdate }: { selfUpdate?: Overview['selfUpdate'] }
  * 一台被控端的准入模式：主控端希望它用哪个，它现在实际在用什么。
  *
  * 两个值分开显示是**故意**的：主控端只写期望值，真正生效要等那台下一次上报
- * （最长 5 分钟，主控端从不主动连它）。只显示一个「当前模式」会让点完按钮的人
+ * （按它自己的上报周期，主控端从不主动连它）。只显示一个「当前模式」会让点完按钮的人
  * 以为坏了；并排显示「已下发」和「它现在」，等待窗口就是自解释的。
  */
 function NodeModeControl({
@@ -409,13 +375,13 @@ function NodeModeControl({
   node: Node
   busy: boolean
   isAdmin: boolean
-  onRun: (action: () => Promise<void>) => Promise<void>
+  onRun: (action: ConsoleAction) => Promise<void>
 }) {
   // 空串＝主控端不管这台，它用自己的设置。
   const desired = node.desiredMode === 'open' || node.desiredMode === 'restricted' ? node.desiredMode : null
   const pending = desired !== null && desired !== node.admissionMode
   const set = (mode: 'open' | 'restricted' | 'auto') =>
-    void onRun(async () => void (await setNodeMode(node.id, mode)))
+    void onRun(async (signal) => void (await setNodeMode(node.id, mode, signal)))
 
   return (
     <div className="mt-2 flex flex-wrap items-center gap-2 border-t border-border-muted pt-2 text-xs">
@@ -466,30 +432,19 @@ function NodeModeControl({
  */
 function DevicePanel({
   license,
+  devices,
+  busy,
+  error,
   onClose,
-  onChanged,
+  onRun,
 }: {
   license: License
+  devices: Device[] | null
+  busy: boolean
+  error: string
   onClose: () => void
-  onChanged: () => Promise<void>
+  onRun: (action: ConsoleAction) => Promise<void>
 }) {
-  const [devices, setDevices] = useState<Device[] | null>(null)
-  const [error, setError] = useState('')
-  const [busy, setBusy] = useState(false)
-
-  const refresh = useCallback(async () => {
-    try {
-      const result = await fetchDevices(license.id)
-      setDevices(result.devices)
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
-    }
-  }, [license.id])
-
-  useEffect(() => {
-    void refresh()
-  }, [refresh])
-
   return (
     <Card
       title={`设备 · ${license.code}`}
@@ -503,8 +458,8 @@ function DevicePanel({
       {error ? <p className="py-2 text-sm text-error">{error}</p> : null}
       {devices === null ? (
         <p className="flex items-center gap-2 py-4 text-sm text-foreground-muted">
-          <Spinner />
-          正在读取设备…
+          {error ? null : <Spinner />}
+          {error ? '设备暂未读到，可点顶部刷新重试。' : '正在读取设备…'}
         </p>
       ) : devices.length === 0 ? (
         <Empty>这个码还没绑设备。把它填到宿主的「中转激活码」里，第一次连上就会绑住这台机器。</Empty>
@@ -522,15 +477,7 @@ function DevicePanel({
                 className="rounded-md border border-border px-2 py-1 text-xs"
                 type="button"
                 disabled={busy}
-                onClick={() => {
-                  setBusy(true)
-                  setError('')
-                  void unbindDevice(license.id, device.deviceId)
-                    .then(refresh)
-                    .then(onChanged)
-                    .catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)))
-                    .finally(() => setBusy(false))
-                }}
+                onClick={() => void onRun(async (signal) => void (await unbindDevice(license.id, device.deviceId, signal)))}
               >
                 解绑
               </button>

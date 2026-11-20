@@ -1,4 +1,4 @@
-// blob/OTA 分块读取在阻塞线程执行；控制面共用可信代理规则。
+// 控制面禁缓存；OTA 固定句柄分块读取并支持范围与现有发布摘要重验。
 //! 有界读取 HTTP 请求并分流到转发、升级或本地应答。
 //!
 //! 不引 http 框架：中转只处理固定的几种形态（体检、状态、`/tunnel` 升级、其余转发），
@@ -621,7 +621,10 @@ pub async fn respond_console(
     reader: &mut BufReader<TcpStream>,
     response: &crate::console::ConsoleResponse,
 ) -> std::io::Result<()> {
-    let mut extra: Vec<(String, String)> = Vec::new();
+    let mut extra = vec![
+        ("cache-control".to_string(), "no-store".to_string()),
+        ("vary".to_string(), "Cookie".to_string()),
+    ];
     if let Some(cookie) = response.set_cookie.as_ref() {
         extra.push(("set-cookie".to_string(), cookie.clone()));
     }
@@ -638,14 +641,49 @@ pub async fn respond_console(
     .await
 }
 
-/// 包读取与网络写入分开背压，内存只持有一个固定大小块。
+/// 包读取与网络写入分开背压；同版本可覆盖，缓存必须按已有摘要重验。
 async fn respond_ota_download<S: AsyncRead + tokio::io::AsyncWrite + Unpin>(
     reader: &mut BufReader<S>,
     mut download: crate::console::ota::OtaDownload,
+    request: &RequestHead,
 ) -> std::io::Result<()> {
-    let head = format!("HTTP/1.1 200 OK\r\ncontent-type: application/gzip\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", download.size);
+    let etag = download.etag();
+    let mut extra = "accept-ranges: bytes\r\ncache-control: public, no-cache\r\n".to_string();
+    if let Some(etag) = &etag { extra.push_str(&format!("etag: {etag}\r\n")); }
+    let unchanged = request.header("if-none-match").map(|value| {
+        value.split(',').any(|item| {
+            let item = item.trim();
+            item == "*" || etag.as_ref().map(|etag| {
+                item.strip_prefix("W/").unwrap_or(item) == etag.as_str()
+            }).unwrap_or(false)
+        })
+    }).unwrap_or(false);
+    if unchanged {
+        let head = format!("HTTP/1.1 304 Not Modified\r\n{extra}connection: close\r\n\r\n");
+        reader.get_mut().write_all(head.as_bytes()).await?;
+        return reader.get_mut().flush().await;
+    }
+    let range = request.header("range").filter(|_| {
+        // 日期验证器不可用；If-Range 不匹配或旧包没摘要时回完整新版本。
+        request.header("if-range").map(|value| Some(value.trim()) == etag.as_deref()).unwrap_or(true)
+    });
+    let (status, start, length) = if let Some(value) = range {
+        match crate::console::ota::byte_range(value, download.size) {
+            Ok(range) => {
+                extra.push_str(&format!("content-range: bytes {}-{}/{}\r\n", range.start, range.start + range.length - 1, download.size));
+                ("206 Partial Content", range.start, range.length)
+            }
+            Err(()) => {
+                let head = format!("HTTP/1.1 416 Range Not Satisfiable\r\n{extra}content-range: bytes */{}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n", download.size);
+                reader.get_mut().write_all(head.as_bytes()).await?;
+                return reader.get_mut().flush().await;
+            }
+        }
+    } else { ("200 OK", 0, download.size) };
+    if start > 0 { download = download.seek(start).await?; }
+    let head = format!("HTTP/1.1 {status}\r\ncontent-type: application/gzip\r\ncontent-length: {length}\r\n{extra}connection: close\r\n\r\n");
     reader.get_mut().write_all(head.as_bytes()).await?;
-    let mut remaining = download.size;
+    let mut remaining = length;
     while remaining > 0 {
         let (next, bytes) = download.read_chunk().await?;
         download = next;
@@ -847,7 +885,7 @@ pub async fn handle_owned_path(
                 };
                 if head.method == "GET" && rest.starts_with("download/") {
                     match crate::console::ota::handle_download(&console.store, rest.trim_start_matches("download/")).await {
-                        Ok(download) => respond_ota_download(reader, download).await?,
+                        Ok(download) => respond_ota_download(reader, download, head).await?,
                         Err(response) => respond_console(reader, &response).await?,
                     }
                     return Ok(true);
@@ -879,8 +917,10 @@ pub async fn handle_owned_path(
                 let body = match read_console_body(reader, head, MAX_CONSOLE_BODY).await {
                     Ok(body) => body,
                     Err(error) => {
-                        let body = serde_json::json!({"ok": false, "error": error.message()}).to_string();
-                        respond_json(reader, error.status(), &body).await?;
+                        let response = crate::console::ConsoleResponse::json(
+                            error.status(), serde_json::json!({"ok": false, "error": error.message()}),
+                        );
+                        respond_console(reader, &response).await?;
                         return Ok(true);
                     }
                 };
@@ -899,7 +939,11 @@ pub async fn handle_owned_path(
             }
             if console.matches_web(other) {
                 let response = crate::console::serve_web(&console, other);
-                respond_console(reader, &response).await?;
+                // 页面每次重验；静态 assets 保留自己的缓存行为，不套敏感 API 的 no-store。
+                let extra = if response.content_type.starts_with("text/html") {
+                    vec![("cache-control".to_string(), "no-cache".to_string())]
+                } else { Vec::new() };
+                respond_with(reader, response.status, response.content_type, &response.body, &extra).await?;
                 return Ok(true);
             }
             Ok(false)
@@ -1073,7 +1117,7 @@ mod tests {
         let (mut client, server) = tokio::io::duplex(1024);
         let sending = tokio::spawn(async move {
             let mut reader = BufReader::new(server);
-            respond_ota_download(&mut reader, download).await.unwrap();
+            respond_ota_download(&mut reader, download, &head("/")).await.unwrap();
         });
         let mut wire = Vec::new();
         client.read_to_end(&mut wire).await.unwrap();
@@ -1083,6 +1127,78 @@ mod tests {
         assert!(head.contains("content-length: 200000"));
         assert_eq!(&wire[split + 4..], payload.as_slice());
         let _ = std::fs::remove_file(path);
+    }
+
+    async fn ota_wire(payload: &[u8], headers: Vec<(String, String)>, digest: &str) -> Vec<u8> {
+        let path = std::env::temp_dir().join(format!("dsh-ota-range-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&path, payload).unwrap();
+        let download = crate::console::ota::OtaDownload {
+            file: std::fs::File::open(&path).unwrap(), size: payload.len() as u64, sha256: digest.to_string(),
+        };
+        let mut request = head("/api/desktop-plugins/ota/download/test/stable/1.0.0");
+        request.headers = headers;
+        let (mut client, server) = tokio::io::duplex(7);
+        let sending = tokio::spawn(async move {
+            respond_ota_download(&mut BufReader::new(server), download, &request).await.unwrap();
+        });
+        let mut wire = Vec::new();
+        client.read_to_end(&mut wire).await.unwrap();
+        sending.await.unwrap();
+        let _ = std::fs::remove_file(path);
+        wire
+    }
+
+    #[tokio::test]
+    async fn ota_ranges_and_cache_validators_describe_exact_bytes() {
+        let digest = "a".repeat(64);
+        let etag = format!("\"{digest}\"");
+        let wire = ota_wire(b"0123456789", vec![("range".into(), "bytes=3-5".into())], &digest).await;
+        let text = String::from_utf8(wire).unwrap();
+        assert!(text.starts_with("HTTP/1.1 206 Partial Content\r\n"));
+        assert!(text.contains("content-length: 3\r\n"));
+        assert!(text.contains("content-range: bytes 3-5/10\r\n"));
+        assert!(text.contains("accept-ranges: bytes\r\n"));
+        assert!(text.contains(&format!("etag: {etag}\r\n")));
+        assert!(text.contains("cache-control: public, no-cache\r\n"));
+        assert!(text.ends_with("\r\n\r\n345"));
+        for (value, body) in [("bytes=8-", "89"), ("bytes=-3", "789"), ("bytes=8-99", "89")] {
+            let wire = ota_wire(b"0123456789", vec![("range".into(), value.into())], &digest).await;
+            assert!(String::from_utf8(wire).unwrap().ends_with(&format!("\r\n\r\n{body}")));
+        }
+        for value in ["bytes=10-", "bytes=0-1,4-5"] {
+            let wire = ota_wire(b"0123456789", vec![("range".into(), value.into())], &digest).await;
+            let text = String::from_utf8(wire).unwrap();
+            assert!(text.starts_with("HTTP/1.1 416 Range Not Satisfiable\r\n"));
+            assert!(text.contains("content-range: bytes */10\r\n"));
+            assert!(text.ends_with("content-length: 0\r\nconnection: close\r\n\r\n"));
+        }
+        let unchanged = ota_wire(b"new", vec![("if-none-match".into(), format!("W/{etag}"))], &digest).await;
+        let unchanged = String::from_utf8(unchanged).unwrap();
+        assert!(unchanged.starts_with("HTTP/1.1 304 Not Modified\r\n"));
+        assert!(unchanged.ends_with("\r\n\r\n"));
+        // 同版覆盖后 If-Range 旧摘要必须回新整包，不能把新尾巴接在旧文件上。
+        let replaced = ota_wire(b"new", vec![("range".into(), "bytes=1-".into()), ("if-range".into(), "\"old\"".into())], &digest).await;
+        let replaced = String::from_utf8(replaced).unwrap();
+        assert!(replaced.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(replaced.ends_with("\r\n\r\nnew"));
+        let old = ota_wire(b"old", vec![], "").await;
+        assert!(!String::from_utf8(old).unwrap().contains("etag:"));
+    }
+
+    #[tokio::test]
+    async fn platform_responses_are_never_cached_including_auth_failures() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let send = tokio::spawn(async move {
+            let response = crate::console::ConsoleResponse::json(401, serde_json::json!({"ok":false}));
+            respond_console(&mut BufReader::new(server), &response).await.unwrap();
+        });
+        let mut wire = String::new();
+        BufReader::new(client).read_to_string(&mut wire).await.unwrap();
+        send.await.unwrap();
+        assert!(wire.contains("cache-control: no-store\r\n"));
+        assert!(wire.contains("vary: Cookie\r\n"));
     }
 
     #[tokio::test]
