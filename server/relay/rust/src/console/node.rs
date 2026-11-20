@@ -261,8 +261,8 @@ mod tests {
         let node = store.create_node("slave");
         apply_report(&store, &master_config(), &node.claim_code, "", &report).unwrap();
         let snapshot = store.find_node_by_id(&node.id).unwrap();
-        let status: serde_json::Value = serde_json::from_str(&snapshot.status_json).unwrap();
-        assert_eq!(status["reportIntervalSeconds"], 42);
+        // Node 已把 status_json 解析成 report_interval_seconds 对外，不再暴露原串。
+        assert_eq!(snapshot.report_interval_seconds, Some(42));
         assert!(snapshot.last_seen_at.is_some());
     }
 
