@@ -1,5 +1,5 @@
 //! 跨语言逐字节对撞：Rust 实现与 JS 权威实现必须对同一输入编出**完全相同**的字节。
-//! blob 协商、旧控制帧及同 type/id 双向分片回执共用现有线格式。
+//! 注册载荷、手机 API 路径与 blob 双向分片回执同时钉住事实源和参考实现。
 //!
 //! 测试运行时调用 Node 执行本仓 `../test/protocol.js`，使用其实际编码字节作为参照，
 //! 与 Rust 实现逐帧比对。中转仓库的 CI 安装 Node 与 Rust 工具链。
@@ -97,6 +97,7 @@ fn encode_frame_matches_js_byte_for_byte() {
         ("revokeAllAck", t::REVOKE_ALL_ACK),
         ("pushRegister", t::PUSH_REGISTER),
         ("pushSend", t::PUSH_SEND),
+        ("migrate", t::MIGRATE),
         ("blobPut", t::BLOB_PUT),
         ("blobDelete", t::BLOB_DELETE),
     ];
@@ -122,6 +123,71 @@ fn reference_type_table_matches_js_source() {
     let script = "const entries = value => JSON.stringify(Object.entries(value).sort(([a], [b]) => a.localeCompare(b))); console.log(entries(p.T) === entries(t.T));";
     let text = run_node(script).expect("读取 JS 参考帧表失败");
     assert_eq!(text, "true", "参考宿主帧表必须与事实源逐项相等");
+}
+
+#[test]
+fn documented_payload_fields_match_source() {
+    assert!(node_available(), "本机没有 node，载荷说明对撞无法进行");
+    let script = r#"
+const fs = require('node:fs');
+const source = fs.readFileSync(require.resolve('../protocol-types.js'), 'utf8');
+const protocol = fs.readFileSync('../PROTOCOL.md', 'utf8');
+const line = name => source.split('\n').find(text => text.trimStart().startsWith(name + ':')) || '';
+const row = code => protocol.split('\n').find(text => text.startsWith('| ' + code + ' |')) || '';
+const compact = text => text.replace(/\s+/g, '');
+const register = '{instanceId,name?,version?,license?,secret?,lanUrls?,lanCandidates?}';
+const fields = compact(line('register')).includes(register) && compact(row('0x01')).includes(register);
+const registered = compact(line('registered')).includes('{ok,mirror,blobUpload?:{maxChunkBytes,maxBlobBytes}}')
+  && compact(row('0x02')).includes('{ok,mirror,blobUpload?}');
+const close = /UTF-8 reason/.test(line('wsClose')) && /123B/.test(line('wsClose'))
+  && /UTF-8 reason/.test(row('0x0F')) && /123/.test(row('0x0F'));
+console.log(fields && registered && close);
+"#;
+    assert_eq!(run_node(script).expect("读取协议载荷说明失败"), "true", "载荷说明必须与协议表一致");
+}
+
+#[test]
+fn registration_payloads_match_js_byte_for_byte() {
+    assert!(node_available(), "本机没有 node，注册载荷对撞无法进行");
+    let cases = [
+        ("register", t::REGISTER, r#"{"instanceId":"host","name":"桌面","version":"0.5.59","secret":"shared","lanUrls":["http://192.168.1.2:3000"],"lanCandidates":[{"url":"http://192.168.1.2:3000"}]}"#),
+        ("register", t::REGISTER, r#"{"instanceId":"host","license":"admission-code"}"#),
+        ("register", t::REGISTER, r#"{"instanceId":"legacy"}"#),
+        ("registered", t::REGISTERED, r#"{"ok":true,"mirror":true}"#),
+        ("registered", t::REGISTERED, r#"{"ok":true,"mirror":false}"#),
+    ];
+    for (name, code, json) in cases {
+        let script = format!("console.log(JSON.stringify([...p.jsonFrame(p.T['{name}'], 0, JSON.parse({}))]));", serde_quote(json));
+        let expected = parse_byte_array(&run_node(&script).expect("编码 JS 注册载荷失败")).expect("解析注册帧失败");
+        assert_eq!(encode_frame(code, 0, &Payload::Json(json.to_string())), expected, "{name} 载荷不一致");
+    }
+}
+
+#[test]
+fn mobile_prefix_paths_match_relay_route_rules() {
+    assert!(node_available(), "本机没有 node，路径规则对撞无法进行");
+    // 与中转 http.rs 的部署前缀、手机 status 和查询串回归使用同一批路径。
+    let script = r#"
+const assert = require('node:assert/strict');
+for (const [path, expected] of [
+  ['/status', '/status'], ['/relay/status', '/status'], ['/relay/tunnel', '/tunnel'],
+  ['/api/mobile/v1/status', '/api/mobile/v1/status'],
+  ['/relay/api/mobile/v1/status', '/api/mobile/v1/status'],
+  ['/relay/api/mobile/v1/healthz', '/api/mobile/v1/healthz'],
+  ['/relay/api/mobile/v1/health', '/api/mobile/v1/health'],
+  ['/relay/api/mobile/v1/push-token', '/api/mobile/v1/push-token'],
+  ['/relay/whatever/thing', '/relay/whatever/thing'],
+]) assert.equal(t.stripDeployPrefix(path), expected, path);
+for (const [path, query, expected] of [
+  ['//api/mobile/v1/status/', '?x=1', '/api/mobile/v1/status?x=1'],
+  ['/relay/api/mobile/v1/status', '?x=1', '/api/mobile/v1/status?x=1'],
+  ['/relay//healthz/', '', '/healthz'],
+  ['/relay/api/mobile/v1/sessions', '?x=1', '/api/mobile/v1/sessions?x=1'],
+  ['/relay/whatever/thing', '', '/relay/whatever/thing'], ['/', '', '/'],
+]) assert.equal(t.routedPath(path, query), expected, path);
+console.log('ok');
+"#;
+    assert_eq!(run_node(script).expect("读取 JS 路径规则失败"), "ok");
 }
 
 #[test]
@@ -206,13 +272,14 @@ fn close_payload_matches_js() {
         node_available(),
         "本机没有 node，跨语言对撞无法进行——这组测试存在的意义就是它真的跑了"
     );
+    let long_reason = "超长的中文原因".repeat(20);
     let cases: &[(u16, &str)] = &[
         (1000, "normal"),
         (1001, "bye"),
         (1006, "reserved"),
         (999, "below"),
         (5000, "above"),
-        (1001, "超长的中文原因超长的中文原因超长的中文原因超长的中文原因"),
+        (1001, long_reason.as_str()),
     ];
     for (code, reason) in cases {
         let script = format!(

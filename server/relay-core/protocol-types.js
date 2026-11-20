@@ -1,4 +1,4 @@
-// blobPut 保留旧控制帧，并在能力协商后复用非零 id 双向传片与回执。
+// 帧载荷说明与 PROTOCOL.md 对齐，手机 API 路径优先于中转短路径匹配。
 'use strict';
 
 /**
@@ -16,8 +16,8 @@
 
 /** 帧类型编号。id=0 表示无请求号（控制帧），id=N 表示对应某次请求。 */
 const T = {
-  register: 0x01,      // id=0  JSON {instanceId, pairingCode, name, lanUrls?, lanCandidates?}
-  registered: 0x02,    // id=0  JSON {blobUpload?:{maxChunkBytes,maxBlobBytes},...}；能力与旧注册载荷见 PROTOCOL.md
+  register: 0x01,      // id=0  JSON {instanceId,name?,version?,license?,secret?,lanUrls?,lanCandidates?}；不发 pairingCode
+  registered: 0x02,    // id=0  JSON {ok,mirror,blobUpload?:{maxChunkBytes,maxBlobBytes}}；载荷语义见 PROTOCOL.md
   updatePairing: 0x03, // id=0  JSON {pairingCode}
   httpRequest: 0x04,   // id=N  JSON {method, path, headers}；body 随后以 httpBody 流式发送
   httpBody: 0x05,      // id=N  raw bytes（空 payload = body 结束）
@@ -30,7 +30,7 @@ const T = {
   wsError: 0x0C,       // id=N  JSON {message}
   wsText: 0x0D,        // id=N  raw bytes（上游 WS 文本帧数据）
   wsBinary: 0x0E,      // id=N  raw bytes（上游 WS 二进制帧数据）
-  wsClose: 0x0F,       // id=N  2B 大端 close code
+  wsClose: 0x0F,       // id=N  2B 大端 close code + 可选 UTF-8 reason（最多 123B）
   ping: 0x10,          // id=0  空
   pong: 0x11,          // id=0  空
   pairRequest: 0x12,   // id=0  JSON {requestId, device:{id?, deviceId?, name?, platform?, osVersion?, appVersion?, ip?}}（手机配对 → 请求桌面授权；ip 由中转注入）
@@ -95,11 +95,13 @@ const MOBILE_PREFIX = '/api/mobile/v1/';
 /**
  * 从请求路径里剥掉部署前缀，返回中转认得的路径（只给中转自己判路由用）。
  *
- * 中转不解释业务，只认自己那几条路径，所以判据看**末尾**：路径以某个认领路径结尾就算
- * 那个路径。其余路径原样返回。
+ * 先精确匹配中转自有路径；含手机 API 前缀时只剥部署前缀，不能被 /status 等短路径抢答。
+ * 其余路径才按中转认领路径的末尾匹配。规则与 Rust http.rs 的 strip_deploy_prefix 一致。
  */
 function stripDeployPrefix(pathname) {
   if (OWNED_PATHS.includes(pathname)) return pathname;
+  const mobileAt = pathname.indexOf(MOBILE_PREFIX);
+  if (mobileAt >= 0) return mobileAt > 0 ? pathname.slice(mobileAt) : pathname;
   const match = OWNED_PATHS.find((owned) => owned !== '/' && pathname.endsWith(owned));
   return match || pathname;
 }

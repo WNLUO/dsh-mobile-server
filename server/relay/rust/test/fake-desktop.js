@@ -1,3 +1,4 @@
+// 参考宿主只发送登记所需元信息，不在隧道注册中携带配对码。
 'use strict';
 
 /**
@@ -97,7 +98,7 @@ class RelayTunnel {
           return;
         }
         // 带实例 id 的连接要等中转回 `registered` 才算连上（真实插件就是这么等的）。
-        this.sendJson(T.register, 0, { instanceId: this.instanceId, pairingCode: '000000', name: this.instanceId });
+        this.sendJson(T.register, 0, { instanceId: this.instanceId, name: this.instanceId });
       });
       ws.on('message', (data) => push(Buffer.isBuffer(data) ? data : Buffer.from(data)));
       ws.on('error', (err) => reject(err));
