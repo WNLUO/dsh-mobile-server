@@ -110,3 +110,12 @@
 - **联动**：宿主侧 `dsh-mobile-plugin/lib/mirror/pusher.cjs`（删除 → creds-only → 正文 → 文件，各自配额）、`history-blob.cjs`（封信封）、`sidecar-facade-worker.cjs`（`blobPut` / `blobDelete` 帧）；App 侧离线拉取在 `app/src/services/history-blob-load.ts`（只在宿主够不着时才走，`take` 走本机 HK 解信封）。
 - **守卫**：`cargo test` 里 `blobstore` 那一组（roundtrip、错凭据、过期凭据读不到、`expiresAt=0` 按不过期、空 `cipher` 只换 creds 且目标不存在时拒收、scope 白名单与 200 条上限、删除幂等、预算淘汰记进 `evicted`、读时判 TTL、启动重建清孤儿与 `.tmp`）、`config::tests::blob_limit_must_fit_in_a_frame`。
 - **坑**：**`BLOB_STORE` 打开后 `PLATFORM_DB_PATH` 必须给绝对路径**（数据目录是从它 parent 推出来的），否则进程直接 `exit(1)`；而自动更新的「试跑」用的是 `--version`，**只打版本不读配置**，所以这种配置错会在替换完成后才炸出来（下一轮启动靠 `.update-state` 回滚，但白升一次）。**老插件照样安全**：它不认 `0x1E`、中转收到未知帧静默丢弃，`blobPut` 的旧形状（裸 hex 数组、无 `expiresAt`）按「不过期」读，所以新中转配老插件只是「不推新内容」，不会报错。**`/status` 多了一个 `blob` 字段**（enabled/count/bytes/evicted），`/status` 只答本机、没有客户端消费它。
+
+### A1-10. 列表 5xx 镜像兜底（保留上次正常列表）
+
+- **典型说法**：「列表偶尔报 500」「宿主列表异常时为什么没有旧列表」「插件说 500 会用镜像但手机仍报错」「强制刷新拿到旧列表」。
+- **改哪里**：`server/relay/rust/src/proxy.rs` 在写上游响应头之前处理 500–599；`server/relay/rust/src/http.rs` 在 HTTP 入口筛选镜像资格；`server/relay/rust/src/mirror.rs` 保存镜像并在使用时核对凭据；`server/relay/rust/src/config.rs` 的 `MIRROR_CACHE` 和 `MIRROR_FALLBACK_MS`；模块约定在 `server/relay/rust/src/lib.rs`。
+- **刻意设计**：仅沿用 `parse_read` 放行的默认会话/工作区 GET；`fresh`、归档子集、翻页、非列表和写操作都不使用镜像。收到上游 5xx 时，有镜像且当前凭据仍有效才回 200，正文保留 `stale:true`，响应头带 `x-dsh-relay-mirror: stale`；内容指纹相同时照旧回 `unchanged:true`。无镜像、错凭据或被撤销凭据时保留上游状态、响应头和正文。`MIRROR_CACHE=0` 关闭全部镜像兜底；`MIRROR_FALLBACK_MS=0` 只关闭等待响应头时的计时兜底，不关闭明确的上游 5xx 兜底。
+- **资源收尾**：使用镜像前先取走原响应发送端，向仍在发送的宿主发一次 `HTTP_CANCEL` 并丢掉已入队错误正文；迟到帧不会再入队。写完镜像后由原请求收尾路径释放 pending 名额。不能只替换状态码，也不能先写上游响应头再改成镜像。
+- **守卫**：`cargo test --manifest-path server/relay/rust/Cargo.toml upstream_5xx` 走真实 HTTP 入口和隧道帧分发，覆盖会话/工作区、部署前缀、500/503/599、内容指纹、错凭据、无缓存、fresh、归档、分页、写操作、非列表、非 5xx、原正文保留、取消与 pending 回收；镜像全局容量测试与转发测试共用镜像表测试锁。将真实 5xx 分支禁用时，上述用例必须失败；完整子项目验证运行 `npm test`。
+- **根因**：此前转发只在等待响应头超过弱网阈值时使用镜像，收到 5xx 会直接写给手机，与插件依赖的“列表异常时保留上次正常列表”约定不一致。

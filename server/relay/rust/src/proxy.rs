@@ -1,3 +1,4 @@
+// 默认列表的上游 5xx 使用已授权镜像兜底，取消原响应并在应答结束后释放名额。
 // blob 写入由每隧道有界 worker 处理，主分发保持流量畅通。
 //! 按字节预算转发 HTTP / WS 帧，并管理上传错误与响应暂停恢复。
 //!
@@ -173,7 +174,7 @@ pub async fn proxy_request(
     tunnel: Arc<Tunnel>,
     _slot: Arc<TunnelSlot>,
     // 已经备好的一次缓存读（只有「默认视图的列表读」才会带进来）：
-    // 宿主在阈值内没回头就先拿它答手机，见下面 HeadOutcome::Mirror。
+    // 宿主在阈值内没回头，或明确回了 5xx 时，拿它答手机并取消上游。
     fallback: Option<crate::mirror::Fallback>,
 ) -> std::io::Result<()> {
     proxy_request_with_config(reader, head, tunnel, fallback, crate::config()).await
@@ -355,6 +356,26 @@ async fn proxy_reserved_request(
             return Ok(());
         }
     };
+
+    // 请求入口已按路径、读操作与 fresh 筛过；这里再次按当前凭据与镜像存量决定能否接管。
+    // 拿不到镜像时不动上游响应，保留它的状态、头与流式正文。
+    if (500..600).contains(&http_head.status) {
+        if let Some(body) = fallback.as_ref().and_then(|entry| entry.serve()) {
+            if take_response_sender(&tunnel, id).is_some() {
+                tunnel.send_empty(t::HTTP_CANCEL, id);
+            }
+            drop(chunk_rx);
+            log(format!("mirror fallback answered id={id} upstream={}", http_head.status));
+            respond_with(
+                &mut reader,
+                200,
+                "application/json; charset=utf-8",
+                body.as_bytes(),
+                &[("x-dsh-relay-mirror".to_string(), "stale".to_string())],
+            ).await?;
+            return Ok(());
+        }
+    }
 
     // 写响应头，然后把后续 chunk 流式写给手机。
     let chunked = match write_response_head(&mut reader, &http_head).await {
@@ -1080,6 +1101,145 @@ mod tests {
             chunk_tx: Some(chunk_tx), queued_bytes: bytes.clone(), paused_at: None,
         }));
         (chunk_rx, bytes)
+    }
+
+    fn remember_proxy_mirror(instance: &str) {
+        use sha2::{Digest, Sha256};
+        let hash = format!("{:x}", Sha256::digest(b"mirror-reader"));
+        let payload = serde_json::json!({
+            "kind": "sync",
+            "sessions": { "ok": true, "items": [{ "sessionId": "cached-session" }], "revision": "sessions-rev", "generatedAt": 111 },
+            "workspaces": { "ok": true, "items": [{ "workspaceId": "cached-workspace" }], "revision": "workspaces-rev", "generatedAt": 222 },
+            "creds": [{ "hash": hash }],
+        });
+        assert!(crate::mirror::remember(instance, payload.to_string().as_bytes()));
+    }
+
+    /// 走真实 HTTP 入口和隧道分发；不复制路径筛选或 fallback 判定。
+    async fn mirrored_upstream_response(
+        instance: &str, method: &str, target: &str, credential: &str, status: u16, finish: bool,
+    ) -> (String, usize) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (out, mut frames) = mpsc::channel(16);
+        let tunnel = Tunnel::new(out);
+        tunnel.bind_instance(instance);
+        let slot = Arc::new(TunnelSlot::new());
+        slot.register(instance, tunnel.clone());
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            crate::http::serve_connection(stream, slot).await.unwrap();
+        });
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let raw = format!("{method} {target} HTTP/1.1\r\nhost: relay\r\nx-dsh-instance: {instance}\r\nx-dsh-device-credential: {credential}\r\ncontent-length: 0\r\n\r\n");
+        client.write_all(raw.as_bytes()).await.unwrap();
+        let message = tokio::time::timeout(std::time::Duration::from_secs(2), frames.recv()).await.unwrap().unwrap();
+        let mut request_id = None;
+        dsh_relay_protocol::FrameDecoder::new(4096).push(&message.into_data(), |frame| {
+            assert_eq!(frame.frame_type, t::HTTP_REQUEST);
+            request_id = Some(u64::from(frame.id));
+        });
+        let id = request_id.expect("request frame");
+        let body = br#"{"ok":false,"error":{"code":"internal","message":"upstream failed"}}"#;
+        let head = serde_json::json!({ "status": status, "headers": {
+            "content-type": "application/json", "content-length": body.len().to_string(), "x-upstream": "kept"
+        }});
+        handle_tunnel_frame(&tunnel, instance, t::HTTP_HEAD, id, head.to_string().as_bytes());
+        // 头与部分正文可在同一批到达；兜底必须丢掉这份已入队错误正文。
+        handle_tunnel_frame(&tunnel, instance, t::HTTP_CHUNK, id, body);
+        if finish { handle_tunnel_frame(&tunnel, instance, t::HTTP_END, id, &[]); }
+        let mut cancels = 0;
+        if !finish {
+            loop {
+                let message = tokio::time::timeout(std::time::Duration::from_secs(2), frames.recv())
+                    .await.expect("镜像接管必须取消仍在发送的上游").unwrap();
+                dsh_relay_protocol::FrameDecoder::new(4096).push(&message.into_data(), |frame| {
+                    if frame.frame_type == t::HTTP_CANCEL {
+                        assert_eq!(u64::from(frame.id), id);
+                        cancels += 1;
+                    }
+                });
+                if cancels > 0 { break; }
+            }
+            let before = tunnel.pending.lock().unwrap().get(&id).and_then(|entry| match entry {
+                Pending::Http(entry) => {
+                    assert!(entry.chunk_tx.is_none(), "取消前必须先停止响应入队");
+                    Some(entry.queued_bytes.load(Ordering::SeqCst))
+                }
+                _ => None,
+            });
+            handle_tunnel_frame(&tunnel, instance, t::HTTP_CHUNK, id, b"late-upstream-data");
+            if let Some(before) = before {
+                if let Some(Pending::Http(entry)) = tunnel.pending.lock().unwrap().get(&id) {
+                    assert_eq!(entry.queued_bytes.load(Ordering::SeqCst), before, "迟到帧不能重新入队");
+                }
+            }
+        }
+        let mut response = String::new();
+        tokio::time::timeout(std::time::Duration::from_secs(2), client.read_to_string(&mut response)).await.unwrap().unwrap();
+        server.await.unwrap();
+        while let Ok(message) = frames.try_recv() {
+            dsh_relay_protocol::FrameDecoder::new(4096).push(&message.into_data(), |frame| {
+                if frame.frame_type == t::HTTP_CANCEL { cancels += 1; }
+            });
+        }
+        assert_eq!(tunnel.capacity_snapshot().0, 0, "应答完成必须归还 pending 名额");
+        (response, cancels)
+    }
+
+    #[tokio::test]
+    async fn upstream_5xx_lists_use_authorized_mirror_and_cancel_response() {
+        let _guard = crate::mirror::test_lock();
+        let instance = "proxy-5xx-mirror";
+        remember_proxy_mirror(instance);
+        for (target, status, item) in [
+            ("/api/mobile/v1/sessions", 500, "cached-session"),
+            ("/relay/api/mobile/v1/workspaces", 503, "cached-workspace"),
+            ("/api/mobile/v1/sessions", 599, "cached-session"),
+        ] {
+            let (response, cancels) = mirrored_upstream_response(instance, "GET", target, "mirror-reader", status, false).await;
+            assert!(response.starts_with("HTTP/1.1 200 "), "{target}: {response}");
+            assert!(response.contains("x-dsh-relay-mirror: stale\r\n"), "{response}");
+            let body: serde_json::Value = serde_json::from_str(response.split_once("\r\n\r\n").unwrap().1).unwrap();
+            assert_eq!(body["stale"], true);
+            assert!(body["items"].to_string().contains(item), "{body}");
+            assert!(!response.contains("upstream failed") && !response.contains("x-upstream"));
+            assert_eq!(cancels, 1, "只取消一次原响应");
+        }
+        let (response, _) = mirrored_upstream_response(instance, "GET", "/api/mobile/v1/sessions?rev=sessions-rev", "mirror-reader", 502, false).await;
+        let body: serde_json::Value = serde_json::from_str(response.split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(body["unchanged"], true);
+        assert_eq!(body["stale"], true);
+        assert!(body.get("items").is_none());
+        let (response, cancels) = mirrored_upstream_response(instance, "GET", "/api/mobile/v1/sessions", "mirror-reader", 500, true).await;
+        assert!(response.starts_with("HTTP/1.1 200 ") && response.contains("cached-session"), "{response}");
+        assert_eq!(cancels, 0, "上游已结束时无需再取消");
+    }
+
+    #[tokio::test]
+    async fn upstream_5xx_without_eligible_mirror_preserves_original_response() {
+        let _guard = crate::mirror::test_lock();
+        let instance = "proxy-5xx-original";
+        remember_proxy_mirror(instance);
+        for (method, target, credential, active_instance, status) in [
+            ("GET", "/api/mobile/v1/sessions", "wrong-reader", instance, 500),
+            ("GET", "/api/mobile/v1/sessions", "mirror-reader", "proxy-no-mirror", 500),
+            ("GET", "/api/mobile/v1/sessions?fresh=1", "mirror-reader", instance, 500),
+            ("GET", "/api/mobile/v1/sessions?archived=1", "mirror-reader", instance, 500),
+            ("GET", "/api/mobile/v1/workspaces?offset=10", "mirror-reader", instance, 500),
+            ("POST", "/api/mobile/v1/sessions", "mirror-reader", instance, 500),
+            ("GET", "/api/mobile/v1/status", "mirror-reader", instance, 500),
+            ("GET", "/api/mobile/v1/sessions", "mirror-reader", instance, 499),
+            ("GET", "/api/mobile/v1/sessions", "mirror-reader", instance, 600),
+            ("GET", "/api/mobile/v1/sessions", "mirror-reader", instance, 200),
+        ] {
+            let (response, cancels) = mirrored_upstream_response(active_instance, method, target, credential, status, true).await;
+            assert!(response.starts_with(&format!("HTTP/1.1 {status} ")), "{method} {target}: {response}");
+            assert!(response.contains("x-upstream: kept\r\n"), "{response}");
+            assert!(response.ends_with(r#"{"ok":false,"error":{"code":"internal","message":"upstream failed"}}"#), "{response}");
+            assert!(!response.contains("x-dsh-relay-mirror"), "{response}");
+            assert_eq!(cancels, 0, "原响应无需取消");
+        }
     }
 
     #[test]

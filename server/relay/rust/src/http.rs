@@ -1,3 +1,4 @@
+// 列表镜像资格在入口按路径、读操作和 fresh 筛选，转发层只消费已筛选的兜底。
 // 控制面禁缓存；OTA 固定句柄分块读取并支持范围与现有发布摘要重验。
 //! 有界读取 HTTP 请求并分流到转发、升级或本地应答。
 //!
@@ -1025,7 +1026,7 @@ pub async fn serve_connection(stream: TcpStream, slot: Arc<TunnelSlot>) -> std::
             }
         }
     }
-    // 这一次读能不能用镜像兜底：隧道不在就直接给，隧道在就带着它去转发（弱网阈值到点才用）。
+    // 镜像只兜底默认列表读：隧道不在直接给；隧道在时留给弱网阈值或上游 5xx 分支。
     let mut mirror_fallback: Option<crate::mirror::Fallback> = None;
     if !instance_id.is_empty() && crate::config().mirror_cache {
         let routed = strip_forward_prefix(&head.normalized_pathname()).to_string();

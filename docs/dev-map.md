@@ -133,12 +133,21 @@
 - **联动**：宿主侧 `dsh-mobile-plugin/lib/mirror/pusher.cjs`（删除 → creds-only → 正文 → 文件，各自配额）、`history-blob.cjs`（封信封）、`sidecar-facade-worker.cjs`（`blobPut` / `blobDelete` 帧）；App 侧离线拉取在 `app/src/services/history-blob-load.ts`（只在宿主够不着时才走，`take` 走本机 HK 解信封）。
 - **守卫**：`cargo test` 里 `blobstore` 那一组（roundtrip、错凭据、过期凭据读不到、`expiresAt=0` 按不过期、空 `cipher` 只换 creds 且目标不存在时拒收、scope 白名单与 200 条上限、删除幂等、预算淘汰记进 `evicted`、读时判 TTL、启动重建清孤儿与 `.tmp`）、`config::tests::blob_limit_must_fit_in_a_frame`。
 - **坑**：**`BLOB_STORE` 打开后 `PLATFORM_DB_PATH` 必须给绝对路径**（数据目录是从它 parent 推出来的），否则进程直接 `exit(1)`；而自动更新的「试跑」用的是 `--version`，**只打版本不读配置**，所以这种配置错会在替换完成后才炸出来（下一轮启动靠 `.update-state` 回滚，但白升一次）。**老插件照样安全**：它不认 `0x1E`、中转收到未知帧静默丢弃，`blobPut` 的旧形状（裸 hex 数组、无 `expiresAt`）按「不过期」读，所以新中转配老插件只是「不推新内容」，不会报错。**`/status` 多了一个 `blob` 字段**（enabled/count/bytes/evicted），`/status` 只答本机、没有客户端消费它。
+
+### A1-10. 列表 5xx 镜像兜底（保留上次正常列表）
+
+- **典型说法**：「列表偶尔报 500」「宿主列表异常时为什么没有旧列表」「插件说 500 会用镜像但手机仍报错」「强制刷新拿到旧列表」。
+- **改哪里**：`server/relay/rust/src/proxy.rs` 在写上游响应头之前处理 500–599；`server/relay/rust/src/http.rs` 在 HTTP 入口筛选镜像资格；`server/relay/rust/src/mirror.rs` 保存镜像并在使用时核对凭据；`server/relay/rust/src/config.rs` 的 `MIRROR_CACHE` 和 `MIRROR_FALLBACK_MS`；模块约定在 `server/relay/rust/src/lib.rs`。
+- **刻意设计**：仅沿用 `parse_read` 放行的默认会话/工作区 GET；`fresh`、归档子集、翻页、非列表和写操作都不使用镜像。收到上游 5xx 时，有镜像且当前凭据仍有效才回 200，正文保留 `stale:true`，响应头带 `x-dsh-relay-mirror: stale`；内容指纹相同时照旧回 `unchanged:true`。无镜像、错凭据或被撤销凭据时保留上游状态、响应头和正文。`MIRROR_CACHE=0` 关闭全部镜像兜底；`MIRROR_FALLBACK_MS=0` 只关闭等待响应头时的计时兜底，不关闭明确的上游 5xx 兜底。
+- **资源收尾**：使用镜像前先取走原响应发送端，向仍在发送的宿主发一次 `HTTP_CANCEL` 并丢掉已入队错误正文；迟到帧不会再入队。写完镜像后由原请求收尾路径释放 pending 名额。不能只替换状态码，也不能先写上游响应头再改成镜像。
+- **守卫**：`cargo test --manifest-path server/relay/rust/Cargo.toml upstream_5xx` 走真实 HTTP 入口和隧道帧分发，覆盖会话/工作区、部署前缀、500/503/599、内容指纹、错凭据、无缓存、fresh、归档、分页、写操作、非列表、非 5xx、原正文保留、取消与 pending 回收；镜像全局容量测试与转发测试共用镜像表测试锁。将真实 5xx 分支禁用时，上述用例必须失败；完整子项目验证运行 `npm test`。
+- **根因**：此前转发只在等待响应头超过弱网阈值时使用镜像，收到 5xx 会直接写给手机，与插件依赖的“列表异常时保留上次正常列表”约定不一致。
 <!-- END:TASK-PLAYBOOKS -->
 
 ## B 段 · 文件清单（机械生成，勿手改）
 
 <!-- BEGIN:GENERATED-FILES -->
-> **A 段未覆盖**：24 / 33 个源文件没有任何条目的「改哪里」收它们。
+> **A 段未覆盖**：24 / 36 个源文件没有任何条目的「改哪里」收它们。
 > 其中 0 个被「联动」点到过——`affected` 按名字找得到，但只会提示「顺带被点到」，
 > 没有条目「拥有」它们。完整清单见
 > [`docs/.dev-map-uncovered.txt`](.dev-map-uncovered.txt)——那是一份「地图待补清单」，
@@ -146,43 +155,46 @@
 
 ### Rust 中转与隧道协议（全部源码）
 
-共 33 个文件。
+共 36 个文件。
 
 | 文件 | 用途 |
 | --- | --- |
-| `server/relay-core/protocol-types.js` | DSH 隧道协议 v2 —— 帧类型表与线格式常量（唯一事实源）。 |
+| `server/relay-core/protocol-types.js` | 帧载荷说明与 PROTOCOL. |
 | `server/relay-core/rust/src/lib.rs` | DSH 隧道协议 v2 —— Rust 实现。 |
 | `server/relay-core/rust/tests/parity.rs` | 跨语言逐字节对撞：Rust 实现与 JS 权威实现必须对同一输入编出**完全相同**的字节。 |
-| `server/relay-core/test/protocol.js` | dsh-mobile-server 隧道协议 v2 编解码。 |
+| `server/relay-core/test/protocol.js` | 参考宿主与 Rust parity 共用帧表，包含 blobPut 的旧控制帧和协商分片。 |
 | `server/relay/rust/console/index.html` | (无文件头注释) |
-| `server/relay/rust/console/src/App.tsx` | 中转控制台。 |
+| `server/relay/rust/console/scripts/network-remediation.test.cjs` | 控制台网络、动作确认与真实 React 生命周期的最小 Node 假体回归。 |
+| `server/relay/rust/console/src/App.tsx` | 控制台沿用既有外观，登录、刷新与写操作共用可取消的请求生命周期。 |
 | `server/relay/rust/console/src/components/blocks.tsx` | 一枚小圆点，颜色说明这一行此刻好不好。 |
 | `server/relay/rust/console/src/index.css` | (无文件头注释) |
-| `server/relay/rust/console/src/lib/api.ts` | 控制台的接口层。 |
+| `server/relay/rust/console/src/lib/api.ts` | 控制台的接口层：同源会话请求统一超时、取消和响应校验。 |
 | `server/relay/rust/console/src/lib/format.ts` | 一点点展示用的纯函数，和接口无关。 |
+| `server/relay/rust/console/src/lib/useConsole.ts` | 控制台请求生命周期、动作确认与可见页刷新共用同一个串行入口。 |
 | `server/relay/rust/console/src/main.tsx` | (无文件头注释) |
 | `server/relay/rust/console/vite.config.ts` | 中转控制台的构建配置。 |
-| `server/relay/rust/src/apns.rs` | APNs 推送转发：任务完成时把通知递到苹果，由苹果送到离线 / 后台的 iPhone。 |
-| `server/relay/rust/src/blobstore.rs` | 加密历史 blob 的落盘仓库（`BLOB_STORE` 打开时才存在）。 |
-| `server/relay/rust/src/config.rs` | 环境变量配置（限额的唯一真源）。 |
-| `server/relay/rust/src/console/config.rs` | 控制台的配置：从环境变量读，前缀 `PLATFORM_`。 |
-| `server/relay/rust/src/console/mod.rs` | 中转控制台：管理面、准入、账号与激活码。 |
-| `server/relay/rust/src/console/node.rs` | 主控端 / 被控端。 |
-| `server/relay/rust/src/console/oidc.rs` | 微信登录（OIDC）：接一套标准 OIDC 聚合登录系统（基址由 `PLATFORM_OIDC_ISSUER` 给）。 |
-| `server/relay/rust/src/console/ota.rs` | 插件 OTA 的**临时通道**。 |
-| `server/relay/rust/src/console/ratelimit.rs` | 公开接口的限流。 |
-| `server/relay/rust/src/headers.rs` | 请求头 / 响应头的转发规则。 |
-| `server/relay/rust/src/http.rs` | 一个 TCP 连接上的 HTTP/1. |
-| `server/relay/rust/src/lib.rs` | DSH 自建版中转（Rust）。 |
-| `server/relay/rust/src/main.rs` | 自建版中转的入口：读配置、起 HTTP 服务、等隧道连上来。 |
+| `server/relay/rust/src/apns.rs` | APNs 推送转发：依赖可用令牌存储，永久失效令牌按当次发送值删除。 |
+| `server/relay/rust/src/blobstore.rs` | 管理加密历史 blob 的落盘、容量与设备凭据访问。 |
+| `server/relay/rust/src/blobstore/upload.rs` | 每条宿主隧道串行接收有界 blob 分片，写盘确认不阻塞隧道分发。 |
+| `server/relay/rust/src/config.rs` | 环境变量配置：限额、监听与镜像开关； |
+| `server/relay/rust/src/console/config.rs` | 控制台配置与登录事务期限； |
+| `server/relay/rust/src/console/mod.rs` | 中转控制台：有限登录事务、稳定身份、可信来源审计与准入管理。 |
+| `server/relay/rust/src/console/node.rs` | 主控端 / 被控端：显式交还准入管理权，周期上报加入抖动。 |
+| `server/relay/rust/src/console/oidc.rs` | 微信 OIDC 登录：保留所有同类型身份标识，交存储层稳定匹配。 |
+| `server/relay/rust/src/console/ota.rs` | 插件 OTA 临时通道：固定句柄分块下载与单段 Range，发布磁盘工作移到阻塞池。 |
+| `server/relay/rust/src/console/ratelimit.rs` | 公开接口的固定窗口限流； |
+| `server/relay/rust/src/headers.rs` | 请求头转发与显式可信代理来源解析，供中转和控制面共用。 |
+| `server/relay/rust/src/http.rs` | 列表镜像资格在入口按路径、读操作和 fresh 筛选，转发层只消费已筛选的兜底。 |
+| `server/relay/rust/src/lib.rs` | DSH 自建版中转：纯转发与按既有凭据放行的列表失败镜像兜底。 |
+| `server/relay/rust/src/main.rs` | 中转入口：安全监听默认值、可用控制面依赖与非阻塞存储初始化。 |
 | `server/relay/rust/src/migrate.rs` | 实例迁移台账：宿主换中转之前，在旧中转上留一条「我搬到 X 了」。 |
-| `server/relay/rust/src/mirror.rs` | 宿主离线时的最后一份镜像。 |
+| `server/relay/rust/src/mirror.rs` | 保存宿主列表镜像，在离线、等头超时或上游 5xx 时按原有凭据规则提供旧列表。 |
 | `server/relay/rust/src/plugin_versions.rs` | 宿主上报的插件版本，以及「最低可接受版本」这道门槛。 |
-| `server/relay/rust/src/proxy.rs` | HTTP 转发与隧道帧分发。 |
-| `server/relay/rust/src/selfupdate.rs` | 中转自身的自动更新。 |
-| `server/relay/rust/src/store.rs` | 控制台的数据层：SQLite 建表与查询。 |
-| `server/relay/rust/src/tunnel.rs` | 隧道状态与帧发送（单条隧道）。 |
-| `server/relay/rust/src/ws.rs` | 隧道接入与手机 WebSocket 桥接。 |
+| `server/relay/rust/src/proxy.rs` | 默认列表的上游 5xx 使用已授权镜像兜底，取消原响应并在应答结束后释放名额。 |
+| `server/relay/rust/src/selfupdate.rs` | 中转自身的多源自动更新：候选验证失败换源，文件操作与试跑离开异步线程。 |
+| `server/relay/rust/src/store.rs` | 时间读取只告警真实异常； |
+| `server/relay/rust/src/tunnel.rs` | 管理单条隧道、转发名额与双向排队字节预算。 |
+| `server/relay/rust/src/ws.rs` | 接入宿主隧道，协商有界 blob 上传并桥接保序的手机 WebSocket 流。 |
 <!-- END:GENERATED-FILES -->
 
 ## C 段 · 守卫与测试索引（机械生成，勿手改）
@@ -202,5 +214,5 @@
 | `server/relay/rust/scripts/e2e-mirror.cjs` | 端到端验收：宿主离线时的镜像兜底（`MIRROR_CACHE`）。 |
 | `server/relay/rust/scripts/e2e-stream.cjs` | 端到端验证（第二组）：SSE 流式、手机 WebSocket 桥接、隧道被取代时的清理。 |
 | `server/relay/rust/scripts/e2e.cjs` | 端到端验证：起 Rust 中转 → 连一个参考宿主隧道 → 用 HTTP 请求穿过它。 |
-| `server/relay/rust/test/fake-desktop.js` | 参考隧道实现（协议 v2）：把「中转服务器」与「本地 HTTP/WS 服务」对接起来。 |
+| `server/relay/rust/test/fake-desktop.js` | 参考宿主只发送登记所需元信息，不在隧道注册中携带配对码。 |
 <!-- END:GENERATED-GUARDS -->

@@ -1,8 +1,8 @@
-//! 保存宿主离线镜像并校验共享的设备凭据摘要与过期容差。
+//! 保存宿主列表镜像，在离线、等头超时或上游 5xx 时按原有凭据规则提供旧列表。
 //!
 //! 中转原本是纯转发：宿主那条隧道不在，手机上来的读就只有一句 503，侧栏空着、什么都
 //! 点不开。弱网与宿主刚断线的时候，人看到的正是这个。这里把宿主**自己推上来**的那份
-//! 会话清单与工作区留在进程里，只在找不到能用的隧道时回给手机，并且如实标成 stale——
+//! 会话清单与工作区留在进程里，在隧道不可用、等头超过弱网阈值或上游返回 5xx 时回给手机，标成 stale——
 //! 它只保证「还看得见」，不假装数据是新的（手机侧对 stale 会显示「已保留上次的列表」，
 //! 也不会拿它当权威去确认删除/归档）。
 //!
@@ -526,9 +526,8 @@ fn sha256_hex(raw: &str) -> String {
 
 /// 一次「已经问出去了、但可能来不及」的缓存读。
 ///
-/// 转发路径在等宿主回 `httpHead` 的时候把它备着：到点还没回，就先拿它答手机，再取消
-/// 上游。与直接命中缓存的区别只有一个——这时候隧道是**活着**的，所以只在阈值到点后
-/// 才用它（见 `proxy_request`）。
+/// 转发路径在等宿主回 `httpHead` 时备着：超过弱网阈值或收到 5xx，拿它答手机并取消
+/// 上游。每次真正使用时仍重查镜像和凭据；拿不出时保留上游的失败响应。
 #[derive(Clone)]
 pub struct Fallback {
     instance: String,
@@ -611,16 +610,16 @@ fn creds_of(payload: &serde_json::Value) -> Vec<(String, i64)> {
         .collect()
 }
 
+/// 镜像表是进程级单例，镜像与真实转发用例共用锁，避免容量测试淘汰别的用例条目。
+#[cfg(test)]
+pub(crate) fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// 镜像表是进程级单例。用例并行跑时会互相淘汰对方的条目，断言就成了测时序——
-    /// 每个用例先拿这把锁，串起来跑。
-    fn serial() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: Mutex<()> = Mutex::new(());
-        LOCK.lock().unwrap_or_else(|e| e.into_inner())
-    }
 
     /// 一次请求可能同时带 `X-Dsh-Device-Credential` 与 Bearer 两份凭据，判据拿到的是
     /// 一个有序列表（header 在前），所以断言也按列表写。
@@ -646,7 +645,7 @@ mod tests {
 
     #[test]
     fn keeps_the_last_pushed_bodies_and_marks_them_stale() {
-        let _guard = serial();
+        let _guard = test_lock();
         let instance = "mirror-keep";
         assert!(remember(
             instance,
@@ -666,7 +665,7 @@ mod tests {
     /// 离线时更只剩这一份。这条用例钉的是「多出来的外层字段保住」，不是业务语义。
     #[test]
     fn keeps_unknown_outer_fields_such_as_the_envelope() {
-        let _guard = serial();
+        let _guard = test_lock();
         let instance = "mirror-env";
         let frame = serde_json::json!({
             "kind": "sync",
@@ -704,7 +703,7 @@ mod tests {
 
     #[test]
     fn serves_to_any_credential_whose_digest_is_known() {
-        let _guard = serial();
+        let _guard = test_lock();
         let instance = "mirror-cred";
         // T1 形状：每设备凭据本身就是一段 Bearer，没有 `dshc_` 那种前缀。
         let t1 = "99d9d3ee.1800000000.bG9jYWwtcmFuZG9t";
@@ -735,7 +734,7 @@ mod tests {
 
     #[test]
     fn old_plugins_without_creds_get_nothing() {
-        let _guard = serial();
+        let _guard = test_lock();
         let instance = "mirror-nocreds";
         assert!(remember(instance, &payload(serde_json::json!([]))));
         assert_eq!(lookup(instance, ListKind::Sessions, "", &presented(&["cred_live"])), None);
@@ -760,7 +759,7 @@ mod tests {
 
     #[test]
     fn honours_credential_expiry() {
-        let _guard = serial();
+        let _guard = test_lock();
         let instance = "mirror-expiry";
         assert!(remember(
             instance,
@@ -771,7 +770,7 @@ mod tests {
 
     #[test]
     fn unchanged_answers_with_the_cached_revision() {
-        let _guard = serial();
+        let _guard = test_lock();
         let instance = "mirror-rev";
         assert!(remember(
             instance,
@@ -792,7 +791,7 @@ mod tests {
 
     #[test]
     fn refuses_degraded_or_foreign_payloads() {
-        let _guard = serial();
+        let _guard = test_lock();
         let instance = "mirror-bad";
         // 不是 sync 帧
         assert!(!remember(instance, br#"{"kind":"raw","data":{}}"#));
@@ -815,7 +814,7 @@ mod tests {
 
     #[test]
     fn a_bad_push_keeps_the_previous_good_copy() {
-        let _guard = serial();
+        let _guard = test_lock();
         let instance = "mirror-keep-good";
         assert!(remember(
             instance,
@@ -833,7 +832,7 @@ mod tests {
 
     #[test]
     fn only_plain_default_reads_are_cacheable() {
-        let _guard = serial();
+        let _guard = test_lock();
         for path in ["/api/mobile/v1/sessions", "/api/mobile/v1/workspaces"] {
             assert!(parse_read("GET", path, "").is_some(), "{path}");
             assert!(parse_read("GET", path, "?rev=abc").is_some(), "{path}");
@@ -855,7 +854,7 @@ mod tests {
 
     #[test]
     fn fallback_only_answers_when_it_could() {
-        let _guard = serial();
+        let _guard = test_lock();
         let instance = "mirror-fallback";
         assert!(remember(
             instance,
@@ -887,7 +886,7 @@ mod tests {
 
     #[test]
     fn caps_instances_and_keeps_newest() {
-        let _guard = serial();
+        let _guard = test_lock();
         for index in 0..(MAX_INSTANCES + 4) {
             let instance = format!("mirror-cap-{index}");
             assert!(remember(
@@ -909,7 +908,7 @@ mod tests {
     /// 谁把上限调回单机口径就红。
     #[test]
     fn a_busy_public_relay_keeps_every_instance() {
-        let _guard = serial();
+        let _guard = test_lock();
         assert!(MAX_INSTANCES >= 256, "公用中转的实例规模远超「一台机器一个实例」的口径");
         let count = 200usize;
         for index in 0..count {
@@ -1000,7 +999,7 @@ mod tests {
     /// 纯转发部署（`MIRROR_CACHE=0`）只留摘要：正文一个字节都不存，但摘要还得在。
     #[test]
     fn a_forward_only_relay_keeps_only_the_digests() {
-        let _guard = serial();
+        let _guard = test_lock();
         let instance = "mirror-creds-only";
         let cred = "cred_only";
         assert!(remember_with(
