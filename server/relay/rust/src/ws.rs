@@ -1,4 +1,4 @@
-//! 接入宿主隧道并桥接有界、保序的手机 WebSocket 流。
+//! 接入宿主隧道，协商有界 blob 上传并桥接保序的手机 WebSocket 流。
 //!
 //! 两条 WS 路径：
 //!   - `/tunnel` —— 宿主的出站隧道。同一时刻只服务一条，新连接取代旧的。
@@ -48,7 +48,18 @@ pub fn unregistered_timeouts() -> u64 {
 /// 老宿主只认帧类型、不读内容（`relay/tunnel.js` 收到 0x02 直接 resolve），多一个字段
 /// 没有任何影响；反过来，**没有这个字段就按「存镜像」处理**，所以老中转 + 新宿主也照旧。
 fn registered_ack(mirror_cache: bool) -> String {
-    format!(r#"{{"ok":true,"mirror":{mirror_cache}}}"#)
+    registered_ack_with_blob(mirror_cache, crate::blob_store().is_some())
+}
+
+fn registered_ack_with_blob(mirror_cache: bool, blob: bool) -> String {
+    let mut value = serde_json::json!({"ok":true,"mirror":mirror_cache});
+    if blob {
+        value["blobUpload"] = serde_json::json!({
+            "maxChunkBytes": crate::blobstore::upload::MAX_CHUNK_BYTES,
+            "maxBlobBytes": crate::config().max_blob_bytes,
+        });
+    }
+    value.to_string()
 }
 
 /// 常量时间比较两个字节串：逐字节异或累加，长度不同也把整轮走完再判。
@@ -225,6 +236,7 @@ pub async fn accept_tunnel(
 
     let (out_tx, mut out_rx) = mpsc::channel::<Message>(1024);
     let tunnel = Tunnel::new(out_tx);
+    let blob_tx = crate::blob_store().map(|store| crate::blobstore::upload::spawn(store, Arc::downgrade(&tunnel)));
 
     // 这里**先不登记**。这台是哪个实例要等 `register` 帧到了才知道，而公用中转上
     // 「谁」决定了后续请求发给谁——先挂上去再改名，中间那段窗口里的请求会发给一台
@@ -485,14 +497,12 @@ pub async fn accept_tunnel(
                         break 'tunnel Some("instance change on one tunnel".to_string());
                     }
                     // 诊断（`DEBUG_SYNC_STATS=1`）：这台实例是哪个出口 IP 来的。
-                    // 中转只看得见 nginx 的 loopback 端口，`x-real-ip` 是本机 nginx 覆盖写入的，
-                    // 客户端伪造不了（`x-forwarded-for` 那串能随便填，不能当来源）。为的是把
-                    // 「还在推整份镜像的那几台」对到具体机器上，查完就没用了，所以只在开关打开时打。
+                    // 与控制面共用来源规则，异机/容器代理只有显式可信CIDR才可提供来源。
                     if crate::config().debug_sync_stats {
-                        let ip = head.header("x-real-ip").unwrap_or_default();
+                        let ip = crate::headers::client_ip(peer, &head.headers, &crate::config().trusted_proxy_cidrs);
                         log(format!(
                             "tunnel registered instance={instance_id} ip={} peer={}",
-                            if ip.is_empty() { "-" } else { ip.trim() },
+                            ip.map(|ip| ip.to_string()).unwrap_or_else(|| "-".to_string()),
                             peer.map(|p| p.to_string()).unwrap_or_else(|| "-".to_string())
                         ));
                     }
@@ -515,10 +525,26 @@ pub async fn accept_tunnel(
                 tunnel.send_json(t::REGISTERED, 0, &registered_ack(crate::config().mirror_cache));
                 continue;
             }
+            if matches!(frame_type, t::BLOB_PUT | t::BLOB_DELETE) {
+                if tunnel.instance_id().is_none() { continue; }
+                if let Some(tx) = blob_tx.as_ref() {
+                    // 分片最多约64KiB base64；大整包只允许原有 id0 路径。
+                    if id == 0 {
+                        // 旧协议没有确认/重发；满队列时只对这条旧连接背压，不能静默丢历史或creds。
+                        if tx.send((frame_type, id, payload)).await.is_err() {
+                            break 'tunnel Some("blob worker stopped".to_string());
+                        }
+                    } else if payload.len() > 128 * 1024 || tx.try_send((frame_type, id, payload)).is_err() {
+                        tunnel.send_json(t::BLOB_PUT, id as u64, r#"{"ok":false,"nextOffset":0,"done":false,"error":"blob upload queue full or chunk too large"}"#);
+                    }
+                }
+                continue;
+            }
             crate::proxy::handle_tunnel_frame(&tunnel, &instance_label, frame_type, id as u64, &payload);
         }
     };
 
+    drop(blob_tx);
     heartbeat.abort();
     writer.abort();
     tunnel.mark_closed();
@@ -997,8 +1023,11 @@ mod tests {
     /// 「照推整份」——那是这次要省掉的两百多 GB。两条都钉住。
     #[test]
     fn registered_ack_carries_mirror_flag() {
-        assert_eq!(registered_ack(true), r#"{"ok":true,"mirror":true}"#);
-        assert_eq!(registered_ack(false), r#"{"ok":true,"mirror":false}"#);
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&registered_ack_with_blob(true, false)).unwrap(), serde_json::json!({"ok":true,"mirror":true}));
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&registered_ack_with_blob(false, false)).unwrap(), serde_json::json!({"ok":true,"mirror":false}));
+        let capable: serde_json::Value = serde_json::from_str(&registered_ack_with_blob(false, true)).unwrap();
+        assert_eq!(capable["blobUpload"]["maxChunkBytes"], 49152);
+        assert_eq!(capable["blobUpload"]["maxBlobBytes"], crate::config().max_blob_bytes);
     }
 
     /// 注册密钥比较：同值才算过，长度或任一字节不同都必须拒绝。

@@ -1,3 +1,4 @@
+// 推送令牌失败回收按实例、设备与旧令牌原子匹配，不误删轮换后的新值。
 //! 控制台的数据层：SQLite 建表与查询。
 //!
 //! 从 Node 运营版（`server/dsh-mobile-hub/lib/platform/`）译过来，**表结构与授权码规则
@@ -993,6 +994,14 @@ impl Store {
         );
     }
 
+    /// 在途推送失败只删除当次旧令牌；App已轮换上报时不动新值。
+    pub fn delete_push_token_if_matches(&self, instance_id: &str, device_id: &str, token: &str) -> bool {
+        self.lock().execute(
+            "DELETE FROM push_tokens WHERE instance_id = ?1 AND device_id = ?2 AND token = ?3",
+            params![instance_id, device_id, token],
+        ).map(|removed| removed > 0).unwrap_or(false)
+    }
+
     /// 这台实例上「哪些设备还没看过这一轮」要推谁：把整台实例的令牌都取出来。
     ///
     /// 完成事件不带设备粒度（completion 状态机按设备记账的那份在宿主侧，中转只有
@@ -1335,6 +1344,19 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_push_token_does_not_remove_replacement_or_other_instance() {
+        let store = Store::in_memory().unwrap();
+        store.upsert_push_token("a", "phone", "ios", "old");
+        store.upsert_push_token("b", "phone", "ios", "old");
+        store.upsert_push_token("a", "phone", "ios", "new");
+        assert!(!store.delete_push_token_if_matches("a", "phone", "old"));
+        assert_eq!(store.push_tokens_of("a"), vec![("phone".to_string(), "new".to_string())]);
+        assert!(store.delete_push_token_if_matches("b", "phone", "old"));
+        assert_eq!(store.push_token_count("a"), 1);
+        assert_eq!(store.push_token_count("b"), 0);
+    }
 
     #[test]
     fn license_code_shape_matches_node() {

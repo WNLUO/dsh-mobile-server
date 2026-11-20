@@ -1,4 +1,4 @@
-//! 环境变量配置（限额的唯一真源）。
+//! 环境变量配置：限额、回环监听默认值与共用可信代理网段。
 //!
 //! 对齐 Node 版 `lib/config.js`：所有可调项都走「越界直接报错、不 clamp」。一个手滑的
 //! 0 或负值若被静默接受，表现是限额「关掉」而不是「设错」（例如 MAX_PENDING=0 会让全部
@@ -73,6 +73,7 @@ fn parse_update_interval(raw: Option<&str>) -> Result<u64, String> {
 pub struct Config {
     pub host: String,
     pub port: u16,
+    pub trusted_proxy_cidrs: Vec<crate::headers::ProxyCidr>,
 
     pub max_frame_bytes: usize,
     pub max_body_bytes: usize,
@@ -141,7 +142,7 @@ pub struct Config {
     pub max_blob_bytes: usize,
     /// 每个实例的 blob 总量上限（字节；默认 64MB）。
     pub max_blob_per_instance_bytes: usize,
-    /// 全局 blob 总量上限（字节；默认 512MB）。超过按 `updated_at` 从旧到新淘汰。
+    /// 全局 blob 总量上限（字节；默认 512MB）。超限先淘汰写入实例自己的旧条目。
     pub max_blob_total_bytes: usize,
     /// blob 存活时长（秒；默认 7 天）。读/写时顺手清过期。
     pub blob_ttl_seconds: u64,
@@ -223,7 +224,11 @@ impl Config {
     /// 从环境变量读配置。任何一项越界都返回 Err，由 main 直接退出。
     pub fn from_env() -> Result<Self, String> {
         let config = Config {
-            host: env::var("HOST").unwrap_or_else(|_| "0.0.0.0".to_string()),
+            host: env::var("HOST").unwrap_or_else(|_| "127.0.0.1".to_string()),
+            trusted_proxy_cidrs: match env::var("TRUSTED_PROXY_CIDRS") {
+                Ok(raw) => crate::headers::parse_trusted_proxies(&raw)?,
+                Err(_) => crate::headers::default_trusted_proxies(),
+            },
             port: env::var("PORT")
                 .ok()
                 .and_then(|p| p.trim().parse::<u16>().ok())
@@ -356,7 +361,8 @@ impl Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            host: "0.0.0.0".to_string(),
+            host: "127.0.0.1".to_string(),
+            trusted_proxy_cidrs: crate::headers::default_trusted_proxies(),
             port: 8700,
             max_frame_bytes: 8 * 1024 * 1024,
             max_body_bytes: 67 * 1024 * 1024,
@@ -393,6 +399,15 @@ impl Default for Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn safe_listener_and_proxy_defaults_are_explicit() {
+        let config = Config::default();
+        assert_eq!(config.host, "127.0.0.1");
+        assert!(crate::headers::trusted_proxy("127.0.0.2".parse().unwrap(), &config.trusted_proxy_cidrs));
+        assert!(crate::headers::trusted_proxy("::1".parse().unwrap(), &config.trusted_proxy_cidrs));
+        assert!(!crate::headers::trusted_proxy("10.0.0.1".parse().unwrap(), &config.trusted_proxy_cidrs));
+    }
 
     /// 源码编译出来的二进制**不带**默认更新源；官方包带的是流水线烤进去的那组。
     ///

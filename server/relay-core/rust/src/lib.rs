@@ -1,4 +1,5 @@
 //! DSH 隧道协议 v2 —— Rust 实现。
+//! blobPut 沿用 0x1D：旧 id=0 控制帧，协商后非零 id 双向分片与回执。
 //!
 //! 线格式与 `../protocol-types.js` 定义的一致：
 //!
@@ -47,7 +48,8 @@ pub mod t {
     pub const PUSH_SEND: u8 = 0x1B;
     /// 宿主断开旧隧道之前报「我搬到 `to` 了」；`to` 为空串撤销这条记录。
     pub const MIGRATE: u8 = 0x1C;
-    /// 宿主把 HK 加密的历史 blob（密文）推给中转；中转只存不解。
+    /// 旧 id=0 上传整份密文或以空 cipher 刷新凭据；中转只存不解。
+    /// registered.blobUpload 协商后，id=N 上传分片、同 type/id 反向回 ack；载荷见 PROTOCOL.md。
     pub const BLOB_PUT: u8 = 0x1D;
     /// 宿主让中转删掉已推过的 blob（`{scope, key}` 或 `{scope, keys:[...]}`）。
     pub const BLOB_DELETE: u8 = 0x1E;

@@ -1,3 +1,4 @@
+// blob 写入由每隧道有界 worker 处理，主分发保持流量畅通。
 //! 按字节预算转发 HTTP / WS 帧，并管理上传错误与响应暂停恢复。
 //!
 //! 响应方向达到高水位先暂停宿主，回落后恢复；字节硬上限与暂停期限负责收尾。
@@ -474,19 +475,9 @@ fn parse_json_value(payload: &[u8]) -> serde_json::Value {
     serde_json::from_slice(payload).unwrap_or_else(|_| serde_json::json!({}))
 }
 
-/// 解 `blobPut` 里的 `cipher`（base64url，无填充优先，带填充也认）。
-fn decode_base64_url(raw: &str) -> Option<Vec<u8>> {
-    use base64::Engine as _;
-    let raw = raw.trim();
-    base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(raw)
-        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(raw))
-        .ok()
-}
-
 /// `creds` 数组：每项 `{hash, expiresAt}`（与镜像同一形状），也认老的裸 hex 串。
 /// 形状不对的整条丢掉。
-fn parse_creds(value: Option<&serde_json::Value>) -> Vec<crate::blobstore::Cred> {
+pub(crate) fn parse_creds(value: Option<&serde_json::Value>) -> Vec<crate::blobstore::Cred> {
     use crate::blobstore::Cred;
     let mut out = Vec::new();
     if let Some(list) = value.and_then(|v| v.as_array()) {
@@ -874,94 +865,8 @@ pub fn handle_tunnel_frame(tunnel: &Arc<Tunnel>, instance_id: &str, frame_type: 
                 None => log("ignored migrate frame from a tunnel with no instanceId"),
             }
         }
-        t::BLOB_PUT => {
-            // 宿主推上来一条用 HK 加密好的历史 blob。中转**只存密文、不解密**：
-            // 这里只取 `creds` 摘要与 `bytes`，cipher 原样落盘。`BLOB_STORE` 关时
-            // 没有仓库，直接忽略（不报错、不回执），转发行为一个字节都不变。
-            let Some(store) = crate::blob_store() else { return };
-            let value = parse_json_value(payload);
-            let scope = value
-                .get("scope")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .trim()
-                .to_string();
-            let key = value
-                .get("key")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .trim()
-                .to_string();
-            if scope.is_empty() || key.is_empty() {
-                return;
-            }
-            let Some(cipher) = value
-                .get("cipher")
-                .and_then(|v| v.as_str())
-                .and_then(decode_base64_url)
-            else {
-                return;
-            };
-            let creds = parse_creds(value.get("creds"));
-            // 记录归属取**这条隧道自己登的 instanceId**（与 migrate 同口径），不信任
-            // payload 里可能出现的任何「替谁存」字段。
-            let Some(instance) = tunnel.instance_id() else {
-                return;
-            };
-            if !store.put(&instance, &scope, &key, &cipher, creds) {
-                log(format!(
-                    "blob put rejected instance={instance} scope={scope} bytes={}",
-                    cipher.len()
-                ));
-            }
-        }
-        t::BLOB_DELETE => {
-            // 宿主让中转删掉已推过的 blob（会话删除 / 归档清空 / 吊销全部）。
-            // payload 是 `{scope, key}` 或 `{scope, keys:[...]}`，两种都认。
-            // 归属同样取这条隧道自己登的 instanceId，删不到别家去。
-            let Some(store) = crate::blob_store() else { return };
-            let value = parse_json_value(payload);
-            let scope = value
-                .get("scope")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .trim()
-                .to_string();
-            if scope.is_empty() {
-                return;
-            }
-            let Some(instance) = tunnel.instance_id() else {
-                return;
-            };
-            let mut keys: Vec<String> = Vec::new();
-            if let Some(key) = value.get("key").and_then(|v| v.as_str()) {
-                let key = key.trim();
-                if !key.is_empty() {
-                    keys.push(key.to_string());
-                }
-            }
-            if let Some(list) = value.get("keys").and_then(|v| v.as_array()) {
-                for item in list {
-                    if let Some(key) = item.as_str() {
-                        let key = key.trim();
-                        if !key.is_empty() {
-                            keys.push(key.to_string());
-                        }
-                    }
-                }
-            }
-            let mut removed = 0usize;
-            for key in &keys {
-                if store.delete(&instance, &scope, key) {
-                    removed += 1;
-                }
-            }
-            if removed > 0 {
-                log(format!(
-                    "blob delete instance={instance} scope={scope} removed={removed}"
-                ));
-            }
-        }
+        // blobPut/blobDelete 已由 ws 的每连接有界文件 worker 接管。
+        t::BLOB_PUT | t::BLOB_DELETE => {}
         t::HTTP_HEAD => {
             let value = parse_json_value(payload);
             let status = value

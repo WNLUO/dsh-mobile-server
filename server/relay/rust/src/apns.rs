@@ -1,4 +1,4 @@
-//! APNs 推送转发：任务完成时把通知递到苹果，由苹果送到离线 / 后台的 iPhone。
+//! APNs 推送转发：依赖可用令牌存储，永久失效令牌按当次发送值删除。
 //!
 //! 鉴权用 **token-based**（`.p8` 密钥 + provider JWT），不用证书：密钥不过期
 //! （证书一年一换），一台密钥能推该团队全部 App。部署方提供三样配置：
@@ -6,8 +6,8 @@
 //! 推送就是关的**——纯转发部署什么也不用改。
 //!
 //! 刻意不做的事：不重试（苹果没收到就等下次完成事件的提示音 / 常驻通知兜底，
-//! 推送是增强不是唯一通道）；不缓存设备令牌的删除回调（令牌失效由 App 下次
-//! 启动重新上报覆盖）；连接不复用 HTTP/2（reqwest 内部有连接池，够用）。
+//! 推送是增强不是唯一通道）；只在设备令牌永久失效时摘除对应旧值，网络与provider
+//! 凭据错误不删设备令牌。reqwest内部连接池复用连接。
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -74,6 +74,21 @@ impl ApnsConfig {
     }
 }
 
+#[derive(Debug)]
+pub struct SendError { message: String, invalid_token: bool }
+
+impl std::fmt::Display for SendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(&self.message) }
+}
+
+fn rejected(status: u16, body: &str) -> SendError {
+    let reason = serde_json::from_str::<serde_json::Value>(body).ok()
+        .and_then(|v| v.get("reason").and_then(|v| v.as_str()).map(str::to_string));
+    let invalid_token = (status == 410 && reason.as_deref() == Some("Unregistered"))
+        || matches!(reason.as_deref(), Some("BadDeviceToken" | "ExpiredToken"));
+    SendError { message: format!("apns rejected ({status}): {body}"), invalid_token }
+}
+
 /// 中转的推送出口。`None` = 推送未配置（功能关闭）。
 pub struct ApnsClient {
     config: ApnsConfig,
@@ -92,7 +107,7 @@ impl ApnsClient {
     }
 
     /// 发一条推送。失败只记日志：推送是增强通道，失败不该影响转发路径。
-    pub async fn send(&self, token: &str, payload: &serde_json::Value) -> Result<(), String> {
+    pub async fn send(&self, token: &str, payload: &serde_json::Value) -> Result<(), SendError> {
         let jwt = self.config.provider_jwt();
         let response = self
             .http
@@ -103,7 +118,7 @@ impl ApnsClient {
             .json(payload)
             .send()
             .await
-            .map_err(|error| format!("apns request failed: {error}"))?;
+            .map_err(|error| SendError { message: format!("apns request failed: {error}"), invalid_token: false })?;
         let status = response.status();
         if status.is_success() {
             Ok(())
@@ -111,7 +126,7 @@ impl ApnsClient {
             // 苹果的错误响应体带 reason（如 BadDeviceToken / ExpiredProviderToken），
             // 原样带出来，部署方日志里能直接对照苹果的码表。
             let body = response.text().await.unwrap_or_default();
-            Err(format!("apns rejected ({status}): {body}"))
+            Err(rejected(status.as_u16(), &body))
         }
     }
 }
@@ -122,6 +137,13 @@ static CLIENT: std::sync::OnceLock<Option<ApnsClient>> = std::sync::OnceLock::ne
 /// 装配全局推送出口。配置缺失 / 密钥解析失败都只是打一条日志，**不崩**：
 /// 推送关闭的中转照常转发。
 pub fn init_from_env() {
+    if crate::console().is_none() {
+        if ["APNS_KEY", "APNS_KEY_ID", "APNS_TEAM_ID"].iter().any(|name| std::env::var(name).map(|v| !v.trim().is_empty()).unwrap_or(false)) {
+            crate::tunnel::log("apns disabled: APNs需要PLATFORM_ENABLED=1且控制台存储启动成功；本纯转发节点忽略APNS配置");
+        }
+        let _ = CLIENT.set(None);
+        return;
+    }
     let client = match ApnsConfig::from_env() {
         Ok(config) => Some(ApnsClient::new(config)),
         Err(reason) => {
@@ -185,7 +207,15 @@ pub async fn send_completion(instance_id: &str, device_id: &str, tokens: &[(Stri
         );
         fit_payload(&mut payload);
         if let Err(reason) = client.send(token, &payload).await {
-            crate::tunnel::log(format!("apns send failed instance={instance_id} device={device_id}: {reason}"));
+            if reason.invalid_token {
+                if let Some(console) = crate::console() {
+                    let instance = instance_id.to_string();
+                    let device = token_device.clone();
+                    let old_token = token.clone();
+                    let _ = tokio::task::spawn_blocking(move || console.store.delete_push_token_if_matches(&instance, &device, &old_token)).await;
+                }
+            }
+            crate::tunnel::log(format!("apns send failed instance={instance_id} device={token_device}: {reason}"));
         }
     }
 }
@@ -380,6 +410,17 @@ MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgnqsiMNGt7P+R25vT
 QnJWqSruOaP2dlbximQ4um4KBtWhRANCAAThnyzbyWh4vpzzJPfoF1r9CJANhtdZ
 V1n0uBVNK/D9VvFM1bkevUBnaglIzsphCotUxHuowB+PU2hnSYfp1bZ8
 -----END PRIVATE KEY-----";
+
+    #[test]
+    fn only_permanent_device_errors_invalidate_tokens() {
+        for (status, reason) in [(410, "Unregistered"), (400, "BadDeviceToken"), (400, "ExpiredToken")] {
+            assert!(rejected(status, &serde_json::json!({"reason":reason}).to_string()).invalid_token);
+        }
+        for (status, reason) in [(403, "ExpiredProviderToken"), (403, "InvalidProviderToken"), (429, "TooManyRequests"), (500, "InternalServerError")] {
+            assert!(!rejected(status, &serde_json::json!({"reason":reason}).to_string()).invalid_token);
+        }
+        assert!(!rejected(410, "not json").invalid_token);
+    }
 
     #[test]
     fn parses_inline_pem_and_signs() {

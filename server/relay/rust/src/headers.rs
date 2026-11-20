@@ -1,9 +1,67 @@
-//! 请求头 / 响应头的转发规则。
+//! 请求头转发与显式可信代理来源解析，供中转和控制面共用。
 //!
 //! 中转不解释业务语义：逐跳头与 `host` 之外一律原样带过去。
 //!
 //! 逐跳头集合与 `dsh-mobile-plugin/lib/relay/lan-proxy.js` 手工同步，由
 //! `dsh-mobile-plugin/test/shared-helpers-parity.test.cjs` 逐项比对——改这里要同步改那边。
+
+use std::net::{IpAddr, SocketAddr};
+
+#[derive(Debug, Clone)]
+pub struct ProxyCidr { network: IpAddr, prefix: u8 }
+
+impl ProxyCidr {
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        let (ip, prefix) = raw.trim().split_once('/').ok_or_else(|| format!("invalid proxy CIDR: {raw}"))?;
+        let network: IpAddr = ip.parse().map_err(|_| format!("invalid proxy IP: {raw}"))?;
+        let prefix: u8 = prefix.parse().map_err(|_| format!("invalid proxy prefix: {raw}"))?;
+        if prefix > if network.is_ipv4() { 32 } else { 128 } { return Err(format!("invalid proxy prefix: {raw}")); }
+        Ok(Self { network, prefix })
+    }
+    pub fn contains(&self, address: IpAddr) -> bool {
+        match (self.network, address) {
+            (IpAddr::V4(a), IpAddr::V4(b)) => {
+                let mask = u32::MAX.checked_shl((32 - self.prefix) as u32).unwrap_or(0);
+                u32::from(a) & mask == u32::from(b) & mask
+            }
+            (IpAddr::V6(a), IpAddr::V6(b)) => {
+                let mask = u128::MAX.checked_shl((128 - self.prefix) as u32).unwrap_or(0);
+                u128::from(a) & mask == u128::from(b) & mask
+            }
+            _ => false,
+        }
+    }
+}
+
+pub fn parse_trusted_proxies(raw: &str) -> Result<Vec<ProxyCidr>, String> {
+    raw.split(',').map(str::trim).filter(|s| !s.is_empty()).map(ProxyCidr::parse).collect()
+}
+
+pub fn default_trusted_proxies() -> Vec<ProxyCidr> {
+    parse_trusted_proxies("127.0.0.0/8,::1/128").expect("fixed loopback CIDRs")
+}
+
+pub fn trusted_proxy(peer: IpAddr, proxies: &[ProxyCidr]) -> bool {
+    proxies.iter().any(|cidr| cidr.contains(peer))
+}
+
+/// 不信任代理时永远用peer；可信代理只认一个严格IP形式的X-Real-IP。
+pub fn client_ip(peer: Option<SocketAddr>, headers: &[(String, String)], proxies: &[ProxyCidr]) -> Option<IpAddr> {
+    let peer = peer?.ip();
+    if !trusted_proxy(peer, proxies) { return Some(peer); }
+    headers.iter().find(|(name, _)| name.eq_ignore_ascii_case("x-real-ip"))
+        .and_then(|(_, value)| value.trim().parse().ok()).or(Some(peer))
+}
+
+/// 状态接口仍单独鉴权：远端直连不能靠伪造头放行，代理缺真实来源时也不放行。
+pub fn local_status_request(peer: Option<SocketAddr>, headers: &[(String, String)], proxies: &[ProxyCidr]) -> bool {
+    let Some(peer) = peer else { return false };
+    let real = headers.iter().find(|(name, _)| name.eq_ignore_ascii_case("x-real-ip"));
+    let forwarded = headers.iter().any(|(name, _)| name.eq_ignore_ascii_case("x-forwarded-for"));
+    if real.is_none() && !forwarded { return peer.ip().is_loopback(); }
+    if !trusted_proxy(peer.ip(), proxies) { return false; }
+    real.and_then(|(_, value)| value.trim().parse::<IpAddr>().ok()).map(|ip| ip.is_loopback()).unwrap_or(false)
+}
 
 /// 默认探测逐跳头时用的集合。
 ///
@@ -68,6 +126,24 @@ pub fn sanitize_resp_headers(headers: Vec<(String, String)>) -> Vec<(String, Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proxy_cidrs_and_source_headers_have_one_trust_boundary() {
+        let proxies = parse_trusted_proxies("127.0.0.0/8,::1/128,10.2.0.0/16,2001:db8::/32").unwrap();
+        let socket = |raw: &str| Some(raw.parse::<SocketAddr>().unwrap());
+        let headers = |raw: &str| vec![("x-real-ip".to_string(), raw.to_string())];
+        assert_eq!(client_ip(socket("10.2.1.2:80"), &headers("203.0.113.8"), &proxies), Some("203.0.113.8".parse().unwrap()));
+        assert_eq!(client_ip(socket("10.3.1.2:80"), &headers("127.0.0.1"), &proxies), Some("10.3.1.2".parse().unwrap()));
+        assert_eq!(client_ip(socket("127.0.0.1:80"), &headers("203.0.113.8, 127.0.0.1"), &proxies), Some("127.0.0.1".parse().unwrap()));
+        assert!(!local_status_request(socket("127.0.0.1:80"), &headers("203.0.113.8"), &proxies));
+        assert!(local_status_request(socket("10.2.1.2:80"), &headers("::1"), &proxies));
+        assert!(!local_status_request(socket("10.3.1.2:80"), &headers("::1"), &proxies));
+        assert!(!local_status_request(socket("10.2.1.2:80"), &[], &proxies));
+        assert!(!local_status_request(socket("127.0.0.1:80"), &headers("bad"), &proxies));
+        assert!(parse_trusted_proxies("10.0.0.0/33").is_err());
+        assert!(parse_trusted_proxies("::1/129").is_err());
+        assert!(parse_trusted_proxies("").unwrap().is_empty());
+    }
 
     #[test]
     fn hop_by_hop_and_host_are_dropped() {

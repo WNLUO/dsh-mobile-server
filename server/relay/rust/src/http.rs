@@ -1,3 +1,4 @@
+// blob 读取在阻塞线程执行；来源解析与控制面共用可信代理规则。
 //! 有界读取 HTTP 请求并分流到转发、升级或本地应答。
 //!
 //! 不引 http 框架：中转只处理固定的几种形态（体检、状态、`/tunnel` 升级、其余转发），
@@ -169,36 +170,9 @@ fn is_pairing_route(pathname: &str) -> bool {
     strip_deploy_prefix(pathname) == PAIRING_PATH
 }
 
-/// `/status` 能不能答给这次请求：只认本机来的。
-///
-/// **不能只看 peer 地址**：生产上四台中转都只监听 `127.0.0.1:18788`，前面是同机的
-/// nginx，于是每一个公网请求在中转眼里都是「127.0.0.1 来的」——只看 peer 等于这道闸
-/// 完全不存在（2026-10-31 在 B 上实测到的就是 200）。所以判据分两层：
-///   1. peer 必须是回环（直连的、或者绑了 0.0.0.0 被人直接打进来的，一律 404）；
-///   2. 是回环的话，再看 nginx 覆盖写入的 `x-real-ip`（退化时看 `x-forwarded-for` 第一段），
-///      只有它也是回环或者根本没带（机器上直接 curl）才放行。
-/// 头部只在 peer 已经确认是回环之后才采信：这样即使有人把端口绑到 0.0.0.0，伪造
-/// `x-real-ip: 127.0.0.1` 也没用（那一层的 peer 判据先把他拦掉了）。
+/// 状态接口单独鉴权，可信代理来源判断与控制面共用。
 fn status_allowed(peer: Option<std::net::SocketAddr>, head: &RequestHead) -> bool {
-    let Some(peer) = peer else {
-        return false;
-    };
-    if !peer.ip().is_loopback() {
-        return false;
-    }
-    if let Some(raw) = head.header("x-real-ip") {
-        if let Ok(ip) = raw.trim().parse::<std::net::IpAddr>() {
-            return ip.is_loopback();
-        }
-    }
-    if let Some(raw) = head.header("x-forwarded-for") {
-        if let Some(first) = raw.split(',').next() {
-            if let Ok(ip) = first.trim().parse::<std::net::IpAddr>() {
-                return ip.is_loopback();
-            }
-        }
-    }
-    true
+    crate::headers::local_status_request(peer, &head.headers, &crate::config().trusted_proxy_cidrs)
 }
 
 /// 送给宿主的路径：剥掉部署前缀，保留查询串。
@@ -549,13 +523,13 @@ async fn handle_blob_get(
         return Ok(true);
     }
     let credentials = presented_credentials(head);
-    let mut hit: Option<(Vec<u8>, u64)> = None;
-    for credential in &credentials {
-        if let Some(found) = store.get_meta(&instance_id, &scope, &key, credential.as_bytes()) {
-            hit = Some(found);
-            break;
-        }
-    }
+    let lookup_instance = instance_id.clone();
+    let lookup_scope = scope.clone();
+    let lookup_key = key.clone();
+    let lookup_credentials = credentials.clone();
+    let hit = tokio::task::spawn_blocking(move || {
+        lookup_credentials.iter().find_map(|credential| store.get_meta(&lookup_instance, &lookup_scope, &lookup_key, credential.as_bytes()))
+    }).await.map_err(|e| std::io::Error::other(format!("blob read task failed: {e}")))?;
     let Some((cipher, updated_at)) = hit else {
         // 鉴权失败与「没这条」回同一个 404（不给扫描器区分），但**日志里要留一行**：
         // 现场最常见的问题是设备凭据没跟上这一轮 creds，只看 404 分不出来。没带凭据
@@ -1551,6 +1525,6 @@ mod tests {
             local,
             &with("x-forwarded-for", "203.0.113.9, 10.0.0.1")
         ));
-        assert!(status_allowed(local, &with("x-forwarded-for", "::1")));
+        assert!(!status_allowed(local, &with("x-forwarded-for", "::1")), "可信代理须覆盖X-Real-IP，不另信XFF");
     }
 }

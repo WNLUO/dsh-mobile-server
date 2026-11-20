@@ -13,7 +13,7 @@
 | type | 名称 | id | 载荷 | 用途 |
 |---|---|---|---|---|
 | 0x01 | register | 0 | JSON `{instanceId, version?}` | 宿主登记实例；同一实例重连只取代自己。`version` 是宿主正在跑的插件版本（`0.4.8` 这种三段数字）：中转按它记「谁还在老版本」，并在配了 `MIN_PLUGIN_VERSION` 时把太旧的挡在门外。**没这个字段 = 老插件 = 按最旧算** |
-| 0x02 | registered | 0 | JSON `{ok, mirror}` | 中转确认注册。`mirror` 是本节点的镜像口径：`false`（`MIRROR_CACHE=0` 的纯转发节点）表示收下整份镜像也只留凭据摘要、正文解析完就丢，宿主据此只推摘要帧（清单与工作区各只带 `ok`+`revision`、外加 `creds`）。老宿主只认帧类型、不读内容，多这个字段没有影响 |
+| 0x02 | registered | 0 | JSON `{ok, mirror, blobUpload?}` | 中转确认注册。`mirror` 是本节点的镜像口径：`false`（`MIRROR_CACHE=0` 的纯转发节点）表示收下整份镜像也只留凭据摘要、正文解析完就丢，宿主据此只推摘要帧（清单与工作区各只带 `ok`+`revision`、外加 `creds`）。老宿主只认帧类型、不读内容，多这个字段没有影响。`blobUpload` 是本连接的分片上传能力，见下节 |
 | 0x03 | updatePairing | 0 | JSON | 保留编号 |
 | 0x04 | httpRequest | N | JSON `{method, path, headers}` | 手机请求头送到宿主 |
 | 0x05 | httpBody | N | bytes | 请求体；空载荷表示结束 |
@@ -40,9 +40,32 @@
 | 0x1A | pushRegister | 0 | JSON | 宿主代 App 上报/删除 iOS 推送令牌（{deviceId, platform, token} 或 {deviceId, action:'delete'}）；中转按实例落表，控制台未开时忽略 |
 | 0x1B | pushSend | 0 | JSON | 宿主请求中转发一条 APNs 推送（{deviceId, title, body, sessionId?, kind}）；只发给该实例登记过的令牌，APNs 未配置时零开销返回 |
 | 0x1C | migrate | 0 | JSON `{"to":"<新中转地址>","at":<毫秒>}` | 宿主断开旧隧道之前登记「我搬到 `to` 了」；`to` 为空串表示撤销这条记录。中转只接受这条隧道自己登记的 instanceId，按实例记 30 天 |
-| 0x1D | blobPut | 0 | JSON `{scope, key, creds, cipher}` | 宿主把用实例历史密钥（HK）加密好的历史 blob 推给中转：`scope` 为 `messages` 或 `file`，`key` 是 sessionId / fileId，`creds` 是本实例当前有效设备凭据的 `[{hash, expiresAt}]`（sha256 hex + 过期毫秒，供中转做拉取鉴权），`cipher` 是信封字节的 base64url。`cipher` 为空串表示**只更新 creds/元数据**、不动已落盘的密文。中转**只存密文、永不持钥、永不解密**；`BLOB_STORE` 关时直接忽略 |
+| 0x1D | blobPut | 0 或 N | JSON：旧 `{scope, key, creds, cipher}`；协商分片/ack 见下节 | 宿主把用实例历史密钥（HK）加密好的历史 blob 推给中转：`scope` 为 `messages` 或 `file`，`key` 是 sessionId / fileId，`creds` 是本实例当前有效设备凭据的 `[{hash, expiresAt}]`（sha256 hex + 过期毫秒，供中转做拉取鉴权），`cipher` 是信封字节的 base64url。旧 `id=0` 仍发整包，`cipher` 为空串表示**只更新 creds/元数据**、不动已落盘的密文；没有分片回执。协商后 `id=N` 复用同一编号双向传片/回执。中转**只存密文、永不持钥、永不解密**；`BLOB_STORE` 关时旧控制帧仍直接忽略 |
 | 0x1E | blobDelete | 0 | JSON `{scope, key}` 或 `{scope, keys:[...]}` | 宿主让中转删掉已推过的 blob（会话删除 / 归档清空 / 吊销全部）。只删这条隧道自己登记的 instanceId 名下的条目 |
 
 帧编号的事实源是 `protocol-types.js`；保留编号仍要与插件一致，但 Rust 中转不会将这些旧业务帧当成配对或镜像指令处理。中转侧 60 秒收不到 pong 则断开隧道，宿主侧超时为 90 秒。
 
 宿主按 `instanceId` 登记隧道，手机请求按 `X-Dsh-Instance` 分发；不存在的实例回 503。**那台实例在这条中转上留过未过期的迁移记录时**，这句 503 换成 `{"ok":false,"code":"migrated","to":"<url>","error":"that host moved to another relay"}`，并在响应头 `x-dsh-migrated-to` 带同一个地址（HTTP 与手机 WS 桥接同一条判据），手机据此自己切到新中转；没有记录时仍是原来那句 503，一个字都不变。没带实例头时，仅在恰好一台宿主在线时转发，不会在多台宿主间猜测。中转自答 `/healthz`、`/status`、`/api/mobile/v1/health`、`/api/mobile/v1/push-token`（推送令牌上报，判据与镜像读同一套设备凭据摘要）和 `GET /api/mobile/v1/blob/<scope>/<key>`（历史 blob 拉取，只在 `BLOB_STORE` 开时认领；关着时照常转发/404），其余路径按规则转发；控制台路由见中转服务文档。
+
+## blob 分片上传
+
+中转仅在 blob 仓库真实可用时，在 `registered` 中提供：
+
+```json
+{"ok":true,"mirror":false,"blobUpload":{"maxChunkBytes":49152,"maxBlobBytes":5242880}}
+```
+
+`maxBlobBytes` 是本节点配置的单条密文上限，示例为 5 MiB；`maxChunkBytes` 当前为 49152。两者均须为正的安全整数。`blobUpload` 缺失、关闭或任一上限无效时，宿主不使用分片，继续发旧 `blobPut id=0`。旧整包与 `cipher:""` 凭据刷新语义保持不变，凭据刷新始终走 `id=0`。协商只对当前连接有效，断线或 stop 后清除，重连重新读取 `registered`。
+
+分片仍用 `blobPut=0x1D`，宿主以非零 `u32` 递增 id 标识上传。每条隧道最多一条在途上传，blob 的未决回执表与 HTTP/WS 的 pending 独立，按帧类型与方向分流。宿主发片，中转以相同类型、相同 id 回 ack：
+
+- 首片：`{scope,key,creds,offset:0,total,final,cipher}`。
+- 后续片：`{offset,total,final,cipher}`，可省略首片的 `scope/key/creds`。
+- 成功回执：`{ok:true,nextOffset,done}`。
+- 失败回执：`{ok:false,nextOffset:0,done:false,error}`，`error` 为错误文字。
+
+`cipher` 是**每片独立编码**的 base64url。`offset`、`total`、`nextOffset` 与两个能力上限都按解码后的信封字节计量；宿主先切信封字节再分别编码，不能按 base64 文本截片。每片从中转上次确认的 `nextOffset` 接着发，`total` 固定且大于零，不超过 `maxBlobBytes`；解码后的每片非空且不超过 `maxChunkBytes`。非尾片必须满足 `offset + 片长 < total` 且 `final:false`；尾片必须满足 `offset + 片长 === total` 且 `final:true`。不允许零长上传或空尾片。
+
+宿主一次只发一片，收到该片 ack 后才发下一片，每片服从既有字节背压并让出共享发送队列。成功 ack 的 `nextOffset` 只确认已写入临时文件的字节；`done:false` 不代表 blob 已发布。只有完整校验、预算接受和原子持久化发布全部成功，最终 ack 才返回 `done:true`，宿主据此清除 dirty。
+
+失败 ack 会丢弃本次临时上传，旧的完整 blob 保持可读；宿主保留 dirty，由既有下一轮以新 id 从零重推，不做片内重传。断线或 stop 拒绝未决回执并清理临时上传，迟到的其他 id ack 忽略。

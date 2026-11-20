@@ -5,18 +5,20 @@
 //! `(instance, scope, key)`、一段 `bytes` 和一串凭据摘要，正文原样落盘、原样取回。
 //!
 //! 落盘在 `data_dir/blobs/`：`<sha256(instance)>/<sha256(scope|key)>.blob`，旁边一份
-//! `.meta` 记 `updated_at` 与凭据摘要（重启时靠它重建内存索引——目录名是哈希，反推
-//! 不出原文）。内存里只放元数据，正文每次按需从盘上读。
+//! `.meta` 明文记录 instance、scope、key、updated_at 与凭据摘要，供重启重建索引。
+//! 正文是密文；目录名哈希不隐藏这份元数据里的实例、会话和文件标识。
 //!
 //! **写盘是「临时文件 + 原子 rename」**：先写同目录下的 `<hash>.blob.<seq>.tmp` 再
 //! rename 成目标名，`.meta` 在正文就位之后写。这样同一 key 并发写时，读到的要么是
 //! 旧的完整正文、要么是新的完整正文，不会拿到写了一半的字节；进程在两步之间被杀掉，
 //! 留下的也只是孤儿 `.tmp`（下次启动清掉）或「有正文没 meta」的孤儿 `.blob`。
 //!
-//! 预算是三道闸：单 blob、每实例总量、全局总量；超了按 `updated_at` 从旧到新淘汰。
+//! 预算是三道闸：单 blob、每实例总量、全局总量；优先淘汰写入实例自己的旧条目。
 //! TTL 由两条判据兜：读时直接按 `updated_at` 判过期（不依赖清理跑过），盘上垃圾则由
 //! 节流的清理定期收掉。与 `mirror` 的取舍一致——进程重启丢索引可以接受，下一次
 //! 宿主推 blob 会补回来。
+
+pub mod upload;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -122,6 +124,7 @@ pub fn decode_hex32(raw: &str) -> Option<[u8; 32]> {
 /// 只存不读的 blob 仓库。
 pub struct BlobStore {
     root: PathBuf,
+    io_lock: Mutex<()>,
     max_blob_bytes: usize,
     max_per_instance_bytes: usize,
     max_total_bytes: usize,
@@ -161,6 +164,7 @@ impl BlobStore {
         std::fs::create_dir_all(&root)?;
         let store = Self {
             root,
+            io_lock: Mutex::new(()),
             max_blob_bytes,
             max_per_instance_bytes,
             max_total_bytes,
@@ -209,6 +213,7 @@ impl BlobStore {
         cipher: &[u8],
         creds: Vec<Cred>,
     ) -> bool {
+        let _io = self.io_lock.lock().unwrap_or_else(|e| e.into_inner());
         if instance.trim().is_empty() || !KNOWN_SCOPES.contains(&scope) || key.trim().is_empty() {
             return false;
         }
@@ -219,7 +224,7 @@ impl BlobStore {
             return self.update_creds(instance, scope, key, creds);
         }
         // 单 blob 上限：超了直接拒收，保留旧的。
-        if cipher.len() > self.max_blob_bytes {
+        if cipher.len() > self.max_blob_bytes.min(self.max_per_instance_bytes).min(self.max_total_bytes) {
             return false;
         }
 
@@ -278,6 +283,7 @@ impl BlobStore {
 
     /// 删掉一条 blob（`blobDelete` 帧走这条）。返回索引里是否真有这一条。
     pub fn delete(&self, instance: &str, scope: &str, key: &str) -> bool {
+        let _io = self.io_lock.lock().unwrap_or_else(|e| e.into_inner());
         let blob_key = (instance.to_string(), scope.to_string(), key.to_string());
         let removed = {
             let mut index = self.index.lock().unwrap_or_else(|e| e.into_inner());
@@ -308,6 +314,7 @@ impl BlobStore {
         key: &str,
         presented_cred: &[u8],
     ) -> Option<(Vec<u8>, u64)> {
+        let _io = self.io_lock.lock().unwrap_or_else(|e| e.into_inner());
         if presented_cred.is_empty() {
             return None;
         }
@@ -364,7 +371,6 @@ impl BlobStore {
     ) -> std::io::Result<()> {
         let dir = self.dir_for(instance);
         std::fs::create_dir_all(&dir)?;
-        let target = self.blob_path(instance, scope, key);
         let tmp = dir.join(format!(
             "{}.blob.{}.tmp",
             Self::hash_for(scope, key),
@@ -374,11 +380,39 @@ impl BlobStore {
             let _ = std::fs::remove_file(&tmp);
             return Err(error);
         }
-        if let Err(error) = std::fs::rename(&tmp, &target) {
-            let _ = std::fs::remove_file(&tmp);
+        self.publish_file(instance, scope, key, &tmp, meta)
+    }
+
+    /// 正文与元数据都先准备好；发布失败还原旧正文，索引最后才更新。
+    fn publish_file(&self, instance: &str, scope: &str, key: &str, tmp: &std::path::Path, meta: &Meta) -> std::io::Result<()> {
+        std::fs::File::open(tmp)?.sync_all()?;
+        let target = self.blob_path(instance, scope, key);
+        let backup = target.with_extension(format!("blob.{}.tmp", next_seq()));
+        let had_old = target.exists();
+        if had_old { std::fs::hard_link(&target, &backup)?; }
+        if let Err(error) = std::fs::rename(tmp, &target) {
+            if had_old { let _ = std::fs::rename(&backup, &target); }
+            let _ = std::fs::remove_file(tmp);
             return Err(error);
         }
-        self.write_meta(instance, scope, key, meta.bytes, meta.updated_at, &meta.creds)
+        if let Err(error) = self.write_meta(instance, scope, key, meta.bytes, meta.updated_at, &meta.creds) {
+            if had_old { let _ = std::fs::rename(&backup, &target); }
+            else { let _ = std::fs::remove_file(&target); }
+            return Err(error);
+        }
+        if had_old { let _ = std::fs::remove_file(backup); }
+        Ok(())
+    }
+
+    fn commit_upload(&self, instance: &str, scope: &str, key: &str, tmp: &std::path::Path, bytes: usize, creds: Vec<Cred>) -> bool {
+        let _io = self.io_lock.lock().unwrap_or_else(|e| e.into_inner());
+        if bytes == 0 || bytes > self.max_blob_bytes.min(self.max_per_instance_bytes).min(self.max_total_bytes) { return false; }
+        let meta = Meta { bytes, updated_at: now_ms(), seq: next_seq(), creds };
+        if self.publish_file(instance, scope, key, tmp, &meta).is_err() { return false; }
+        let blob_key = (instance.to_string(), scope.to_string(), key.to_string());
+        self.index.lock().unwrap_or_else(|e| e.into_inner()).insert(blob_key.clone(), meta);
+        self.maybe_sweep_expired();
+        self.enforce_budgets(&blob_key)
     }
 
     /// 单独写一份 `.meta`（creds-only 更新只动它）。
@@ -415,6 +449,10 @@ impl BlobStore {
         ));
         let payload = serde_json::to_vec(&record).unwrap_or_default();
         if let Err(error) = std::fs::write(&tmp, payload) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(error);
+        }
+        if let Err(error) = std::fs::File::open(&tmp).and_then(|file| file.sync_all()) {
             let _ = std::fs::remove_file(&tmp);
             return Err(error);
         }
@@ -475,7 +513,7 @@ impl BlobStore {
                     let victim = index
                         .iter()
                         .filter(|(key, _)| *key != keep)
-                        .min_by_key(|(_, meta)| (meta.updated_at, meta.seq))
+                        .min_by_key(|(key, meta)| (key.0 != keep.0, meta.updated_at, meta.seq))
                         .map(|(key, _)| key.clone());
                     match victim {
                         Some(victim) => {
@@ -499,6 +537,9 @@ impl BlobStore {
             self.evicted
                 .fetch_add(victims.len() as u64, Ordering::Relaxed);
             for victim in &victims {
+                if victim.0 != keep.0 {
+                    crate::tunnel::log(format!("blob global eviction writer={} victim={} scope={}", keep.0, victim.0, victim.1));
+                }
                 self.remove_files(victim);
             }
         }
@@ -869,6 +910,26 @@ mod tests {
         assert_eq!(count, 1);
         assert!(total <= 300);
         assert_eq!(evicted, 1, "淘汰数要记进 /status 那份账");
+    }
+
+    #[test]
+    fn global_budget_prefers_the_writing_instances_own_old_blobs() {
+        let store = BlobStore::new(temp_root(), 200, 1000, 300, 3600).unwrap();
+        assert!(store.put("quiet", "messages", "old", &[1; 100], vec![cred(b"device")]));
+        assert!(store.put("busy", "messages", "a", &[2; 100], vec![cred(b"device")]));
+        assert!(store.put("busy", "messages", "b", &[3; 150], vec![cred(b"device")]));
+        assert!(store.get("quiet", "messages", "old", b"device").is_some());
+        assert!(store.get("busy", "messages", "a", b"device").is_none());
+        assert_eq!(store.get("busy", "messages", "b", b"device").unwrap(), vec![3; 150]);
+    }
+
+    #[test]
+    fn rejected_replacement_keeps_existing_blob_and_creds() {
+        let store = BlobStore::new(temp_root(), 200, 20, 300, 3600).unwrap();
+        assert!(store.put("i", "messages", "k", b"old", vec![cred(b"old-device")]));
+        assert!(!store.put("i", "messages", "k", &[4; 21], vec![cred(b"new-device")]));
+        assert_eq!(store.get("i", "messages", "k", b"old-device").unwrap(), b"old");
+        assert!(store.get("i", "messages", "k", b"new-device").is_none());
     }
 
     /// TTL 过期在**读**时判定（不依赖清理跑过），盘上垃圾由清理收掉。

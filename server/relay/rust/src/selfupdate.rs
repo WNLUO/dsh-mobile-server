@@ -1,4 +1,4 @@
-//! 中转自身的自动更新。
+//! 中转自身的多源自动更新：候选验证失败换源，文件操作与试跑离开异步线程。
 //!
 //! 从一个**自己控制的静态地址**取新版本，下载对应架构的二进制，校验 sha256，
 //! 原子替换，然后退出让服务管理器拉起来。
@@ -15,8 +15,8 @@
 //!
 //! ## 多个更新源
 //!
-//! `SELF_UPDATE_SOURCE` 可以给一串地址（逗号分隔），按顺序试，第一个取到可用清单的
-//! 就算数。国内机器把国内源写前面、海外机器把海外源写前面，一台机器上同时配着两边
+//! `SELF_UPDATE_SOURCE` 可以给一串地址（逗号分隔），按顺序取清单、下载、校验和试跑；
+//! 候选任一步失败就换下一个源。国内机器把国内源写前面，一台机器上同时配着两边
 //! 的地址——主源倒了不会变成「从此收不到更新」。海外走 GitHub 那条是实测过的：
 //! 法兰克福那台取 GitHub 资产比取国内更新源快一个数量级。
 //!
@@ -452,7 +452,11 @@ pub fn spawn_self_update(ctx: UpdateContext) {
     }
     tokio::spawn(async move {
         // 先看是不是上次升级没起来。是的话**这轮直接不升**，等人上来看。
-        let state = ctx.paths.load();
+        let startup_paths = ctx.paths.clone();
+        let state = match tokio::task::spawn_blocking(move || startup_paths.load()).await {
+            Ok(state) => state,
+            Err(error) => { crate::tunnel::log(format!("读取更新状态失败：{error}")); return; }
+        };
         if !state.rollback.is_empty() {
             crate::tunnel::log(format!(
                 "上一次自动更新没有成功（{}），本轮不再自动升级。查清楚后删掉 {} 再重启",
@@ -486,95 +490,60 @@ pub struct UpdateContext {
     pub paths: Paths,
 }
 
-/// 查一次、能升就升。返回升级到的版本（调用前已经把文件换好并准备退出）。
-///
-/// 不升、或者升不了，都返回 `Ok(None)` 并记日志——自动更新失败绝不能影响这台
-/// 中转的转发。
+/// 每个源都完成下载、校验和试跑后才提交；候选失败不影响正在服务的版本。
 pub async fn check_and_apply(ctx: &UpdateContext) -> Result<Option<String>, String> {
     if asset_name().is_none() {
         return Err("这个架构没有预编译的更新包".into());
     }
-    let arch = asset_arch().unwrap_or_default();
-    // 下载可能是个几 MB 的文件，超时给足；连不上就不要在那儿干等。
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(300))
+        .connect_timeout(Duration::from_secs(10))
+        .read_timeout(Duration::from_secs(60))
         .user_agent("dsh-relay-self-update")
         .build()
         .map_err(|e| e.to_string())?;
-
-    let current = env!("CARGO_PKG_VERSION");
-    let (upgrade, errors) = first_manifest(&client, &ctx.sources, current, arch).await?;
-    match upgrade {
-        Some((version, url, sha256)) => {
-            crate::tunnel::log(format!(
-                "发现新版本 {version}（当前 {current}），开始下载"
-            ));
-            apply(ctx, &client, &version, &url, &sha256).await?;
-            Ok(Some(version))
-        }
-        None => {
-            if !errors.is_empty() {
-                // 每个源都试过了、都没成。把原因一并打出来：只有一个源的时候这条
-                // 日志就是唯一线索。
-                return Err(errors.join("；"));
-            }
-            Ok(None)
-        }
-    }
+    let Some((version, staging)) = prepare_from_sources(
+        &client, &ctx.sources, env!("CARGO_PKG_VERSION"),
+        asset_arch().unwrap_or_default(), &ctx.paths,
+    ).await? else { return Ok(None) };
+    // 候选验证与安装分开：安装出错属于本机状态，不再尝试覆盖另一个源的包。
+    let paths = ctx.paths.clone();
+    let installed_version = version.clone();
+    tokio::task::spawn_blocking(move || install_candidate(&paths, &installed_version, &staging))
+        .await.map_err(|e| format!("安装任务失败：{e}"))??;
+    Ok(Some(version))
 }
 
-/// 依次问各个更新源，返回第一个能用的升级计划。
-///
-/// 全部失败时返回 `Ok((None, 原因列表))` 而不是 Err：多个源里有一个挂了不代表这台
-/// 机器出了问题，调用方只记日志就够了。
-async fn first_manifest(
-    client: &reqwest::Client,
-    sources: &[String],
-    current: &str,
-    arch: &str,
-) -> Result<(Option<(String, String, String)>, Vec<String>), String> {
+async fn prepare_from_sources(
+    client: &reqwest::Client, sources: &[String], current: &str, arch: &str, paths: &Paths,
+) -> Result<Option<(String, PathBuf)>, String> {
     if sources.is_empty() {
         return Err("没有配置更新源（SELF_UPDATE_SOURCE 为空）".into());
     }
     let mut errors = Vec::new();
     for source in sources {
-        if !secure_url(source) {
-            errors.push(format!("更新源必须是 https（或本机回环）：{source}"));
-            continue;
-        }
-        let manifest_url = format!("{}/latest.json", source.trim_end_matches('/'));
-        let text = match client.get(&manifest_url).send().await {
-            Ok(response) => match response.error_for_status() {
-                Ok(response) => match response.text().await {
-                    Ok(text) => text,
-                    Err(error) => {
-                        errors.push(format!("{manifest_url} 读取失败：{error}"));
-                        continue;
-                    }
-                },
-                Err(error) => {
-                    errors.push(format!("{manifest_url} HTTP 错误：{error}"));
-                    continue;
+        let candidate = async {
+            if !secure_url(source) {
+                return Err("更新源必须是 https（或本机回环）".to_string());
+            }
+            let manifest_url = format!("{}/latest.json", source.trim_end_matches('/'));
+            let text = client.get(&manifest_url).send().await
+                .map_err(|e| format!("清单连接失败：{e}"))?
+                .error_for_status().map_err(|e| format!("清单 HTTP 错误：{e}"))?
+                .text().await.map_err(|e| format!("清单读取失败：{e}"))?;
+            match plan(current, &text, arch)? {
+                Plan::UpToDate => Ok(None),
+                Plan::Upgrade { version, url, sha256 } => {
+                    let staging = prepare_candidate(client, paths, &version, &url, &sha256).await?;
+                    Ok(Some((version, staging)))
                 }
-            },
-            Err(error) => {
-                errors.push(format!("{manifest_url} 连不上：{error}"));
-                continue;
             }
-        };
-        match plan(current, &text, arch) {
-            Ok(Plan::UpToDate) => return Ok((None, Vec::new())),
-            Ok(Plan::Upgrade {
-                version,
-                url,
-                sha256,
-            }) => return Ok((Some((version, url, sha256)), Vec::new())),
-            Err(error) => {
-                errors.push(format!("{manifest_url}：{error}"));
-            }
+        }.await;
+        match candidate {
+            Ok(candidate) => return Ok(candidate),
+            Err(error) => errors.push(format!("{source}：{error}")),
         }
     }
-    Ok((None, errors))
+    Err(errors.join("；"))
 }
 
 /// 试跑一遍候选二进制，确认它在这台机器上真能启动、而且自报的版本号对得上。
@@ -650,73 +619,54 @@ fn trial_run(staging: &Path, expected_version: &str) -> Result<(), String> {
     }
 }
 
-/// 下载、校验、替换。失败时**不留下任何半截状态**。
-async fn apply(
-    ctx: &UpdateContext,
-    client: &reqwest::Client,
-    version: &str,
-    url: &str,
-    expected: &str,
-) -> Result<(), String> {
-    std::fs::create_dir_all(&ctx.paths.data_dir)
-        .map_err(|e| format!("建数据目录失败：{e}"))?;
-
-    let bytes = client
-        .get(url)
-        .send()
-        .await
+/// 下载失败、摘要不符或试跑失败均不修改线上文件和升级状态。
+async fn prepare_candidate(
+    client: &reqwest::Client, paths: &Paths, version: &str, url: &str, expected: &str,
+) -> Result<PathBuf, String> {
+    let bytes = client.get(url).send().await
         .map_err(|e| format!("下载二进制失败：{e}"))?
-        .error_for_status()
-        .map_err(|e| format!("二进制 HTTP 错误：{e}"))?
-        .bytes()
-        .await
-        .map_err(|e| format!("二进制读取失败：{e}"))?;
+        .error_for_status().map_err(|e| format!("二进制 HTTP 错误：{e}"))?
+        .bytes().await.map_err(|e| format!("二进制读取失败：{e}"))?;
+    let staging = paths.staging(version);
+    let target = staging.clone();
+    let version = version.to_string();
+    let expected = expected.to_string();
+    tokio::task::spawn_blocking(move || {
+        let actual = sha256_hex(&bytes);
+        if actual != expected {
+            return Err(format!("校验失败（期望 {expected}，实际 {actual}）"));
+        }
+        let result = write_executable(&target, &bytes).and_then(|_| trial_run(&target, &version));
+        if result.is_err() { let _ = std::fs::remove_file(&target); }
+        result
+    }).await.map_err(|e| format!("候选验证任务失败：{e}"))??;
+    Ok(staging)
+}
 
-    let actual = sha256_hex(&bytes);
-    if actual != expected {
-        // **校验不过就到此为止**，连临时文件都不留。这是整个流程里最硬的一条。
-        return Err(format!(
-            "校验失败，放弃这次更新（期望 {expected}，实际 {actual}）"
-        ));
-    }
-
-    let staging = ctx.paths.staging(version);
-    write_executable(&staging, &bytes)?;
-
-    // **替换之前**先试跑。起不来的包在这里就拦住，线上文件名一个字节都没动。
-    trial_run(&staging, version).inspect_err(|error| {
-        let _ = std::fs::remove_file(&staging);
-        crate::tunnel::log(format!("放弃升级到 {version}：{error}"));
-    })?;
-
-    // 先把「待验证」落盘，再动文件。反过来的话，进程在两次 rename 之间被杀掉，
-    // 盘上就是一个没人认领的新文件。
-    let mut state = ctx.paths.load();
+fn install_candidate(paths: &Paths, version: &str, staging: &Path) -> Result<(), String> {
+    let original = paths.load();
+    let mut state = original.clone();
     state.pending = version.to_string();
     state.attempts = 0;
-    state.confirmed = String::new();
-    state.rollback = String::new();
-    ctx.paths.save(&state)?;
-
-    let exe = &ctx.paths.exe;
-    let backup = ctx.paths.previous();
-    // 旧文件改名留一份：这是回滚的唯一依据。
-    if backup.exists() {
-        let _ = std::fs::remove_file(&backup);
+    state.confirmed.clear();
+    state.rollback.clear();
+    if let Err(error) = paths.save(&state) {
+        let _ = std::fs::remove_file(staging);
+        return Err(error);
     }
-    std::fs::rename(exe, &backup).map_err(|e| format!("备份旧版本失败：{e}"))?;
-    if let Err(error) = std::fs::rename(&staging, exe) {
-        // 换不上去就把旧的放回原位，别留下一台没有可执行文件的中转。
-        let _ = std::fs::rename(&backup, exe);
-        state.pending = String::new();
-        let _ = ctx.paths.save(&state);
-        return Err(format!("替换失败，已回滚：{error}"));
+    let backup = paths.previous();
+    if backup.exists() { let _ = std::fs::remove_file(&backup); }
+    if let Err(error) = std::fs::rename(&paths.exe, &backup) {
+        let _ = paths.save(&original);
+        let _ = std::fs::remove_file(staging);
+        return Err(format!("备份旧版本失败：{error}"));
     }
-
-    crate::tunnel::log(format!(
-        "已替换为 {version}，退出后由服务管理器拉起新版并自检"
-    ));
-    // 直接退出：管理器立刻再拉一次。用 75 是为了让「正常结束不重启」的管理器也重试。
+    if let Err(error) = std::fs::rename(staging, &paths.exe) {
+        let restored = std::fs::rename(&backup, &paths.exe);
+        if restored.is_ok() { let _ = paths.save(&original); }
+        return Err(format!("替换失败，恢复旧版本结果 {restored:?}：{error}"));
+    }
+    crate::tunnel::log(format!("已替换为 {version}，退出后由服务管理器拉起新版并自检"));
     std::process::exit(EXIT_RESTART);
 }
 
@@ -1088,14 +1038,57 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 多个更新源：第一个连不上就往下试，不能因为主源挂了就收不到更新。
-    #[test]
-    fn sources_are_tried_in_order() {
-        // 这里只钉「空源要报错」这条——真正的网络失败顺序由集成测试兜。
-        let _ = temp_dir("sources");
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        let client = reqwest::Client::new();
-        let result = runtime.block_on(first_manifest(&client, &[], "0.1.7", "x86_64"));
-        assert!(result.unwrap_err().contains("SELF_UPDATE_SOURCE"));
+    #[cfg(unix)]
+    async fn update_source(binary: Vec<u8>, hash: String, binary_status: u16) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let asset_url = format!("{base}/relay");
+        let manifest = serde_json::json!({"version":"999.0.0", "binaries":{"x86_64":{"url":asset_url,"sha256":hash}}}).to_string().into_bytes();
+        let job = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else { break };
+                let mut request = vec![0; 4096];
+                let n = stream.read(&mut request).await.unwrap();
+                let is_manifest = String::from_utf8_lossy(&request[..n]).starts_with("GET /latest.json ");
+                let (status, body) = if is_manifest { (200, &manifest) } else { (binary_status, &binary) };
+                let head = format!("HTTP/1.1 {status} OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len());
+                stream.write_all(head.as_bytes()).await.unwrap();
+                stream.write_all(body).await.unwrap();
+            }
+        });
+        (base, job)
+    }
+
+    /// 真实本地HTTP源覆盖：下载HTTP失败、摘要不符、试跑失败都必须落到后一个源。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn candidate_failures_try_the_next_source_without_touching_live_files() {
+        let good = b"#!/bin/sh\necho dsh-relay 999.0.0\n".to_vec();
+        let broken = b"#!/bin/sh\nexit 127\n".to_vec();
+        let (http_fail, a) = update_source(good.clone(), sha256_hex(&good), 503).await;
+        let (hash_fail, b) = update_source(good.clone(), "0".repeat(64), 200).await;
+        let (trial_fail, c) = update_source(broken.clone(), sha256_hex(&broken), 200).await;
+        let (working, d) = update_source(good.clone(), sha256_hex(&good), 200).await;
+        let dir = temp_dir("candidate-fallback");
+        let paths = paths_at(&dir);
+        std::fs::write(&paths.exe, b"live").unwrap();
+        let client = reqwest::Client::builder().connect_timeout(Duration::from_millis(100)).read_timeout(Duration::from_secs(2)).build().unwrap();
+        let sources = vec![http_fail, hash_fail, trial_fail, working];
+        let (version, staging) = prepare_from_sources(&client, &sources, "0.1.0", "x86_64", &paths).await.unwrap().unwrap();
+        assert_eq!(version, "999.0.0");
+        assert_eq!(std::fs::read(staging).unwrap(), good);
+        assert_eq!(std::fs::read(&paths.exe).unwrap(), b"live");
+        assert_eq!(paths.load(), UpdateState::default());
+        for job in [a, b, c, d] { job.abort(); }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn empty_update_sources_are_rejected() {
+        let dir = temp_dir("sources");
+        let error = prepare_from_sources(&reqwest::Client::new(), &[], "0.1.7", "x86_64", &paths_at(&dir)).await.unwrap_err();
+        assert!(error.contains("SELF_UPDATE_SOURCE"));
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -1,3 +1,4 @@
+// 参考宿主与 Rust parity 共用帧表，包含 blobPut 的旧控制帧和协商分片。
 'use strict';
 
 /**
@@ -15,33 +16,7 @@
  * 类型表事实源为 ../protocol-types.js，协议变更时还须同步独立发布的插件副本。
  */
 
-const T = {
-  register: 0x01,      // id=0  JSON {instanceId, pairingCode, name, lanUrls?, lanCandidates?}
-  registered: 0x02,    // id=0  JSON {}
-  updatePairing: 0x03, // id=0  JSON {pairingCode}
-  httpRequest: 0x04,   // id=N  JSON {method, path, headers}；body 随后以 httpBody 流式发送
-  httpBody: 0x05,      // id=N  raw bytes（空 payload = body 结束）
-  httpHead: 0x06,      // id=N  JSON {status, headers}
-  httpChunk: 0x07,     // id=N  raw bytes
-  httpEnd: 0x08,       // id=N  空
-  httpError: 0x09,     // id=N  JSON {message}
-  wsUpgrade: 0x0A,     // id=N  JSON {path, headers}
-  wsOpen: 0x0B,        // id=N  空
-  wsError: 0x0C,       // id=N  JSON {message}
-  wsText: 0x0D,        // id=N  raw bytes（上游 WS 文本帧数据）
-  wsBinary: 0x0E,      // id=N  raw bytes（上游 WS 二进制帧数据）
-  wsClose: 0x0F,       // id=N  2B 大端 close code
-  ping: 0x10,          // id=0  空
-  pong: 0x11,          // id=0  空
-  pairRequest: 0x12,   // id=0  JSON {requestId, device:{id?, deviceId?, name?, platform?, osVersion?, appVersion?, ip?}}（手机配对 → 请求桌面授权；ip 由中转注入）
-  pairConfirm: 0x13,   // id=0  JSON {requestId, approved, token?}（桌面授权结果 → 中转 → 手机）
-  httpCancel: 0x14,     // id=N  空；取消上游 HTTP 请求/响应
-  httpPause: 0x15,      // id=N  空；暂停向中转发送响应数据
-  httpResume: 0x16,     // id=N  空；恢复向中转发送响应数据
-  sync: 0x17,          // id=0  JSON {kind, ...}；桌面→中转主动推送（移动端镜像缓存）
-  revokeAll: 0x18,     // id=0  JSON {at}；桌面请求中转清空本实例全部设备授权
-  revokeAllAck: 0x19,  // id=0  JSON {ok, revoked}；中转确认已清空
-};
+const { T } = require('../protocol-types.js');
 
 const TYPE_NAME = {};
 for (const [name, code] of Object.entries(T)) TYPE_NAME[code] = name;

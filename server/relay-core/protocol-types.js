@@ -1,3 +1,4 @@
+// blobPut 保留旧控制帧，并在能力协商后复用非零 id 双向传片与回执。
 'use strict';
 
 /**
@@ -16,7 +17,7 @@
 /** 帧类型编号。id=0 表示无请求号（控制帧），id=N 表示对应某次请求。 */
 const T = {
   register: 0x01,      // id=0  JSON {instanceId, pairingCode, name, lanUrls?, lanCandidates?}
-  registered: 0x02,    // id=0  JSON {}
+  registered: 0x02,    // id=0  JSON {blobUpload?:{maxChunkBytes,maxBlobBytes},...}；能力与旧注册载荷见 PROTOCOL.md
   updatePairing: 0x03, // id=0  JSON {pairingCode}
   httpRequest: 0x04,   // id=N  JSON {method, path, headers}；body 随后以 httpBody 流式发送
   httpBody: 0x05,      // id=N  raw bytes（空 payload = body 结束）
@@ -43,7 +44,7 @@ const T = {
   pushRegister: 0x1A,  // id=0  JSON {deviceId, platform, token}；宿主代 App 上报 iOS 推送令牌（本实例）
   pushSend: 0x1B,      // id=0  JSON {deviceId, title, body, sessionId?, kind}；宿主请求中转发一条 APNs 推送
   migrate: 0x1C,       // id=0  JSON {to, at}；宿主换中转地址前在旧隧道上登记「这台搬到 to」，to 空串 = 撤销
-  blobPut: 0x1D,       // id=0  JSON {scope, key, creds, cipher}；宿主把 HK 加密的历史 blob（base64url 密文）推给中转，中转只存不解
+  blobPut: 0x1D,       // id=0  旧 JSON {scope,key,creds,cipher}（空 cipher 仅刷新）；协商后 id=N 双向分片/ack，见 PROTOCOL.md
   blobDelete: 0x1E,    // id=0  JSON {scope, key} 或 {scope, keys:[...]}；宿主让中转删掉已推过的 blob
 };
 

@@ -1,4 +1,4 @@
-//! 自建版中转的入口：读配置、起 HTTP 服务、等隧道连上来。
+//! 中转入口：安全监听默认值、可用控制面依赖与非阻塞存储初始化。
 //!
 //! 控制台（`PLATFORM_ENABLED=1`）是可选的：打开时它接管 `/api/platform/v1/**` 与
 //! `/platform/**`，并提供隧道准入；关着的时候就是纯转发。
@@ -40,9 +40,9 @@ async fn main() {
     };
 
     dsh_relay::install_config(config.clone());
-    // APNs 推送出口：默认关闭（APNS_KEY / APNS_KEY_ID / APNS_TEAM_ID 任一不配就是关）。
-    // 关闭时只打一条日志，转发路径一个字不变。
-    dsh_relay::apns::init_from_env();
+    if !config.host.parse::<std::net::IpAddr>().map(|ip| ip.is_loopback()).unwrap_or(config.host == "localhost") {
+        log("警告：中转正在非回环地址明文监听，请确认仅由可信TLS反向代理访问");
+    }
     let slot = Arc::new(TunnelSlot::new());
     dsh_relay::install_slot(slot.clone());
 
@@ -102,17 +102,23 @@ async fn main() {
         }
     }
 
+    // APNs令牌与发送依赖实际初始化成功的控制台，配置了但不可用时明确关闭。
+    dsh_relay::apns::init_from_env();
+
     // 历史 blob 仓库：默认关。开着时把密文落到 data 目录下，注入转发与 HTTP 两侧。
     // 建不起来（磁盘不可写等）只记日志、不挡转发——中转的首要职责仍是转发。
     if config.blob_store {
         let blob_root = data_dir.join("blobs");
-        match dsh_relay::blobstore::BlobStore::new(
-            blob_root.clone(),
-            config.max_blob_bytes,
-            config.max_blob_per_instance_bytes,
-            config.max_blob_total_bytes,
-            config.blob_ttl_seconds,
-        ) {
+        let worker_root = blob_root.clone();
+        let worker_config = config.clone();
+        let built = tokio::task::spawn_blocking(move || dsh_relay::blobstore::BlobStore::new(
+            worker_root,
+            worker_config.max_blob_bytes,
+            worker_config.max_blob_per_instance_bytes,
+            worker_config.max_blob_total_bytes,
+            worker_config.blob_ttl_seconds,
+        )).await;
+        match built.unwrap_or_else(|error| Err(std::io::Error::other(error.to_string()))) {
             Ok(store) => {
                 dsh_relay::install_blob_store(Arc::new(store));
                 log(format!(

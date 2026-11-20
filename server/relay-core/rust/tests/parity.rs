@@ -1,11 +1,12 @@
 //! 跨语言逐字节对撞：Rust 实现与 JS 权威实现必须对同一输入编出**完全相同**的字节。
+//! blob 协商、旧控制帧及同 type/id 双向分片回执共用现有线格式。
 //!
 //! 测试运行时调用 Node 执行本仓 `../test/protocol.js`，使用其实际编码字节作为参照，
 //! 与 Rust 实现逐帧比对。中转仓库的 CI 安装 Node 与 Rust 工具链。
 
 use std::process::Command;
 
-use dsh_relay_protocol::{encode_close_payload, encode_frame, t, Payload};
+use dsh_relay_protocol::{encode_close_payload, encode_frame, t, DecodeOutcome, FrameDecoder, Payload};
 
 /// JS 对照实现位于 relay-core 的测试夹具目录；本仓库独立构建，不依赖插件仓库检出。
 const JS_PROTOCOL: &str = "../test/protocol.js";
@@ -110,6 +111,76 @@ fn encode_frame_matches_js_byte_for_byte() {
         let actual = encode_frame(*code, 0x01020304, &Payload::Bytes("协议parity".as_bytes().to_vec()));
         assert_eq!(actual, expected, "{name} 的编码与 JS 不一致");
     }
+}
+
+#[test]
+fn reference_type_table_matches_js_source() {
+    assert!(
+        node_available(),
+        "本机没有 node，跨语言对撞无法进行——这组测试存在的意义就是它真的跑了"
+    );
+    let script = "const entries = value => JSON.stringify(Object.entries(value).sort(([a], [b]) => a.localeCompare(b))); console.log(entries(p.T) === entries(t.T));";
+    let text = run_node(script).expect("读取 JS 参考帧表失败");
+    assert_eq!(text, "true", "参考宿主帧表必须与事实源逐项相等");
+}
+
+#[test]
+fn blob_upload_frames_match_js_byte_for_byte() {
+    assert!(
+        node_available(),
+        "本机没有 node，跨语言对撞无法进行——这组测试存在的意义就是它真的跑了"
+    );
+    let cases: &[(&str, &str, u8, u32, &str)] = &[
+        ("旧注册回执", "registered", t::REGISTERED, 0, r#"{"ok":true,"mirror":false}"#),
+        ("分片能力", "registered", t::REGISTERED, 0, r#"{"ok":true,"mirror":false,"blobUpload":{"maxChunkBytes":49152,"maxBlobBytes":5242880}}"#),
+        ("旧整包", "blobPut", t::BLOB_PUT, 0, r#"{"scope":"messages","key":"会话","creds":[{"hash":"0000000000000000000000000000000000000000000000000000000000000000","expiresAt":0}],"cipher":"AAEC_w"}"#),
+        ("旧凭据刷新", "blobPut", t::BLOB_PUT, 0, r#"{"scope":"messages","key":"会话","creds":[{"hash":"0000000000000000000000000000000000000000000000000000000000000000","expiresAt":0}],"cipher":""}"#),
+        ("首片", "blobPut", t::BLOB_PUT, 0x01020304, r#"{"scope":"messages","key":"会话","creds":[{"hash":"0000000000000000000000000000000000000000000000000000000000000000","expiresAt":0}],"offset":0,"total":8,"final":false,"cipher":"AAEC"}"#),
+        ("首片回执", "blobPut", t::BLOB_PUT, 0x01020304, r#"{"ok":true,"nextOffset":3,"done":false}"#),
+        ("续片", "blobPut", t::BLOB_PUT, 0x01020304, r#"{"offset":3,"total":8,"final":false,"cipher":"AwQF"}"#),
+        ("续片回执", "blobPut", t::BLOB_PUT, 0x01020304, r#"{"ok":true,"nextOffset":6,"done":false}"#),
+        ("尾片", "blobPut", t::BLOB_PUT, 0x01020304, r#"{"offset":6,"total":8,"final":true,"cipher":"Bgc"}"#),
+        ("发布回执", "blobPut", t::BLOB_PUT, 0x01020304, r#"{"ok":true,"nextOffset":8,"done":true}"#),
+        ("失败回执", "blobPut", t::BLOB_PUT, u32::MAX, r#"{"ok":false,"nextOffset":0,"done":false,"error":"写入失败"}"#),
+    ];
+    let mut rust_stream = Vec::new();
+    let mut js_frames = Vec::new();
+    for (label, name, code, id, json) in cases {
+        let script = format!(
+            "const payload = JSON.parse({}); const frame = p.jsonFrame(p.T['{name}'], {id}, payload); console.log(JSON.stringify([...frame]));",
+            serde_quote(json)
+        );
+        let js_bytes = run_node(&script).expect("编码 JS blob 帧失败");
+        let expected = parse_byte_array(&js_bytes).expect("解析 JS blob 帧失败");
+        let actual = encode_frame(*code, *id, &Payload::Json((*json).to_string()));
+        assert_eq!(actual, expected, "{label} 的编码与 JS 不一致");
+        rust_stream.extend_from_slice(&actual);
+        js_frames.push(format!("p.jsonFrame(p.T['{name}'], {id}, JSON.parse({}))", serde_quote(json)));
+    }
+
+    // 请求与反向回执同 type/id，编解码必须保留每条 JSON，不得按 id 合并。
+    let mut decoder = FrameDecoder::new(rust_stream.len());
+    let mut decoded = Vec::new();
+    let mut decode = |frame: dsh_relay_protocol::Frame<'_>| {
+        decoded.push((frame.frame_type, frame.id, frame.payload.to_vec()));
+    };
+    assert_eq!(decoder.push(&rust_stream[..7], &mut decode), DecodeOutcome::Ok);
+    assert_eq!(decoder.push(&rust_stream[7..], &mut decode), DecodeOutcome::Ok);
+    assert_eq!(decoder.pending_len(), 0);
+    let expected: Vec<_> = cases.iter()
+        .map(|(_, _, code, id, json)| (*code, *id, json.as_bytes().to_vec()))
+        .collect();
+    assert_eq!(decoded, expected, "同 type/id 的双向 blob 帧必须逐帧保留");
+
+    let script = format!(
+        "const decoded = []; const push = p.createFrameDecoder(frame => decoded.push([frame.type, frame.id, [...frame.payload]])); const wire = Buffer.concat([{}]); push(wire.subarray(0, 7)); push(wire.subarray(7)); console.log(JSON.stringify(decoded));",
+        js_frames.join(",")
+    );
+    let js_decoded = run_node(&script).expect("解码 JS blob 帧失败");
+    let rust_decoded = format!("[{}]", decoded.iter().map(|(code, id, payload)| {
+        format!("[{code},{id},[{}]]", payload.iter().map(u8::to_string).collect::<Vec<_>>().join(","))
+    }).collect::<Vec<_>>().join(","));
+    assert_eq!(js_decoded, rust_decoded, "blob 帧的流式解码与 JS 不一致");
 }
 
 #[test]
