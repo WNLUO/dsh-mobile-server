@@ -1,4 +1,4 @@
-//! 跨语言逐字节对撞：Rust 实现与 JS 权威实现必须对同一输入编出**完全相同**的字节。
+//! 控制错误与注册载荷跨语言逐字节对撞，并核对保留帧及错误code说明。
 //! 注册载荷、手机 API 路径与 blob 双向分片回执同时钉住事实源和参考实现。
 //!
 //! 测试运行时调用 Node 执行本仓 `../test/protocol.js`，使用其实际编码字节作为参照，
@@ -141,7 +141,12 @@ const registered = compact(line('registered')).includes('{ok,mirror,blobUpload?:
   && compact(row('0x02')).includes('{ok,mirror,blobUpload?}');
 const close = /UTF-8 reason/.test(line('wsClose')) && /123B/.test(line('wsClose'))
   && /UTF-8 reason/.test(row('0x0F')) && /123/.test(row('0x0F'));
-console.log(fields && registered && close);
+const error = line('wsError') + row('0x0C');
+const rejection = ['bad_register_secret', 'plugin_too_old', 'instance_mismatch'].every(code =>
+  line('wsError').includes(code) && row('0x0C').includes(code))
+  && /id=0/.test(error) && /code\?/.test(error);
+const reserved = !line('updatePairing').includes('{pairingCode}') && /保留编号/.test(line('updatePairing'));
+console.log(fields && registered && close && rejection && reserved);
 "#;
     assert_eq!(run_node(script).expect("读取协议载荷说明失败"), "true", "载荷说明必须与协议表一致");
 }
@@ -155,6 +160,10 @@ fn registration_payloads_match_js_byte_for_byte() {
         ("register", t::REGISTER, r#"{"instanceId":"legacy"}"#),
         ("registered", t::REGISTERED, r#"{"ok":true,"mirror":true}"#),
         ("registered", t::REGISTERED, r#"{"ok":true,"mirror":false}"#),
+        ("wsError", t::WS_ERROR, r#"{"message":"admission rejected"}"#),
+        ("wsError", t::WS_ERROR, r#"{"code":"bad_register_secret","message":"bad registration secret"}"#),
+        ("wsError", t::WS_ERROR, r#"{"code":"instance_mismatch","message":"一条隧道只能绑定一个实例"}"#),
+        ("wsError", t::WS_ERROR, r#"{"code":"plugin_too_old","message":"too old","min":"1.2.3","have":"1.0.0","retryAfterMs":1800000}"#),
     ];
     for (name, code, json) in cases {
         let script = format!("console.log(JSON.stringify([...p.jsonFrame(p.T['{name}'], 0, JSON.parse({}))]));", serde_quote(json));

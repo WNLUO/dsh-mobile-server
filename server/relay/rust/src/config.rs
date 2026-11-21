@@ -1,4 +1,4 @@
-//! 环境变量配置：限额、监听与镜像开关；弱网计时开关不控制上游 5xx 兜底。
+//! 环境变量配置：隧道宿主45秒先判死，中转默认60秒清理未响应连接。
 //!
 //! 对齐 Node 版 `lib/config.js`：所有可调项都走「越界直接报错、不 clamp」。一个手滑的
 //! 0 或负值若被静默接受，表现是限额「关掉」而不是「设错」（例如 MAX_PENDING=0 会让全部
@@ -254,8 +254,8 @@ impl Config {
             ws_heartbeat_ms: positive_int("WS_HEARTBEAT_MS", 15_000, 600_000)? as u64,
             ws_pong_timeout_ms: positive_int("WS_PONG_TIMEOUT_MS", 60_000, 600_000)? as u64,
             tunnel_heartbeat_ms: positive_int("TUNNEL_HEARTBEAT_MS", 15_000, 600_000)? as u64,
-            // 两侧超时**刻意不对称**（中转 60s < 宿主 90s）：反了会在网络抖动时互相
-            // terminate 并反复重连。
+            // 两侧超时刻意不对称（中转 60s > 宿主 45s）：宿主先发现无回应并重连，
+            // 中转再回收旧连接，避免宿主仍以为可用时手机先撞上死隧道。
             tunnel_pong_timeout_ms: positive_int("TUNNEL_PONG_TIMEOUT_MS", 60_000, 600_000)? as u64,
             unregistered_timeout_ms: positive_int("UNREGISTERED_TIMEOUT_MS", 5_000, 60_000)? as u64,
 

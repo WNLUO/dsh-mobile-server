@@ -1,4 +1,4 @@
-/** 控制台网络、动作确认与真实 React 生命周期的最小 Node 假体回归。 */
+/** 控制台服务端时间基线、写入确认与真实React生命周期的行为和内存变异回归。 */
 'use strict';
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
@@ -64,9 +64,9 @@ function fakeReact() {
     strictRestart() { cells.forEach(cell => { if (cell?.work) { cell.cleanup?.(); cell.cleanup = cell.work(); } }); },
   };
 }
-function host(change = {}) {
+function host(change = {}, BrowserDate = Date) {
   const hooks = fakeReact(), timers = new Map(), intervals = new Map(), events = new Map(), calls = [];
-  let next = 0, licenseStatus = 'active', bound = true;
+  let next = 0, licenseStatus = 'active', bound = true, elapsed = 0;
   const document = {
     visibilityState: 'visible',
     addEventListener(name, fn) { events.set(name, fn); },
@@ -75,9 +75,9 @@ function host(change = {}) {
   const defaults = (url, init) => {
     const route = url.replace('/api/platform/v1', '');
     if (route === '/me') return json({ ok: true, user });
-    if (route === '/overview') return json({ ok: true, role: 'master', version: 'test' });
+    if (route === '/overview') return json({ ok: true, role: 'master', version: 'test', serverTime: '2026-11-21T00:00:00.000Z' });
     if (route === '/licenses') return json({ ok: true, licenses: [{ ...license, status: licenseStatus }] });
-    if (route === '/nodes') return json({ ok: true, nodes: [] });
+    if (route === '/nodes') return json({ ok: true, nodes: [], serverTime: '2026-11-21T00:00:00.000Z' });
     if (route === '/licenses/license/status') { licenseStatus = licenseStatus === 'active' ? 'revoked' : 'active'; return json({ ok: true, status: licenseStatus }); }
     if (route === '/licenses/license/devices') return json({ ok: true, devices: bound ? [device] : [] });
     if (route === '/licenses/license/devices/phone' && init.method === 'DELETE') { bound = false; return json({ ok: true, removed: true }); }
@@ -87,12 +87,14 @@ function host(change = {}) {
   const state = {
     hooks, timers, intervals, document, calls, defaults,
     fetch: defaults,
+    advance(ms) { elapsed += ms; },
     visible(value) { document.visibilityState = value; events.get('visibilitychange')?.(); },
     poll() { [...intervals.values()].forEach(fn => fn()); },
     timeout() { [...timers.entries()].forEach(([id, fn]) => { timers.delete(id); fn(); }); },
   };
   const common = {
-    AbortController, DOMException, Error, Date, Promise, console,
+    AbortController, DOMException, Error, Date: BrowserDate, Promise, console,
+    performance: { now: () => elapsed },
     document,
     fetch: (url, init) => { calls.push({ url, init }); return Promise.resolve().then(() => state.fetch(url, init)); },
     setTimeout: fn => { const id = ++next; timers.set(id, fn); return id; },
@@ -302,3 +304,62 @@ test('变异证明：去掉动作后锁定或把网络失败当登出会破坏�
   view = await boot(loggedOut); assert.equal(view.signedOut, true, '生产断言要求保留未确认登录态');
   loggedOut.hooks.cleanup();
 });
+
+
+async function serverClockContract(change, clockOffset = 900_000) {
+  const serverNow = Date.parse('2026-11-21T00:00:00.000Z')
+  class BrowserDate extends Date { static now() { return serverNow + clockOffset } }
+  const h = host(change ? { 'lib/useConsole.ts': change } : {}, BrowserDate)
+  h.fetch = (url, init) => url.endsWith('/nodes') ? json({
+    ok: true, serverTime: new Date(serverNow).toISOString(),
+    nodes: [{ tunnelOnline: true, reportIntervalSeconds: 60, lastSeenAt: new Date(serverNow - 30_000).toISOString() }],
+  }) : h.defaults(url, init)
+  try {
+    let view = await boot(h)
+    assert.equal(view.now, serverNow, '节点时间必须取服务端快照，与浏览器快慢无关')
+    assert.equal(h.hook.nodeStatus(view.nodes[0], view.now).online, true)
+    h.fetch = (url, init) => url.endsWith('/nodes') ? json({ ok: true, nodes: [], serverTime: 'invalid' }) : h.defaults(url, init)
+    await view.refresh(); view = h.render()
+    assert.equal(view.now, serverNow, '无效时间不能把已有快照切回浏览器墙钟')
+    assert.equal(view.nodes.length, 1)
+    assert.match(view.error, /时间/)
+  } finally { h.hooks.cleanup() }
+}
+
+test('节点快照使用服务端时间，无效时间保留旧快照', async () => {
+  await serverClockContract(undefined, 900_000)
+  await serverClockContract(undefined, -900_000)
+})
+test('变异：浏览器墙钟代替服务端时间时节点契约必须失败', async () => {
+  await assert.rejects(serverClockContract(source => {
+    const before = 'setNow(serverNow)'
+    assert.equal(source.split(before).length, 2)
+    return source.replace(before, 'setNow(Date.now())')
+  }), /节点时间必须取服务端快照/)
+})
+
+
+async function failedPollingClockContract(change) {
+  const h = host(change ? { 'lib/useConsole.ts': change } : {})
+  const serverNow = Date.parse('2026-11-21T00:00:00.000Z')
+  h.fetch = (url, init) => url.endsWith('/nodes') ? json({ ok: true, serverTime: new Date(serverNow).toISOString(),
+    nodes: [{ tunnelOnline: true, reportIntervalSeconds: 60, lastSeenAt: new Date(serverNow).toISOString() }],
+  }) : h.defaults(url, init)
+  try {
+    let view = await boot(h)
+    assert.equal(h.hook.nodeStatus(view.nodes[0], view.now).online, true)
+    h.fetch = () => { throw new TypeError('offline') }
+    for (let i = 0; i < 7; i += 1) { h.advance(30_000); h.poll(); await settle() }
+    view = h.render()
+    assert.equal(view.now, serverNow + 210_000, '轮询失败也按单调时间推进服务端基线')
+    assert.match(h.hook.nodeStatus(view.nodes[0], view.now).text, /失联/)
+  } finally { h.hooks.cleanup() }
+}
+test('快照后连续轮询失败，节点仍会超过三个上报周期并失联', () => failedPollingClockContract())
+test('变异：取消经过时间推进会被失败轮询契约捕获', async () => {
+  await assert.rejects(failedPollingClockContract(source => {
+    const before = 'scope.clock.server + performance.now() - scope.clock.receivedAt'
+    assert.equal(source.split(before).length, 3)
+    return source.replaceAll(before, 'scope.clock.server')
+  }), /轮询失败也按单调时间推进/)
+})

@@ -1,4 +1,4 @@
-// 帧载荷说明与 PROTOCOL.md 对齐，手机 API 路径优先于中转短路径匹配。
+// 控制错误区分id0拒绝与请求错误，保留帧不再声明已停用的配对码载荷。
 'use strict';
 
 /**
@@ -18,7 +18,7 @@
 const T = {
   register: 0x01,      // id=0  JSON {instanceId,name?,version?,license?,secret?,lanUrls?,lanCandidates?}；不发 pairingCode
   registered: 0x02,    // id=0  JSON {ok,mirror,blobUpload?:{maxChunkBytes,maxBlobBytes}}；载荷语义见 PROTOCOL.md
-  updatePairing: 0x03, // id=0  JSON {pairingCode}
+  updatePairing: 0x03, // id=0  JSON {}（保留编号，宿主已不再发；中转从不读）
   httpRequest: 0x04,   // id=N  JSON {method, path, headers}；body 随后以 httpBody 流式发送
   httpBody: 0x05,      // id=N  raw bytes（空 payload = body 结束）
   httpHead: 0x06,      // id=N  JSON {status, headers}
@@ -27,7 +27,7 @@ const T = {
   httpError: 0x09,     // id=N  JSON {message}
   wsUpgrade: 0x0A,     // id=N  JSON {path, headers}
   wsOpen: 0x0B,        // id=N  空
-  wsError: 0x0C,       // id=N  JSON {message}
+  wsError: 0x0C,       // id=N 上游错误{message}；id=0 中转拒绝{message,code?}，code可为bad_register_secret/plugin_too_old/instance_mismatch；准入拒绝可无code
   wsText: 0x0D,        // id=N  raw bytes（上游 WS 文本帧数据）
   wsBinary: 0x0E,      // id=N  raw bytes（上游 WS 二进制帧数据）
   wsClose: 0x0F,       // id=N  2B 大端 close code + 可选 UTF-8 reason（最多 123B）

@@ -1,4 +1,4 @@
-/** 控制台请求生命周期、动作确认与可见页刷新共用同一个串行入口。 */
+/** 控制台快照使用服务端时间判断节点新鲜度，浏览器墙钟不参与在线判定。 */
 import { useCallback, useEffect, useRef, useState } from 'react'
 
 import {
@@ -16,6 +16,7 @@ type Scope = {
   actionController: AbortController | null
   working: boolean
   locked: boolean
+  clock: { server: number; receivedAt: number } | null
 }
 
 export type ConsoleAction = (signal: AbortSignal) => Promise<void>
@@ -58,7 +59,7 @@ export function useConsole() {
   const [working, setWorking] = useState(false)
   const [needsRefresh, setNeedsRefresh] = useState(false)
   const [refreshing, setRefreshing] = useState(false)
-  const [now, setNow] = useState(Date.now())
+  const [now, setNow] = useState(0)
 
   const clearSession = useCallback((scope: Scope) => {
     if (!scope.active) return
@@ -66,6 +67,7 @@ export function useConsole() {
     scope.signedOut = true
     scope.selected = null
     scope.locked = false
+    scope.clock = null
     setUser(null)
     setSignedOut(true)
     setOverview(null)
@@ -83,8 +85,8 @@ export function useConsole() {
     const controller = new AbortController()
     scope.readController = controller
     const selectedId = scope.selected?.id
+    if (scope.clock) setNow(scope.clock.server + performance.now() - scope.clock.receivedAt)
     setRefreshing(true)
-    setNow(Date.now())
     const pending = (async () => {
       try {
         if (!scope.user) {
@@ -103,14 +105,17 @@ export function useConsole() {
           throw new NetworkError('控制台数据不完整，请重试。')
         }
         const [nextNodes, nextDevices] = await Promise.all([
-          nextOverview.role === 'master' ? fetchNodes(controller.signal) : Promise.resolve({ nodes: [] }),
+          nextOverview.role === 'master' ? fetchNodes(controller.signal) : Promise.resolve({ nodes: [], serverTime: nextOverview.serverTime }),
           selectedId ? fetchDevices(selectedId, controller.signal) : Promise.resolve(null),
         ])
         if (!Array.isArray(nextNodes.nodes) || (nextDevices && !Array.isArray(nextDevices.devices))) {
           throw new NetworkError('列表数据不完整，请重试。')
         }
         if (!scope.active || controller.signal.aborted) return false
-        setNow(Date.now())
+        const serverNow = Date.parse(nextNodes.serverTime)
+        if (!Number.isFinite(serverNow)) throw new NetworkError('控制台时间信息不完整，请刷新后重试。')
+        scope.clock = { server: serverNow, receivedAt: performance.now() }
+        setNow(serverNow)
         setOverview(nextOverview)
         setLicenses(nextLicenses.licenses)
         setNodes(nextNodes.nodes)
@@ -205,12 +210,14 @@ export function useConsole() {
   useEffect(() => {
     const scope: Scope = {
       active: true, user: null, signedOut: false, selected: null, reading: null,
-      readController: null, actionController: null, working: false, locked: false,
+      readController: null, actionController: null, working: false, locked: false, clock: null,
     }
     scopeRef.current = scope
     void read(scope).finally(() => { if (scope.active) setChecking(false) })
     const poll = () => {
-      if (document.visibilityState !== 'visible' || scope.working || scope.reading || scope.signedOut) return
+      if (document.visibilityState !== 'visible' || scope.signedOut) return
+      if (scope.clock) setNow(scope.clock.server + performance.now() - scope.clock.receivedAt)
+      if (scope.working || scope.reading) return
       void read(scope, true)
     }
     const timer = setInterval(poll, 30_000)

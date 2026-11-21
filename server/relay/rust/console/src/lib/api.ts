@@ -1,3 +1,4 @@
+/** 节点新鲜度使用同源响应时间，管理写入错误保持为失败响应。 */
 /**
  * 控制台的接口层：同源会话请求统一超时、取消和响应校验。
  *
@@ -66,6 +67,7 @@ export interface Node {
 
 export interface Overview {
   ok: true
+  serverTime: string
   admissionMode: 'open' | 'restricted' | string
   licenseCount: number
   activeLicenseCount: number
@@ -201,7 +203,7 @@ export function unbindDevice(licenseId: string, deviceId: string, signal?: Abort
   return request(`/licenses/${licenseId}/devices/${encodeURIComponent(deviceId)}`, { method: 'DELETE', signal })
 }
 
-export function fetchNodes(signal?: AbortSignal): Promise<{ ok: true; nodes: Node[] }> {
+export function fetchNodes(signal?: AbortSignal): Promise<{ ok: true; nodes: Node[]; serverTime: string }> {
   return request('/nodes', { signal })
 }
 

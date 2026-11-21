@@ -1,4 +1,4 @@
-// 时间读取只告警真实异常；节点在线判断使用同次上报保存的周期与时间。
+// 管理写入返回数据库错误；不存在与重复删除保留独立的幂等语义。
 //! 控制台数据层：身份稳定匹配、有限登录事务与原子设备名额。
 //!
 //! 沿用 Node 运营版的授权码规则与基础表结构；新增列按已有探测补列方式升级。
@@ -369,13 +369,13 @@ impl Store {
             .flatten()
     }
 
-    pub fn set_setting(&self, key: &str, value: &str) {
+    pub fn set_setting(&self, key: &str, value: &str) -> Result<(), String> {
         let ts = now_iso();
-        let _ = self.lock().execute(
+        self.lock().execute(
             "INSERT INTO settings (key, value, updated_at) VALUES (?1, ?2, ?3)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
             params![key, value, ts],
-        );
+        ).map(|_| ()).map_err(|error| error.to_string())
     }
 
     // ── users ─────────────────────────────────────────────────────
@@ -629,22 +629,24 @@ impl Store {
     // ── licenses ──────────────────────────────────────────────────
 
     /// 生成一个新码。撞码时重试几次（16^16 的空间，撞上基本不可能，但保留原版的重试）。
-    pub fn create_license(&self, owner_id: Option<&str>, note: &str) -> License {
+    pub fn create_license(&self, owner_id: Option<&str>, note: &str) -> Result<License, String> {
         let ts = now_iso();
-        let mut code = generate_license_code();
+        let conn = self.lock();
         for _ in 0..5 {
-            if self.find_license_by_code(&code).is_none() {
-                break;
+            let id = uuid::Uuid::new_v4().to_string();
+            let code = generate_license_code();
+            match conn.execute(
+                "INSERT INTO licenses (id, owner_id, code, device_limit, status, note, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, 1, 'active', ?4, ?5, ?5)",
+                params![id, owner_id, code, note, ts],
+            ) {
+                Ok(_) => return conn.query_row("SELECT * FROM licenses WHERE id = ?1", params![id], map_license)
+                    .map_err(|error| error.to_string()),
+                Err(error) if error.sqlite_error_code() == Some(rusqlite::ErrorCode::ConstraintViolation) => continue,
+                Err(error) => return Err(error.to_string()),
             }
-            code = generate_license_code();
         }
-        let id = uuid::Uuid::new_v4().to_string();
-        let _ = self.lock().execute(
-            "INSERT INTO licenses (id, owner_id, code, device_limit, status, note, created_at, updated_at)
-             VALUES (?1, ?2, ?3, 1, 'active', ?4, ?5, ?5)",
-            params![id, owner_id, code, note, ts],
-        );
-        self.find_license_by_id(&id).expect("刚插入的激活码读不回来")
+        Err("无法生成唯一激活码，请重试".into())
     }
 
     pub fn find_license_by_id(&self, id: &str) -> Option<License> {
@@ -679,11 +681,11 @@ impl Store {
         }
     }
 
-    pub fn set_license_status(&self, id: &str, status: &str) {
-        let _ = self.lock().execute(
+    pub fn set_license_status(&self, id: &str, status: &str) -> Result<bool, String> {
+        self.lock().execute(
             "UPDATE licenses SET status = ?1, updated_at = ?2 WHERE id = ?3",
             params![status, now_iso(), id],
-        );
+        ).map(|count| count > 0).map_err(|error| error.to_string())
     }
 
     // ── devices ───────────────────────────────────────────────────
@@ -767,14 +769,14 @@ impl Store {
     }
 
     /// 解绑：删掉这条设备记录，名额放回去。**允许改绑**就是靠它。
-    pub fn unbind_device(&self, license_id: &str, device_id: &str) -> bool {
+    pub fn unbind_device(&self, license_id: &str, device_id: &str) -> Result<bool, String> {
         self.lock()
             .execute(
                 "DELETE FROM devices WHERE license_id = ?1 AND device_id = ?2",
                 params![license_id, device_id],
             )
             .map(|n| n > 0)
-            .unwrap_or(false)
+            .map_err(|error| error.to_string())
     }
 
     pub fn list_devices(&self, license_id: &str) -> Vec<Device> {
@@ -801,44 +803,24 @@ impl Store {
     // 主控端**只存被控端报上来的快照**，不下发隧道流量——主控端挂了不影响任何转发。
 
     /// 建一个认领码。搭建者把它填到被控端的配置里，被控端拿它来报到。
-    pub fn create_node(&self, name: &str) -> Node {
-        // 认领码在全表唯一，**包括已移除的行**——所以查重要连它们一起看。
-        // 只查 `find_node_by_claim`（会跳过已移除的）的话，撞上一条已移除的码会
-        // 直接违反唯一约束、INSERT 静默失败，表现是「生成了认领码但列表里没有」。
-        let taken = |code: &str| -> bool {
-            self.find_node_by_claim(code).is_some()
-                || self.find_revoked_node_by_claim(code).is_some()
-        };
-        let id = uuid::Uuid::new_v4().to_string();
+    pub fn create_node(&self, name: &str) -> Result<Node, String> {
         let ts = now_iso();
+        let conn = self.lock();
         for _ in 0..5 {
-            let code = generate_claim_code();
-            if taken(&code) {
-                continue;
-            }
-            let normalized = normalize_claim_code(&code);
-            if self
-                .lock()
-                .execute(
-                    "INSERT INTO nodes (id, claim_code, name, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?4)",
-                    params![id, normalized, name, ts],
-                )
-                .is_ok()
-            {
-                return self.find_node_by_id(&id).expect("刚插入的被控端读不回来");
+            let id = uuid::Uuid::new_v4().to_string();
+            let code = normalize_claim_code(&generate_claim_code());
+            match conn.execute(
+                "INSERT INTO nodes (id, claim_code, name, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?4)",
+                params![id, code, name, ts],
+            ) {
+                Ok(_) => return conn.query_row("SELECT * FROM nodes WHERE id = ?1", params![id], map_node)
+                    .map_err(|error| error.to_string()),
+                // 唯一约束覆盖已移除行；只换新码重试，不删除任何历史。
+                Err(error) if error.sqlite_error_code() == Some(rusqlite::ErrorCode::ConstraintViolation) => continue,
+                Err(error) => return Err(error.to_string()),
             }
         }
-        // 五次都没插进去（理论上不可能：码空间 32^8）。退一步把已移除的行清掉再试，
-        // 宁可丢掉一条历史，也不要让「生成认领码」这个动作失效。
-        self.lock()
-            .execute("DELETE FROM nodes WHERE revoked_at IS NOT NULL", [])
-            .ok();
-        let code = normalize_claim_code(&generate_claim_code());
-        let _ = self.lock().execute(
-            "INSERT INTO nodes (id, claim_code, name, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?4)",
-            params![id, code, name, ts],
-        );
-        self.find_node_by_id(&id).expect("刚插入的被控端读不回来")
+        Err("无法生成唯一认领码，请重试".into())
     }
 
     pub fn find_node_by_id(&self, id: &str) -> Option<Node> {
@@ -932,14 +914,14 @@ impl Store {
     /// 主控端设置希望被控端用的模式。`None` 表示交还给被控端自己决定。
     ///
     /// 返回 `false` 表示这台被控端不存在（或已被吊销）。
-    pub fn set_desired_mode(&self, id: &str, mode: Option<&str>) -> bool {
+    pub fn set_desired_mode(&self, id: &str, mode: Option<&str>) -> Result<bool, String> {
         self.lock()
             .execute(
-                "UPDATE nodes SET desired_mode = ?1, updated_at = ?2 WHERE id = ?3",
+                "UPDATE nodes SET desired_mode = ?1, updated_at = ?2 WHERE id = ?3 AND revoked_at IS NULL",
                 params![mode.unwrap_or(""), now_iso(), id],
             )
             .map(|n| n > 0)
-            .unwrap_or(false)
+            .map_err(|error| error.to_string())
     }
 
     /// 让一个认领码失效。被控端之后再报到会被拒。
@@ -947,16 +929,22 @@ impl Store {
     /// **只打时间戳、不删行**。删了之后主控端自己也看不出这台曾经存在过，被控端那边
     /// 收到的又只是 404，和「认领码填错了」长得一模一样——而这两件事该做的处置完全不同
     /// （重新生成认领码 vs 去核对地址）。留一行就能把话说清楚。
-    pub fn revoke_node(&self, id: &str) {
-        let _ = self.lock().execute(
+    pub fn revoke_node(&self, id: &str) -> Result<bool, String> {
+        self.lock().execute(
             "UPDATE nodes SET revoked_at = ?1, updated_at = ?1 WHERE id = ?2 AND revoked_at IS NULL",
             params![now_iso(), id],
-        );
+        ).map(|count| count > 0).map_err(|error| error.to_string())
     }
 
     /// 把一条已移除的记录彻底删掉（面板上的「彻底删除」，只收拾残局用）。
-    pub fn forget_node(&self, id: &str) {
-        let _ = self.lock().execute("DELETE FROM nodes WHERE id = ?1", params![id]);
+    pub fn forget_node(&self, id: &str) -> Result<bool, String> {
+        self.lock().execute("DELETE FROM nodes WHERE id = ?1", params![id])
+            .map(|count| count > 0).map_err(|error| error.to_string())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reject_writes_for_test(&self) {
+        self.lock().execute_batch("PRAGMA query_only = ON").unwrap();
     }
 
     // ── ota_releases（插件 OTA 临时通道）──────────────────────────
@@ -1488,7 +1476,7 @@ mod tests {
     #[test]
     fn node_report_period_is_read_from_the_same_snapshot_as_last_seen() {
         let store = Store::in_memory().unwrap();
-        let node = store.create_node("test");
+        let node = store.create_node("test").unwrap();
         assert_eq!(node.report_interval_seconds, None);
         store.touch_node(&node.id, &NodeReport {
             tunnel_online: true, status_json: r#"{"reportIntervalSeconds":45}"#.to_string(), ..NodeReport::default()
@@ -1573,7 +1561,7 @@ mod tests {
     #[test]
     fn one_license_binds_one_device_until_unbound() {
         let store = Store::in_memory().unwrap();
-        let license = store.create_license(None, "");
+        let license = store.create_license(None, "").unwrap();
         store.bind_device(&license.id, "dev-a", "手机", "ios").unwrap();
         // 同一个 deviceId 再来是更新，不是第二个名额。
         store.bind_device(&license.id, "dev-a", "手机改名", "ios").unwrap();
@@ -1581,7 +1569,7 @@ mod tests {
         // 换一台设备会被名额挡住。
         assert!(store.bind_device(&license.id, "dev-b", "另一台", "android").is_err());
         // 解绑之后能改绑——这是「允许改绑」规则的落点。
-        assert!(store.unbind_device(&license.id, "dev-a"));
+        assert!(store.unbind_device(&license.id, "dev-a").unwrap());
         store.bind_device(&license.id, "dev-b", "另一台", "android").unwrap();
         assert_eq!(store.count_active_devices(&license.id), 1);
     }
@@ -1711,7 +1699,7 @@ mod tests {
     #[test]
     fn concurrent_binding_cannot_exceed_device_limit() {
         let store = Store::in_memory().unwrap();
-        let license = store.create_license(None, "");
+        let license = store.create_license(None, "").unwrap();
         let gate = std::sync::Arc::new(std::sync::Barrier::new(8));
         let threads: Vec<_> = (0..8).map(|i| {
             let (store, gate, license) = (store.clone(), gate.clone(), license.id.clone());
@@ -1850,7 +1838,7 @@ mod tests {
         let store = Store::open(&path).expect("老库必须能打开");
         let node = store.find_node_by_id("n-old").expect("老行还在");
         assert_eq!(node.desired_mode, "", "补上的列默认是空串＝主控端本来就不管它");
-        assert!(store.set_desired_mode("n-old", Some("restricted")));
+        assert!(store.set_desired_mode("n-old", Some("restricted")).unwrap());
         assert_eq!(store.desired_mode_of("n-old"), "restricted");
 
         let _ = std::fs::remove_dir_all(&dir);

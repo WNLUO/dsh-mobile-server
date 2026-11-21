@@ -1,3 +1,4 @@
+// OTA只对通过鉴权的publish读包体，无效子路径立即结束请求。
 // 列表镜像资格在入口按路径、读操作和 fresh 筛选，转发层只消费已筛选的兜底。
 // 控制面禁缓存；OTA 固定句柄分块读取并支持范围与现有发布摘要重验。
 //! 有界读取 HTTP 请求并分流到转发、升级或本地应答。
@@ -642,6 +643,20 @@ pub async fn respond_console(
     .await
 }
 
+/// 只有已授权发布才读取OTA包体；未知POST立即返回404。
+async fn read_ota_body(
+    reader: &mut BufReader<TcpStream>, head: &RequestHead, rest: &str,
+    config: &crate::console::config::ConsoleConfig,
+) -> Result<Vec<u8>, crate::console::ConsoleResponse> {
+    if head.method != "POST" { return Ok(Vec::new()); }
+    if rest != "publish" { return Err(crate::console::ConsoleResponse::text(404, "not found\n")); }
+    crate::console::ota::authorize_publish(config, &head.headers)?;
+    read_console_body(reader, head, MAX_OTA_PUBLISH_BODY).await.map_err(|error| {
+        let message = if error == BodyReadError::TooLarge { "package too large" } else { error.message() };
+        crate::console::ConsoleResponse::json(error.status(), serde_json::json!({"ok": false, "error": message}))
+    })
+}
+
 /// 包读取与网络写入分开背压；同版本可覆盖，缓存必须按已有摘要重验。
 async fn respond_ota_download<S: AsyncRead + tokio::io::AsyncWrite + Unpin>(
     reader: &mut BufReader<S>,
@@ -860,29 +875,12 @@ pub async fn handle_owned_path(
                 let Some(console) = crate::console() else {
                     return Ok(false);
                 };
-                // 发布是最贵的一条（整包最大 32MB）：**先验控制面 token 再读 body**，
-                // 免得匿名请求仅凭一个 Content-Length 就让服务端预分配并读满 32MB。
-                // 未配 token / token 不对直接回 401/403，一个字节都不读。
-                if head.method == "POST" && rest == "publish" {
-                    if let Err(response) =
-                        crate::console::ota::authorize_publish(&console.config, &head.headers)
-                    {
+                let body = match read_ota_body(reader, head, rest, &console.config).await {
+                    Ok(body) => body,
+                    Err(response) => {
                         respond_console(reader, &response).await?;
                         return Ok(true);
                     }
-                }
-                let body = if head.method == "POST" {
-                    match read_console_body(reader, head, MAX_OTA_PUBLISH_BODY).await {
-                        Ok(body) => body,
-                        Err(error) => {
-                            let message = if error == BodyReadError::TooLarge { "package too large" } else { error.message() };
-                            let body = serde_json::json!({"ok": false, "error": message}).to_string();
-                            respond_json(reader, error.status(), &body).await?;
-                            return Ok(true);
-                        }
-                    }
-                } else {
-                    Vec::new()
                 };
                 if head.method == "GET" && rest.starts_with("download/") {
                     match crate::console::ota::handle_download(&console.store, rest.trim_start_matches("download/")).await {
@@ -1107,6 +1105,27 @@ pub async fn serve_connection(stream: TcpStream, slot: Arc<TunnelSlot>) -> std::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn ota_unknown_post_rejects_without_waiting_for_any_body_bytes() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let mut reader = BufReader::new(server);
+        let mut request = head("/api/desktop-plugins/ota/not-publish");
+        request.method = "POST".into();
+        request.headers.push(("content-length".into(), MAX_OTA_PUBLISH_BODY.to_string()));
+        let config = crate::console::config::ConsoleConfig::from_env();
+        let response = tokio::time::timeout(std::time::Duration::from_secs(1), read_ota_body(&mut reader, &request, "not-publish", &config)).await
+            .expect("无效OTA路径不能等待32MiB包体").unwrap_err();
+        assert_eq!(response.status, 404);
+        let mut config = config;
+        config.ota_control_token = "expected".into();
+        let denied = tokio::time::timeout(std::time::Duration::from_secs(1), read_ota_body(&mut reader, &request, "publish", &config)).await
+            .expect("发布鉴权失败也不能读包体").unwrap_err();
+        assert_eq!(denied.status, 401);
+        drop(client);
+    }
 
     #[tokio::test]
     async fn ota_response_streams_exact_length_through_network_backpressure() {

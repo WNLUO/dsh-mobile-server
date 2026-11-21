@@ -14,7 +14,7 @@
 |---|---|---|---|---|
 | 0x01 | register | 0 | JSON `{instanceId, name?, version?, license?, secret?, lanUrls?, lanCandidates?}` | 宿主登记实例；同一实例重连只取代自己。`version` 是宿主正在跑的三段插件版本：中转记录它，配置 `MIN_PLUGIN_VERSION` 时拒绝低于门槛或没报有效版本的宿主。`license` 供控制台准入复核；配置 `TUNNEL_REGISTER_SECRET` 时 `secret` 必须匹配。`name/lanUrls/lanCandidates` 是宿主附带的元信息，当前 Rust 中转不据此选路。**不发送 pairingCode** |
 | 0x02 | registered | 0 | JSON `{ok, mirror, blobUpload?}` | 中转确认注册。`mirror` 是本节点的镜像口径：`false`（`MIRROR_CACHE=0` 的纯转发节点）表示收下整份镜像也只留凭据摘要、正文解析完就丢，宿主据此只推摘要帧（清单与工作区各只带 `ok`+`revision`、外加 `creds`）。老宿主只认帧类型、不读内容，多这个字段没有影响。`blobUpload` 是本连接的分片上传能力，见下节 |
-| 0x03 | updatePairing | 0 | JSON | 保留编号 |
+| 0x03 | updatePairing | 0 | JSON `{}` | 保留编号，宿主不再发送，中转不读取 |
 | 0x04 | httpRequest | N | JSON `{method, path, headers}` | 手机请求头送到宿主 |
 | 0x05 | httpBody | N | bytes | 请求体；空载荷表示结束 |
 | 0x06 | httpHead | N | JSON `{status, headers}` | 宿主响应头 |
@@ -23,7 +23,7 @@
 | 0x09 | httpError | N | JSON `{message}` | 上游错误 |
 | 0x0A | wsUpgrade | N | JSON `{path, headers}` | 手机 WS 升级请求 |
 | 0x0B | wsOpen | N | 空 | 上游 WS 已连接 |
-| 0x0C | wsError | N | JSON `{message}` | 上游 WS 错误。**`id=0` 是控制帧**：中转在断开之前用它说明原因，目前只有一个 `code`：`plugin_too_old`（附带 `min` / `have` / `retryAfterMs`），宿主据此把「被版本挡住」和「网络不好」分开，按三十分钟而不是五秒重连 |
+| 0x0C | wsError | N 或 0 | JSON `{message, code?}` | `id=N` 表示上游 WS 错误；`id=0` 表示中转拒绝并即将关闭隧道。准入拒绝可只有 `message`；`code` 可为 `bad_register_secret`、`instance_mismatch`、`plugin_too_old`。版本拒绝附 `min` / `have` / `retryAfterMs`，宿主据此长退避；未知 code 仍按 message 显示拒绝原因 |
 | 0x0D | wsText | N | bytes | WS 文本数据 |
 | 0x0E | wsBinary | N | bytes | WS 二进制数据 |
 | 0x0F | wsClose | N | 2B 大端 code + 可选 UTF-8 reason | WS 关闭，reason 最多 123 字节 |
@@ -69,3 +69,5 @@
 宿主一次只发一片，收到该片 ack 后才发下一片，每片服从既有字节背压并让出共享发送队列。成功 ack 的 `nextOffset` 只确认已写入临时文件的字节；`done:false` 不代表 blob 已发布。只有完整校验、预算接受和原子持久化发布全部成功，最终 ack 才返回 `done:true`，宿主据此清除 dirty。
 
 失败 ack 会丢弃本次临时上传，旧的完整 blob 保持可读；宿主保留 dirty，由既有下一轮以新 id 从零重推，不做片内重传。断线或 stop 拒绝未决回执并清理临时上传，迟到的其他 id ack 忽略。
+
+临时上传在中转连续90秒未收到下一条上传命令时回收；这量的是片间空闲，不是整份上传耗时。宿主的逐片确认、发送背压与隧道存活期限仍独立生效；到期后的续片会收到从零重推的失败回执，旧完整 blob 不受影响。

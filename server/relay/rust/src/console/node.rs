@@ -1,3 +1,4 @@
+// 准入模式持久化失败时不宣称已经应用，保留下一轮上报重试。
 //! 主控端 / 被控端：显式交还准入管理权，周期上报加入抖动。
 //!
 //! 一套代码两种角色，按配置决定：
@@ -68,8 +69,8 @@ pub fn spawn_reporter(config: ConsoleConfig, store: Store) {
                     // 不新增端点、不新增心跳，被控端也不用开任何入站口。
                     let body = response.text().await.unwrap_or_default();
                     apply_desired_mode(&store, &body);
-                    store.set_setting("master_last_report_at", &crate::store::iso_now());
-                    store.set_setting("master_last_error", "");
+                    let _ = store.set_setting("master_last_report_at", &crate::store::iso_now());
+                    let _ = store.set_setting("master_last_error", "");
                 }
                 Ok(response) => {
                     // 状态码本身就是给运维看的结论，照原文抄进日志，别自己再解释一遍：
@@ -84,14 +85,14 @@ pub fn spawn_reporter(config: ConsoleConfig, store: Store) {
                     ));
                     // 面板上要看得见「一直报不上去」。只写日志的话，开面板的人不知道
                     // 自己这台已经在主控端那边掉线了。
-                    store.set_setting(
+                    let _ = store.set_setting(
                         "master_last_error",
                         &format!("HTTP {status} {}", detail.trim()),
                     );
                 }
                 Err(error) => {
                     crate::tunnel::log(format!("主控端不可达：{error}"));
-                    store.set_setting("master_last_error", &format!("不可达：{error}"));
+                    let _ = store.set_setting("master_last_error", &format!("不可达：{error}"));
                 }
             }
             tokio::time::sleep(report_delay(interval, false, rand::random())).await;
@@ -134,7 +135,9 @@ pub fn apply_desired_mode(store: &Store, body: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(body).ok()?;
     let mode = value.get("admissionMode")?;
     if mode.is_null() {
-        store.set_setting("master_manages_mode", "0");
+        if let Err(error) = store.set_setting("master_manages_mode", "0") {
+            crate::tunnel::log(format!("交还准入管理权写入失败：{error}"));
+        }
         return None;
     }
     let wanted = mode.as_str()?.trim();
@@ -144,14 +147,20 @@ pub fn apply_desired_mode(store: &Store, body: &str) -> Option<String> {
     // 收到过一个有效值就等于「这台由主控端管准入」——哪怕它跟本地现有值一样。
     // 这样面板在「主控端要求的就是它现在的模式」时也能如实显示「由主控端管理」，
     // 而不是显示成「没人管、你可以随便改」，让人改完又被掰回去。
-    store.set_setting("master_manages_mode", "1");
+    if let Err(error) = store.set_setting("master_manages_mode", "1") {
+        crate::tunnel::log(format!("准入管理权写入失败：{error}"));
+        return None;
+    }
     let current = store
         .get_setting("admission_mode")
         .unwrap_or_else(|| "open".to_string());
     if current == wanted {
         return None;
     }
-    store.set_setting("admission_mode", wanted);
+    if let Err(error) = store.set_setting("admission_mode", wanted) {
+        crate::tunnel::log(format!("准入模式写入失败：{error}"));
+        return None;
+    }
     store.audit(None, "settings.admission_mode", wanted, "由主控端下发", None);
     crate::tunnel::log(format!("主控端下发准入模式：{current} → {wanted}"));
     Some(wanted.to_string())
@@ -258,7 +267,7 @@ mod tests {
         let mut slave = master_config();
         slave.report_interval_seconds = 42;
         let report = collect_report(&slave, &store);
-        let node = store.create_node("slave");
+        let node = store.create_node("slave").unwrap();
         apply_report(&store, &master_config(), &node.claim_code, "", &report).unwrap();
         let snapshot = store.find_node_by_id(&node.id).unwrap();
         // Node 已把 status_json 解析成 report_interval_seconds 对外，不再暴露原串。
@@ -289,7 +298,7 @@ mod tests {
     fn report_updates_master_view_of_node() {
         let store = Store::in_memory().unwrap();
         let master = master_config();
-        let node = store.create_node("我家那台");
+        let node = store.create_node("我家那台").unwrap();
         let report = NodeReport {
             name: "搭建者改过的名字".into(),
             public_url: "https://relay.example.com".into(),
@@ -317,8 +326,8 @@ mod tests {
         let report = NodeReport::default();
         assert_eq!(apply_report(&store, &master, "NODE-NOPENOPE", "", &report).unwrap_err().0, 404);
 
-        let node = store.create_node("临时");
-        store.revoke_node(&node.id);
+        let node = store.create_node("临时").unwrap();
+        store.revoke_node(&node.id).unwrap();
         // **403 而不是 404**：被控端日志要能分清「我被移除了，去要个新认领码」
         // 和「这个码压根不认识，先核对主控地址」。混成一个 404 等于什么都没说。
         let (status, message) = apply_report(&store, &master, &node.claim_code, "", &report).unwrap_err();
@@ -332,7 +341,7 @@ mod tests {
         );
         assert!(store.find_node_by_id(&node.id).unwrap().revoked_at.is_some());
         // 彻底删除才真的没了。
-        store.forget_node(&node.id);
+        store.forget_node(&node.id).unwrap();
         assert!(store.find_node_by_id(&node.id).is_none());
     }
 
@@ -340,9 +349,9 @@ mod tests {
     #[test]
     fn revoked_and_unknown_are_distinguishable() {
         let store = Store::in_memory().unwrap();
-        let node = store.create_node("临时");
+        let node = store.create_node("临时").unwrap();
         assert!(store.find_revoked_node_by_claim(&node.claim_code).is_none(), "还没移除");
-        store.revoke_node(&node.id);
+        store.revoke_node(&node.id).unwrap();
         assert!(store.find_revoked_node_by_claim(&node.claim_code).is_some());
         assert!(store.find_revoked_node_by_claim("NODE-NOPENOPE").is_none());
     }
@@ -352,9 +361,9 @@ mod tests {
     #[test]
     fn create_node_still_works_with_revoked_rows() {
         let store = Store::in_memory().unwrap();
-        let first = store.create_node("甲");
-        store.revoke_node(&first.id);
-        let second = store.create_node("乙");
+        let first = store.create_node("甲").unwrap();
+        store.revoke_node(&first.id).unwrap();
+        let second = store.create_node("乙").unwrap();
         assert_ne!(second.id, first.id);
         assert_ne!(second.claim_code, first.claim_code);
         assert!(store.find_node_by_id(&second.id).is_some(), "新生成的那台必须真的在");
@@ -401,7 +410,7 @@ mod tests {
         let store = Store::in_memory().unwrap();
         let mut master = master_config();
         master.accepts_reports = false;
-        let node = store.create_node("x");
+        let node = store.create_node("x").unwrap();
         assert_eq!(
             apply_report(&store, &master, &node.claim_code, "", &NodeReport::default())
                 .unwrap_err()
@@ -416,7 +425,7 @@ mod tests {
         let store = Store::in_memory().unwrap();
         let mut master = master_config();
         master.master_token = Some("s3cret".into());
-        let node = store.create_node("x");
+        let node = store.create_node("x").unwrap();
         let report = NodeReport::default();
 
         assert_eq!(
@@ -441,7 +450,7 @@ mod tests {
     fn report_reply_returns_local_control_without_desired_mode() {
         let store = Store::in_memory().unwrap();
         let master = master_config();
-        let node = store.create_node("x");
+        let node = store.create_node("x").unwrap();
         let reply = apply_report(&store, &master, &node.claim_code, "", &NodeReport::default()).unwrap();
         assert_eq!(reply, None, "无期望值时由本地管理");
     }
@@ -451,15 +460,15 @@ mod tests {
     fn report_reply_carries_the_mode_master_set() {
         let store = Store::in_memory().unwrap();
         let master = master_config();
-        let node = store.create_node("x");
+        let node = store.create_node("x").unwrap();
         let report = NodeReport::default();
 
-        assert!(store.set_desired_mode(&node.id, Some("restricted")));
+        assert!(store.set_desired_mode(&node.id, Some("restricted")).unwrap());
         let reply = apply_report(&store, &master, &node.claim_code, "", &report).unwrap();
         assert_eq!(reply.as_deref(), Some("restricted"));
 
         // 交回后由 API 发出 admissionMode:null。
-        assert!(store.set_desired_mode(&node.id, None));
+        assert!(store.set_desired_mode(&node.id, None).unwrap());
         let reply = apply_report(&store, &master, &node.claim_code, "", &report).unwrap();
         assert_eq!(reply, None);
     }
@@ -467,7 +476,7 @@ mod tests {
     #[test]
     fn setting_mode_on_unknown_node_reports_false() {
         let store = Store::in_memory().unwrap();
-        assert!(!store.set_desired_mode("no-such-node", Some("open")));
+        assert!(!store.set_desired_mode("no-such-node", Some("open")).unwrap());
     }
 
     /// 被控端这边：拿到 `admissionMode` 就落地，缺字段或怪值一律不动。

@@ -1,4 +1,4 @@
-//! 中转控制台：有限登录事务、稳定身份、可信来源审计与准入管理。
+//! 控制台管理写入失败如实返回，节点快照附同源时间供前端判断新鲜度。
 //!
 //! 从 Node 运营版（`server/dsh-mobile-hub/`）译过来。与转发路径的关系只有一处：
 //! 隧道接入前的**准入校验**。转发本身仍然不碰数据库。
@@ -38,6 +38,11 @@ pub struct ConsoleResponse {
     pub set_cookie: Option<String>,
     /// 需要 302 跳走时填这里。
     pub redirect: Option<String>,
+}
+
+fn write_failure(error: String) -> ConsoleResponse {
+    crate::tunnel::log(format!("console write failed: {error}"));
+    ConsoleResponse::json(500, json!({ "ok": false, "error": "存储写入失败，请稍后刷新核对" }))
 }
 
 impl ConsoleResponse {
@@ -284,6 +289,7 @@ impl Console {
                     // 这台跑的是哪一版、自动更新开没开、有没有停手。停更的机器以前只能
                     // 翻日志才知道，机器一多就没人看得见。
                     "version": env!("CARGO_PKG_VERSION"),
+                    "serverTime": crate::store::iso_now(),
                     "selfUpdate": self.update_report(),
                 }),
             );
@@ -303,13 +309,13 @@ impl Console {
                 return ConsoleResponse::json(403, json!({ "ok": false, "error": "admin only" }));
             }
             let nodes = self.store.list_nodes(200);
-            return ConsoleResponse::json(200, json!({ "ok": true, "nodes": nodes }));
+            return ConsoleResponse::json(200, json!({ "ok": true, "nodes": nodes, "serverTime": crate::store::iso_now() }));
         }
         if method == "POST" && sub == "/nodes" {
             if !user.is_admin {
                 return ConsoleResponse::json(403, json!({ "ok": false, "error": "admin only" }));
             }
-            let node = self.store.create_node("");
+            let node = match self.store.create_node("") { Ok(node) => node, Err(error) => return write_failure(error) };
             self.store
                 .audit(Some(&user.id), "node.create", &node.claim_code, "", audit_ip);
             return ConsoleResponse::json(201, json!({ "ok": true, "node": node }));
@@ -319,7 +325,7 @@ impl Console {
                 return ConsoleResponse::json(403, json!({ "ok": false, "error": "admin only" }));
             }
             let id = sub.trim_start_matches("/nodes/");
-            self.store.revoke_node(id);
+            if let Err(error) = self.store.revoke_node(id) { return write_failure(error); }
             self.store.audit(Some(&user.id), "node.revoke", id, "", audit_ip);
             // 记录留着（`revokedAt` 有值），面板上显示成「已移除」。
             // 被控端那边之后上报会拿到 403，日志里写「被主控端移除」——
@@ -339,7 +345,7 @@ impl Console {
                 .trim_start_matches("/nodes/")
                 .trim_end_matches("/forget")
                 .trim_end_matches('/');
-            self.store.forget_node(id);
+            if let Err(error) = self.store.forget_node(id) { return write_failure(error); }
             self.store.audit(Some(&user.id), "node.forget", id, "", audit_ip);
             return ConsoleResponse::json(200, json!({ "ok": true }));
         }
@@ -382,8 +388,10 @@ impl Console {
                 }
                 Some(_) => {}
             }
-            if !self.store.set_desired_mode(id, desired) {
-                return ConsoleResponse::json(404, json!({ "ok": false, "error": "not found" }));
+            match self.store.set_desired_mode(id, desired) {
+                Ok(true) => {}
+                Ok(false) => return ConsoleResponse::json(404, json!({ "ok": false, "error": "not found" })),
+                Err(error) => return write_failure(error),
             }
             self.store.audit(
                 Some(&user.id),
@@ -401,7 +409,7 @@ impl Console {
         }
 
         if method == "POST" && sub == "/licenses" {
-            let license = self.store.create_license(Some(&user.id), "");
+            let license = match self.store.create_license(Some(&user.id), "") { Ok(license) => license, Err(error) => return write_failure(error) };
             self.store
                 .audit(Some(&user.id), "license.create", &license.code, "", audit_ip);
             return ConsoleResponse::json(201, json!({ "ok": true, "license": license }));
@@ -434,7 +442,11 @@ impl Console {
             } else {
                 "active"
             };
-            self.store.set_license_status(id, next);
+            match self.store.set_license_status(id, next) {
+                Ok(true) => {}
+                Ok(false) => return ConsoleResponse::json(404, json!({ "ok": false, "error": "not found" })),
+                Err(error) => return write_failure(error),
+            }
             self.store
                 .audit(Some(&user.id), "license.status", &license.code, next, audit_ip);
             return ConsoleResponse::json(200, json!({ "ok": true, "status": next }));
@@ -454,7 +466,10 @@ impl Console {
         if method == "DELETE" && sub.contains("/devices/") {
             let rest = sub.trim_start_matches("/licenses/");
             if let Some((id, device_id)) = rest.split_once("/devices/") {
-                let removed = self.store.unbind_device(id, device_id);
+                let removed = match self.store.unbind_device(id, device_id) {
+                    Ok(removed) => removed,
+                    Err(error) => return write_failure(error),
+                };
                 if removed {
                     self.store
                         .audit(Some(&user.id), "device.unbind", device_id, id, audit_ip);
@@ -657,7 +672,7 @@ impl Console {
                 }),
             );
         }
-        self.store.set_setting("admission_mode", normalized);
+        if let Err(error) = self.store.set_setting("admission_mode", normalized) { return write_failure(error); }
         self.store
             .audit(Some(&actor.id), "settings.admission_mode", normalized, "", audit_ip);
         ConsoleResponse::json(200, json!({ "ok": true, "admissionMode": normalized }))
@@ -981,10 +996,8 @@ mod tests {
     fn restricted_mode_requires_a_valid_code() {
         let console = console();
         let user = admin(&console);
-        let license = console.store.create_license(Some(&user.id), "");
-        console
-            .store
-            .set_setting("admission_mode", "restricted");
+        let license = console.store.create_license(Some(&user.id), "").unwrap();
+        console.store.set_setting("admission_mode", "restricted").unwrap();
 
         // 没码：拒绝
         assert!(console.check_admission("").is_err());
@@ -995,7 +1008,7 @@ mod tests {
         assert!(console.check_admission(&format!("  {lower}  ")).is_ok());
 
         // 吊销之后立刻失效
-        console.store.set_license_status(&license.id, "revoked");
+        console.store.set_license_status(&license.id, "revoked").unwrap();
         assert!(console.check_admission(&license.code).is_err());
     }
 
@@ -1053,7 +1066,7 @@ mod tests {
     fn bind_enforces_one_device_per_code() {
         let console = console();
         let user = admin(&console);
-        let license = console.store.create_license(Some(&user.id), "");
+        let license = console.store.create_license(Some(&user.id), "").unwrap();
         let parse = |r: &ConsoleResponse| -> Value { serde_json::from_slice(&r.body).unwrap() };
 
         let first = console.handle_bind(
@@ -1075,7 +1088,7 @@ mod tests {
         assert_eq!(parse(&second)["reason"], "device_limit_reached");
 
         // 解绑之后能改绑
-        console.store.unbind_device(&license.id, "dev-a");
+        console.store.unbind_device(&license.id, "dev-a").unwrap();
         let rebound = console.handle_bind(
             format!(r#"{{"code":"{}","deviceId":"dev-b"}}"#, license.code).as_bytes(),
         );
@@ -1086,7 +1099,7 @@ mod tests {
     fn verify_reports_why_a_code_is_unusable() {
         let console = console();
         let user = admin(&console);
-        let license = console.store.create_license(Some(&user.id), "");
+        let license = console.store.create_license(Some(&user.id), "").unwrap();
         let parse = |r: &ConsoleResponse| -> Value { serde_json::from_slice(&r.body).unwrap() };
 
         // 码不存在
@@ -1110,7 +1123,7 @@ mod tests {
         assert_eq!(parse(&ok)["ok"], true);
 
         // 吊销之后立刻失效
-        console.store.set_license_status(&license.id, "revoked");
+        console.store.set_license_status(&license.id, "revoked").unwrap();
         let revoked = console.handle_verify(
             format!(r#"{{"code":"{}","deviceId":"dev-a"}}"#, license.code).as_bytes(),
         );
@@ -1200,8 +1213,8 @@ mod tests {
         let console = console();
         let user = admin(&console);
         let headers = cookie_for(&console, &user);
-        let node = console.store.create_node("old");
-        console.store.revoke_node(&node.id);
+        let node = console.store.create_node("old").unwrap();
+        console.store.revoke_node(&node.id).unwrap();
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let response = runtime.block_on(console.handle_api("DELETE", &format!("/api/platform/v1/nodes/{}/forget", node.id), "", &headers, &[], None));
         assert_eq!(response.status, 200);
@@ -1232,7 +1245,7 @@ mod tests {
     #[test]
     fn reports_explicitly_return_mode_control_to_slave() {
         let console = console();
-        let node = console.store.create_node("slave");
+        let node = console.store.create_node("slave").unwrap();
         let headers = vec![("x-dsh-claim".into(), node.claim_code)];
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let reply = runtime.block_on(console.handle_report(&headers, br#"{}"#));
@@ -1335,6 +1348,62 @@ mod tests {
         assert_eq!(safe_next_path("https://evil.example"), None);
         assert_eq!(safe_next_path(&format!("/{}", "a".repeat(600))), None);
     }
+    #[test]
+    fn management_writes_distinguish_storage_errors_and_idempotent_removal() {
+        let console = console();
+        let user = admin(&console);
+        let headers = cookie_for(&console, &user);
+        let license = console.store.create_license(Some(&user.id), "").unwrap();
+        console.store.bind_device(&license.id, "phone", "", "").unwrap();
+        let node = console.store.create_node("node").unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let call = |method: &str, path: &str, query: &str| runtime.block_on(console.handle_api(method, path, query, &headers, &[], None));
+        assert_eq!(call("POST", "/api/platform/v1/nodes/missing/mode", "mode=open").status, 404);
+        assert_eq!(call("DELETE", "/api/platform/v1/nodes/missing", "").status, 200);
+        assert_eq!(call("DELETE", "/api/platform/v1/nodes/missing/forget", "").status, 200);
+        let removed = console.store.create_node("removed").unwrap();
+        let remove_path = format!("/api/platform/v1/nodes/{}", removed.id);
+        assert_eq!(call("DELETE", &remove_path, "").status, 200);
+        assert_eq!(call("DELETE", &remove_path, "").status, 200, "重复移除保持幂等");
+        let missing_device = format!("/api/platform/v1/licenses/{}/devices/missing", license.id);
+        let missing_reply = call("DELETE", &missing_device, "");
+        assert_eq!(missing_reply.status, 200);
+        assert_eq!(serde_json::from_slice::<Value>(&missing_reply.body).unwrap()["removed"], false);
+        console.store.reject_writes_for_test();
+        for (method, path, query) in [
+            ("POST", "/api/platform/v1/nodes".to_string(), ""),
+            ("POST", "/api/platform/v1/licenses".to_string(), ""),
+            ("POST", "/api/platform/v1/settings/mode".to_string(), "mode=restricted"),
+            ("POST", format!("/api/platform/v1/nodes/{}/mode", node.id), "mode=restricted"),
+            ("DELETE", format!("/api/platform/v1/nodes/{}", node.id), ""),
+            ("DELETE", format!("/api/platform/v1/nodes/{}/forget", node.id), ""),
+            ("POST", format!("/api/platform/v1/licenses/{}/status", license.id), ""),
+            ("DELETE", format!("/api/platform/v1/licenses/{}/devices/phone", license.id), ""),
+        ] {
+            assert_eq!(call(method, &path, query).status, 500, "{method} {path} 必须报告写入失败");
+        }
+        assert!(console.store.find_node_by_id(&removed.id).unwrap().revoked_at.is_some(), "创建失败不能清除已移除历史");
+        assert_eq!(console.admission_mode(), "open");
+        assert!(console.store.find_node_by_id(&node.id).unwrap().revoked_at.is_none());
+        assert_eq!(console.store.find_license_by_id(&license.id).unwrap().status, "active");
+        assert!(console.store.find_device(&license.id, "phone").is_some());
+    }
+
+
+    #[test]
+    fn node_list_carries_the_server_time_used_for_its_snapshot() {
+        let console = console();
+        let user = admin(&console);
+        let headers = cookie_for(&console, &user);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let before = crate::store::iso_now();
+        let response = runtime.block_on(console.handle_api("GET", "/api/platform/v1/nodes", "", &headers, &[], None));
+        let after = crate::store::iso_now();
+        let body: Value = serde_json::from_slice(&response.body).unwrap();
+        let time = body["serverTime"].as_str().unwrap();
+        assert!(time >= before.as_str() && time <= after.as_str());
+    }
+
 }
 
 #[cfg(test)]
@@ -1357,8 +1426,10 @@ mod admission_flow {
             config,
             store: Store::in_memory().unwrap(),
         };
-        console.store.set_setting("admission_mode", "restricted");
+        console.store.set_setting("admission_mode", "restricted").unwrap();
         assert_eq!(console.admission_mode(), "restricted", "写入后必须读得回 restricted");
         assert!(console.check_admission("").is_err(), "限制模式下空码必须被拒");
     }
+
+
 }

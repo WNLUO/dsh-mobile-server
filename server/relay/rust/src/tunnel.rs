@@ -1,3 +1,4 @@
+// 隧道心跳仅使用额外1KiB排队余量，普通数据预算保持不变。
 //! 管理单条隧道、转发名额与双向排队字节预算。
 //!
 //! 自建版没有实例注册、没有多租户：同一时刻只服务**一条**宿主隧道。新连接直接取代旧的
@@ -135,6 +136,7 @@ pub struct Tunnel {
 
 /// 隧道发往宿主方向的积压上限（与 Node 版同名常量）。
 pub const MAX_TUNNEL_BUFFERED_BYTES: i64 = 16 * 1024 * 1024;
+const HEARTBEAT_BUFFER_RESERVE_BYTES: i64 = 1024;
 /// 停读手机上行的高水位。
 pub const TUNNEL_FEED_HIGH_WATER_BYTES: i64 = MAX_TUNNEL_BUFFERED_BYTES / 2;
 /// 回落到这个水位就恢复读。
@@ -340,12 +342,14 @@ impl Tunnel {
             return false;
         }
         let control = is_control_frame(frame_type);
-        if !control && self.backlog() > MAX_TUNNEL_BUFFERED_BYTES {
+        let heartbeat = matches!(frame_type, t::PING | t::PONG) && matches!(&payload, Payload::Empty);
+        let limit = MAX_TUNNEL_BUFFERED_BYTES + if heartbeat { HEARTBEAT_BUFFER_RESERVE_BYTES } else { 0 };
+        if !control && self.backlog() > limit {
             return false;
         }
         let frame = encode_frame(frame_type, id as u32, &payload);
         let len = frame.len() as i64;
-        if !control && self.backlog() + len > MAX_TUNNEL_BUFFERED_BYTES {
+        if !control && self.backlog() + len > limit {
             return false;
         }
         // 记账在真正入队之前：入队之后写任务随时可能发出并减回去。
@@ -826,5 +830,28 @@ mod tests {
         assert!(slot.get().is_some());
         assert!(slot.clear_if_current(&second));
         assert!(slot.get().is_none());
+    }
+}
+
+
+#[cfg(test)]
+mod heartbeat_budget_tests {
+    use super::*;
+
+    #[test]
+    fn heartbeats_have_bounded_reserve_without_increasing_data_budget() {
+        for kind in [t::PING, t::PONG] {
+            let (tx, mut rx) = mpsc::channel(8);
+            let tunnel = Tunnel::new(tx);
+            tunnel.backlog.store(MAX_TUNNEL_BUFFERED_BYTES, Ordering::SeqCst);
+            assert!(tunnel.send_empty(kind, 0), "满数据预算仍可排空心跳");
+            assert!(rx.try_recv().is_ok());
+            assert!(!tunnel.send_frame(t::WS_TEXT, 1, Payload::Bytes(vec![1])));
+            tunnel.backlog.store(MAX_TUNNEL_BUFFERED_BYTES + HEARTBEAT_BUFFER_RESERVE_BYTES - 9, Ordering::SeqCst);
+            assert!(tunnel.send_empty(kind, 0), "最后一帧必须精确落在余量边界");
+            assert!(!tunnel.send_empty(kind, 0), "余量同样有上限");
+            tunnel.backlog.store(MAX_TUNNEL_BUFFERED_BYTES, Ordering::SeqCst);
+            assert!(!tunnel.send_frame(kind, 0, Payload::Bytes(vec![1])), "带载荷的伪心跳不能使用余量");
+        }
     }
 }
