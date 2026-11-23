@@ -185,7 +185,7 @@ dependencies = [
 
 [[package]]
 name = "dsh-relay"
-version = "0.1.30"
+version = "0.1.31"
 dependencies = [
  "base64 0.22.1",
  "bytes",
