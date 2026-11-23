@@ -578,17 +578,12 @@ async fn accept_phone_ws_with_config(
     let instance = head.header("x-dsh-instance").unwrap_or_default();
     let Some(tunnel) = slot.get_for(instance) else {
         let mut reader = reader;
-        // 这台实例要是搬到别的中转去了，503 里要把新地址带上，手机才知道往哪切。
-        // 没有迁移记录时**原样**回今天这句（空体、connection: close），老客户端一个字节不变。
-        let response = match crate::migrate::migrated_response(instance) {
-            Some((body, to)) => format!(
-                "HTTP/1.1 503 Service Unavailable\r\ncontent-type: application/json; charset=utf-8\r\ncontent-length: {}\r\nx-dsh-migrated-to: {to}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            ),
-            None => "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n".to_string(),
-        };
         let stream = reader.get_mut();
-        let _ = tokio::io::AsyncWriteExt::write_all(stream, response.as_bytes()).await;
+        let _ = tokio::io::AsyncWriteExt::write_all(
+            stream,
+            b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n",
+        )
+        .await;
         return Ok(());
     };
 

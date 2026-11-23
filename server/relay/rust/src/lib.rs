@@ -11,10 +11,6 @@
 //! 或上游返回 5xx 时回给手机（标成 stale，只对默认视图、只对配对过的设备凭据）。
 //! `MIRROR_CACHE=0` 可以退回纯转发，写操作与要求新鲜结果的读不使用镜像。
 //!
-//! 还有一本 `migrate`：宿主换中转之前在旧中转上留一条「我搬到 X 了」，本进程按实例
-//! 记 30 天。实例不在线时优先回 503 + `x-dsh-migrated-to`（排在镜像兜底之前——让镜像
-//! 先答 200 的话，手机拿到旧清单就满足了，永远学不到新地址）。
-//!
 //! 另外还挂着**中转控制台**（见 `console`）：面板、微信登录、激活码与准入。
 //! 它是可选的——`PLATFORM_ENABLED` 没设时整套不生效，中转就是纯转发。
 //! 控制台与转发只有一处交界：隧道接入前的准入校验，转发路径本身不碰数据库。
@@ -31,7 +27,6 @@ pub mod config;
 pub mod console;
 pub mod headers;
 pub mod http;
-pub mod migrate;
 pub mod mirror;
 pub mod plugin_versions;
 pub mod proxy;
