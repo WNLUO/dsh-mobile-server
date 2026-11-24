@@ -29,19 +29,36 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
-/// 同时记多少台实例的镜像。
+/// 账本至少记多少台。
 ///
 /// 16 是按「一台机器一个实例」的老口径定的。公用中转上一百多台宿主同时在线时，16 个
 /// 位置每插一台就挤掉最旧那台，于是每台每 5 秒推上来的那帧都被当成「第一次落地」：
 /// 日志每帧一行（一台机器一天两百万行），缓存和凭据摘要随时被挤掉——宿主掉线后手机读
-/// 不到兜底，推令牌上报也核不过。512 覆盖公用中转的实际规模，内存由下面的总字节预算兜。
+/// 不到兜底，推令牌上报也核不过。2026-10-27 抬到 4096；2026-11-24 美国那台在线 4400
+/// 多台又顶穿了同一个数（见 `max_instances`），所以它现在只当下限。
+const MIN_INSTANCES: usize = 4096;
+/// 账本最多记多少台。空正文的一份条目只有几百字节，条数本身也要有个头。
+const MAX_INSTANCES: usize = 65_536;
+/// 每台在账本里的最小占用：key、四个短字段与结构体本身，按空正文估。
 ///
-/// 2026-10-27 美国那台实测：一天之内见过 **512 个不同实例**，正好把 512 个位置占满，
-/// 每来一台新的就挤掉最旧的那台。位置不够的原因不是机器多，而是**离线的机器不会自己
-/// 让位**（过期只在读缓存时比对，没人来读就一直躺着）。所以两条一起改：闲置清理
-/// （`ENTRY_IDLE_MS`）负责让位，上限抬到 4096 负责余量。单份按现在的量级只有 9KB 上下，
-/// 4096 份约 40MB，仍在下面的自适应预算之内。
-const MAX_INSTANCES: usize = 4096;
+/// 字节预算只算得清清单正文与凭据摘要，算不出每份条目自己的开销；纯转发的部署
+/// （`MIRROR_CACHE=0`）正文是空的，只按字节卡等于没卡。所以用它把预算折成台数。
+const MIN_ENTRY_BYTES: usize = 1024;
+
+/// 这台机器记多少台实例。
+///
+/// **条数不能写死**：2026-11-24 美国那台在线 4400 多台，上限 4096 只差一点点，结果不是
+/// 「挤掉几百台」，而是**每一台都在下次推送前被挤掉**——全站每秒八百多帧，一台每 5 秒
+/// 推一次，两次推送之间要插进来四千多份，4096 个位置正好被整个换过一遍。于是每帧都是
+/// 「第一次落地」：一分钟四万行日志（一小时 290MB），凭据摘要每次都被丢掉，推送令牌
+/// 上报全变 403。台数跟着字节预算走，才会随机器大小留出余量。
+fn max_instances() -> usize {
+    cap_for(total_bytes_budget())
+}
+
+fn cap_for(budget: usize) -> usize {
+    (budget / MIN_ENTRY_BYTES).clamp(MIN_INSTANCES, MAX_INSTANCES)
+}
 /// 整本账总字节预算的上下限。**实际值在第一次用到时按这台机器的可用内存算出来**
 /// （见 `total_bytes_budget`）：公网上这些中转从 960MB 的小机器到几 G 的都有，写死一个
 /// 数要么把小机器吃光、要么把大机器白限死。超了就从最旧的那份开始淘汰，刚推上来的永远留。
@@ -112,9 +129,24 @@ impl MirrorEntry {
     }
 }
 
-fn store() -> &'static Mutex<HashMap<String, MirrorEntry>> {
-    static STORE: OnceLock<Mutex<HashMap<String, MirrorEntry>>> = OnceLock::new();
-    STORE.get_or_init(|| Mutex::new(HashMap::new()))
+/// 镜像账本：那份 map 加上它当前占的字节数。
+///
+/// 总字节数跟着每次插入、替换、淘汰一起加减。以前是每次插入都全表扫一遍算总量：
+/// 2026-11-24 美国那台 4400 台在线、每秒八百多帧，等于每秒三百多万次字符串长度相加，
+/// 而且全程持着这把锁——这一核上的 CPU 有一部分就是这么烧掉的。
+struct Ledger {
+    map: HashMap<String, MirrorEntry>,
+    bytes: usize,
+}
+
+fn store() -> &'static Mutex<Ledger> {
+    static STORE: OnceLock<Mutex<Ledger>> = OnceLock::new();
+    STORE.get_or_init(|| {
+        Mutex::new(Ledger {
+            map: HashMap::new(),
+            bytes: 0,
+        })
+    })
 }
 
 /// 落地顺序的唯一来源。
@@ -168,10 +200,10 @@ pub struct Stats {
 }
 
 pub fn stats() -> Stats {
-    let map = store().lock().unwrap_or_else(|e| e.into_inner());
+    let ledger = store().lock().unwrap_or_else(|e| e.into_inner());
     Stats {
-        instances: map.len(),
-        bytes: total_bytes(&map),
+        instances: ledger.map.len(),
+        bytes: ledger.bytes,
         budget: total_bytes_budget(),
     }
 }
@@ -323,24 +355,35 @@ fn remember_with(instance_id: &str, payload: &[u8], keep_bodies: bool) -> bool {
         stored_at_ms: now_ms(),
         stored_seq: next_seq(),
     };
-    let mut map = store().lock().unwrap_or_else(|e| e.into_inner());
+    let new_bytes = entry_bytes(key, &entry);
+    let mut ledger = store().lock().unwrap_or_else(|e| e.into_inner());
     // 先让离线的让位，再看台数：顺序反过来就是「先挤掉一台在线的，再去删一台早该走的」。
-    sweep_idle(&mut map, entry.stored_at_ms);
-    let previous_creds = map.get(key).map(|entry| entry.creds.len());
-    if !map.contains_key(key) && map.len() >= MAX_INSTANCES {
-        evict_oldest(&mut map);
-    }
+    sweep_idle(&mut ledger, entry.stored_at_ms);
+    let previous_creds = ledger.map.get(key).map(|entry| entry.creds.len());
+    let evicted = if !ledger.map.contains_key(key) && ledger.map.len() >= max_instances() {
+        evict_oldest(&mut ledger);
+        true
+    } else {
+        false
+    };
     let (sessions_bytes, workspaces_bytes) = (entry.sessions.len(), entry.workspaces.len());
     let creds_count = entry.creds.len();
-    map.insert(key.to_string(), entry);
+    if let Some(previous) = ledger.map.insert(key.to_string(), entry) {
+        ledger.bytes = ledger.bytes.saturating_sub(entry_bytes(key, &previous));
+    }
+    ledger.bytes += new_bytes;
     // 台数管住之后还要管住总量：大清单 × 多实例会先把内存吃满，再轮到台数上限。
     // 淘汰的永远是最旧的那份，刚插进来的这份 seq 最大、轮不到它。
-    prune_to_budget(&mut map, total_bytes_budget());
-    drop(map);
+    prune_to_budget(&mut ledger, total_bytes_budget());
+    drop(ledger);
     // 只在这两件事上留一行：镜像第一次落地、摘要条数变了。镜像本身每 500ms 就重推一次，
     // 每推一次打一行会把日志刷满；而这两条恰恰是运维要看的（「中转到底收没收到镜像」
     // 「撤销一台设备有没有传导过去」）。缓存命中不打：宿主离线时它会按轮询节奏反复出现。
     match previous_creds {
+        // 账本满了被挤掉、下一帧又落回来，这不是「第一次见到这台」：这条分支会在每一帧
+        // 上出现（2026-11-24 美国那台一小时 290MB 全是它），说的只是上限不够用。
+        // 账本满没满看 `/status` 的 `instances`，别指望日志。
+        None if evicted => {}
         None => crate::tunnel::log(format!(
             "mirror stored instance={key} sessions={sessions_bytes}B workspaces={workspaces_bytes}B creds={creds_count}"
         )),
@@ -361,52 +404,61 @@ fn entry_bytes(key: &str, entry: &MirrorEntry) -> usize {
         + entry.creds.iter().map(|(hash, _)| hash.len()).sum::<usize>()
 }
 
-fn total_bytes(map: &HashMap<String, MirrorEntry>) -> usize {
-    map.iter()
-        .map(|(key, entry)| entry_bytes(key, entry))
-        .sum()
-}
-
 /// 淘汰最旧的那一份。新旧按「落地时刻 + 落地顺序」排：只按毫秒排的话，同一毫秒里
 /// 推上来的几份会变成「随便挑一份」。
-fn evict_oldest(map: &mut HashMap<String, MirrorEntry>) {
-    let oldest = map
+fn evict_oldest(ledger: &mut Ledger) {
+    let oldest = ledger
+        .map
         .iter()
         .min_by_key(|(_, entry)| (entry.stored_at_ms, entry.stored_seq))
         .map(|(instance, _)| instance.clone());
     if let Some(instance) = oldest {
-        map.remove(&instance);
+        if let Some(entry) = ledger.map.remove(&instance) {
+            ledger.bytes = ledger.bytes.saturating_sub(entry_bytes(&instance, &entry));
+        }
     }
 }
 
 /// 总量超预算就从头淘汰，直到装得下。留一份是给「单份自己就超预算」兜底：
 /// 淘汰到最后只剩刚推上来的这份，至少不会把最新的镜像也扔掉。
-fn prune_to_budget(map: &mut HashMap<String, MirrorEntry>, max_bytes: usize) {
-    while map.len() > 1 && total_bytes(map) > max_bytes {
-        evict_oldest(map);
+fn prune_to_budget(ledger: &mut Ledger, max_bytes: usize) {
+    while ledger.map.len() > 1 && ledger.bytes > max_bytes {
+        evict_oldest(ledger);
     }
 }
 
 /// 清掉空闲超过 `ENTRY_IDLE_MS` 的条目。返回删了几条。
-fn sweep_idle_entries(map: &mut HashMap<String, MirrorEntry>, now: u64) -> usize {
-    let before = map.len();
-    map.retain(|_, entry| now.saturating_sub(entry.stored_at_ms) <= ENTRY_IDLE_MS);
-    before - map.len()
+fn sweep_idle_entries(ledger: &mut Ledger, now: u64) -> usize {
+    let before = ledger.map.len();
+    let mut freed = 0usize;
+    ledger.map.retain(|key, entry| {
+        if now.saturating_sub(entry.stored_at_ms) > ENTRY_IDLE_MS {
+            freed += entry_bytes(key, entry);
+            false
+        } else {
+            true
+        }
+    });
+    ledger.bytes = ledger.bytes.saturating_sub(freed);
+    before - ledger.map.len()
 }
 
 /// 带节流的清扫：粘在每次推送的路径上，但最多一分钟做一次真正的全表扫描。
 ///
 /// 不节流的话，156 台宿主每台每 500ms 一帧就是每秒三百次全表扫描，白白吃这一核。
-fn sweep_idle(map: &mut HashMap<String, MirrorEntry>, now: u64) {
+fn sweep_idle(ledger: &mut Ledger, now: u64) {
     static LAST_SWEEP_MS: AtomicU64 = AtomicU64::new(0);
     let last = LAST_SWEEP_MS.load(Ordering::Relaxed);
     if last != 0 && now.saturating_sub(last) < SWEEP_INTERVAL_MS {
         return;
     }
     LAST_SWEEP_MS.store(now, Ordering::Relaxed);
-    let removed = sweep_idle_entries(map, now);
+    let removed = sweep_idle_entries(ledger, now);
     if removed > 0 {
-        crate::tunnel::log(format!("mirror swept idle={removed} left={}", map.len()));
+        crate::tunnel::log(format!(
+            "mirror swept idle={removed} left={}",
+            ledger.map.len()
+        ));
     }
 }
 
@@ -423,8 +475,8 @@ pub fn lookup(
     let now = now_ms();
     // 出锁只带走要用的那几段：不掐着全局锁做 JSON 解析。
     let (body, revision, generated_at, creds) = {
-        let map = store().lock().unwrap_or_else(|e| e.into_inner());
-        let entry = map.get(instance_id.trim())?;
+        let ledger = store().lock().unwrap_or_else(|e| e.into_inner());
+        let entry = ledger.map.get(instance_id.trim())?;
         if now.saturating_sub(entry.stored_at_ms) > ENTRY_IDLE_MS {
             return None;
         }
@@ -470,8 +522,8 @@ pub fn lookup(
 pub(crate) fn credential_ok(instance_id: &str, credentials: &[String]) -> bool {
     let now = now_ms();
     let creds = {
-        let map = store().lock().unwrap_or_else(|e| e.into_inner());
-        match map.get(instance_id.trim()) {
+        let ledger = store().lock().unwrap_or_else(|e| e.into_inner());
+        match ledger.map.get(instance_id.trim()) {
             Some(entry) if now.saturating_sub(entry.stored_at_ms) <= ENTRY_IDLE_MS => entry.creds.clone(),
             _ => Vec::new(),
         }
@@ -887,7 +939,8 @@ mod tests {
     #[test]
     fn caps_instances_and_keeps_newest() {
         let _guard = test_lock();
-        for index in 0..(MAX_INSTANCES + 4) {
+        let cap = max_instances();
+        for index in 0..(cap + 4) {
             let instance = format!("mirror-cap-{index}");
             assert!(remember(
                 &instance,
@@ -896,8 +949,28 @@ mod tests {
         }
         // 最早那份被淘汰，最新的还在。
         assert_eq!(lookup("mirror-cap-0", ListKind::Sessions, "", &presented(&["cred_live"])), None);
-        let newest = format!("mirror-cap-{}", MAX_INSTANCES + 3);
+        let newest = format!("mirror-cap-{}", cap + 3);
         assert!(lookup(&newest, ListKind::Sessions, "", &presented(&["cred_live"])).is_some());
+    }
+
+    /// 台数上限跟着字节预算走，而且永远不低于旧的写死值。
+    ///
+    /// 2026-11-24 美国那台在线 4400 多台、上限正好 4096：位置只差几百个，但每台两次
+    /// 推送之间全站要插进来四千多份，4096 个位置被整个换过一遍，于是**每一台**都被挤掉，
+    /// 每帧都当成「第一次落地」。上限必须离真实在线台数有余量，不是刚好压线。
+    #[test]
+    fn the_instance_cap_follows_the_byte_budget() {
+        // 读不到内存时退回旧值，不比现在更差。
+        assert_eq!(cap_for(0), MIN_INSTANCES);
+        // 32MB 预算按每台 1KB 折出 32768 个位置，已经远高于写死的 4096。
+        assert_eq!(cap_for(MIN_TOTAL_BYTES), 32_768);
+        // 大机器封顶，不让条数跟着预算无限涨。
+        assert_eq!(cap_for(MAX_TOTAL_BYTES), MAX_INSTANCES);
+        assert_eq!(cap_for(usize::MAX), MAX_INSTANCES);
+        assert!(
+            cap_for(budget_for(Some(577 * 1024 * 1024))) > 4 * 4096,
+            "美国那台那种 960MB 的机器也要留出一个数量级的余量"
+        );
     }
 
     /// 公用中转上一百多台宿主同时在线时，每台那份都要留得住。
@@ -909,7 +982,7 @@ mod tests {
     #[test]
     fn a_busy_public_relay_keeps_every_instance() {
         let _guard = test_lock();
-        assert!(MAX_INSTANCES >= 256, "公用中转的实例规模远超「一台机器一个实例」的口径");
+        assert!(cap_for(MIN_TOTAL_BYTES) >= 256, "公用中转的实例规模远超「一台机器一个实例」的口径");
         let count = 200usize;
         for index in 0..count {
             let instance = format!("mirror-public-{index}");
@@ -944,40 +1017,70 @@ mod tests {
 
     #[test]
     fn a_byte_budget_prunes_the_oldest() {
-        let mut map: HashMap<String, MirrorEntry> = HashMap::new();
+        let mut ledger = Ledger {
+            map: HashMap::new(),
+            bytes: 0,
+        };
         for seq in 0..8u64 {
-            map.insert(format!("m{seq}"), fake_entry(1000, seq));
+            let key = format!("m{seq}");
+            let entry = fake_entry(1000, seq);
+            ledger.bytes += entry_bytes(&key, &entry);
+            ledger.map.insert(key, entry);
         }
-        prune_to_budget(&mut map, 3000);
-        assert!(total_bytes(&map) <= 3000, "淘汰之后总量必须落在预算内");
-        assert!(map.contains_key("m7"), "刚推上来的那份不能被扔");
-        assert!(!map.contains_key("m0"), "淘汰从最旧的开始");
+        prune_to_budget(&mut ledger, 3000);
+        assert!(ledger.bytes <= 3000, "淘汰之后总量必须落在预算内");
+        assert!(ledger.map.contains_key("m7"), "刚推上来的那份不能被扔");
+        assert!(!ledger.map.contains_key("m0"), "淘汰从最旧的开始");
         // 单份自己就超预算时也要留一份，至少别把最新的镜像也扔掉。
-        let mut single: HashMap<String, MirrorEntry> = HashMap::new();
-        single.insert("big".to_string(), fake_entry(5000, 1));
+        let mut single = Ledger {
+            map: HashMap::new(),
+            bytes: 0,
+        };
+        let big = fake_entry(5000, 1);
+        single.bytes += entry_bytes("big", &big);
+        single.map.insert("big".to_string(), big);
         prune_to_budget(&mut single, 1000);
-        assert_eq!(single.len(), 1);
+        assert_eq!(single.map.len(), 1);
+        assert_eq!(
+            single.bytes,
+            entry_bytes("big", &single.map["big"]),
+            "账本记的字节数要跟留下来的那份对得上"
+        );
     }
 
     /// 闲置清理：超过六小时没新推送的条目必须让位，在线的（时间戳一直被刷新）不受影响。
     #[test]
     fn idle_entries_get_swept_after_six_hours() {
         let now = 100_000_000u64;
-        let mut map: HashMap<String, MirrorEntry> = HashMap::new();
+        let mut ledger = Ledger {
+            map: HashMap::new(),
+            bytes: 0,
+        };
         let mut fresh = fake_entry(10, 2);
         fresh.stored_at_ms = now - 1_000;
         let mut stale = fake_entry(10, 1);
         stale.stored_at_ms = now - ENTRY_IDLE_MS - 1;
-        map.insert("fresh".to_string(), fresh);
-        map.insert("stale".to_string(), stale);
-        assert_eq!(sweep_idle_entries(&mut map, now), 1);
-        assert!(map.contains_key("fresh"), "在线的不能被清");
-        assert!(!map.contains_key("stale"), "闲置超过六小时的必须让位");
+        for (key, entry) in [("fresh", fresh), ("stale", stale)] {
+            ledger.bytes += entry_bytes(key, &entry);
+            ledger.map.insert(key.to_string(), entry);
+        }
+        assert_eq!(sweep_idle_entries(&mut ledger, now), 1);
+        assert!(ledger.map.contains_key("fresh"), "在线的不能被清");
+        assert!(!ledger.map.contains_key("stale"), "闲置超过六小时的必须让位");
+        assert_eq!(
+            ledger.bytes,
+            entry_bytes("fresh", &ledger.map["fresh"]),
+            "清掉的条目要从总字节里减掉"
+        );
         // 边界：正好六小时那份还算「刚用过」，不算闲置。
-        let mut edge: HashMap<String, MirrorEntry> = HashMap::new();
+        let mut edge = Ledger {
+            map: HashMap::new(),
+            bytes: 0,
+        };
         let mut boundary = fake_entry(10, 1);
         boundary.stored_at_ms = now - ENTRY_IDLE_MS;
-        edge.insert("edge".to_string(), boundary);
+        edge.bytes += entry_bytes("edge", &boundary);
+        edge.map.insert("edge".to_string(), boundary);
         assert_eq!(sweep_idle_entries(&mut edge, now), 0);
     }
 
