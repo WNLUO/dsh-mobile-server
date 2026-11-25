@@ -41,8 +41,6 @@ const T = {
   sync: 0x17,          // id=0  JSON {kind, ...}；桌面→中转主动推送（移动端镜像缓存）
   revokeAll: 0x18,     // id=0  JSON {at}；桌面请求中转清空本实例全部设备授权
   revokeAllAck: 0x19,  // id=0  JSON {ok, revoked}；中转确认已清空
-  pushRegister: 0x1A,  // id=0  JSON {deviceId, platform, token}；宿主代 App 上报 iOS 推送令牌（本实例）
-  pushSend: 0x1B,      // id=0  JSON {deviceId, title, body, sessionId?, kind}；宿主请求中转发一条 APNs 推送
   migrate: 0x1C,       // id=0  JSON {to, at}；宿主换中转地址前在旧隧道上登记「这台搬到 to」，to 空串 = 撤销
   blobPut: 0x1D,       // id=0  旧 JSON {scope,key,creds,cipher}（空 cipher 仅刷新）；协商后 id=N 双向分片/ack，见 PROTOCOL.md
   blobDelete: 0x1E,    // id=0  JSON {scope, key} 或 {scope, keys:[...]}；宿主让中转删掉已推过的 blob
@@ -81,7 +79,7 @@ function normalizePath(pathname) {
 }
 
 /** 中转自己认领的路径。与帧编号无关，但同属「三端必须一致」的规则，所以放在一起。 */
-const OWNED_PATHS = ['/', '/healthz', '/status', '/api/mobile/v1/health', '/api/mobile/v1/push-token', '/tunnel'];
+const OWNED_PATHS = ['/', '/healthz', '/status', '/api/mobile/v1/health', '/tunnel'];
 
 /**
  * 手机 API 的固定前缀。`/health` 是 405 那条，这一条是「整段手机 API」。

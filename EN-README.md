@@ -34,7 +34,7 @@ The box in the middle of that diagram is the service you deploy. All it does is 
 ### Optional capabilities
 
 - **Relay console**: WeChat login, activation codes, admission mode, controlling and controlled ends — it lives in the same binary as forwarding, so there is no second service to run.
-- **iOS push notifications**: bring your own APNs key and the phone gets notified even when locked; leave it unconfigured and the feature is simply off.
+- **iOS push notifications**: handled by the directory service; the relay neither configures nor processes them.
 - **Emergency full packages**: OTA payloads for the plugin are served from here as well.
 
 ### Operations
@@ -65,19 +65,11 @@ A pure forwarding deployment needs no environment variables at all. The ones bel
 
 - Console (WeChat login / activation codes / admission): enable with `PLATFORM_ENABLED=1`; the rest lives in `console/config.rs`.
 - Mirror fallback: `MIRROR_CACHE=0` turns it off (on by default); `MIRROR_FALLBACK_MS` sets the threshold.
-- **iOS push notifications**: enabled only when `APNS_KEY` + `APNS_KEY_ID` + `APNS_TEAM_ID` are all set. `APNS_KEY` is the `.p8` private key generated in the Apple Developer portal (Apple Push Notifications authentication key, ES256), accepted as either PEM text or a file path (supports `~/`). Leave it unset and the feature is off, with zero impact on forwarding or anything else; the startup log prints `apns disabled`.
+- **iOS push notifications**: handled by the directory service; the relay has no push-related configuration.
 - **Tunnel registration secret**: `TUNNEL_REGISTER_SECRET=...` (**unset by default = no check**). When set, every host's plugin must carry the same value (the "registration secret" in the desktop settings, or the `DSH_RELAY_REGISTER_SECRET` env var for headless deployments) and the relay verifies it at tunnel registration, rejecting the tunnel on mismatch. It prevents someone who knows an instance id from evicting that host's tunnel and intercepting its phone requests (credentials included). Recommended on shared/public relays; unset keeps the previous behavior where any client that can reach `/tunnel` may claim an instance id.
 - **Console admins**: `PLATFORM_ADMIN_SUBS` is a comma-separated whitelist of OIDC subs that become admins. `PLATFORM_BOOTSTRAP_FIRST_ADMIN=1` is required for "the first user to log in becomes admin when the DB has no users", and it is **off by default**. On a fresh self-hosted first deployment, either turn that flag on explicitly or put your own accounts in `PLATFORM_ADMIN_SUBS`, otherwise logging in does not grant admin rights (`/overview` and `/nodes` are admin-only; claim codes in the node list are hidden from non-admins).
 - **OTA publish token**: `PLATFORM_OTA_CONTROL_TOKEN=...`. Publishing a plugin OTA package requires `Authorization: Bearer <token>`; if unset, the publish endpoint is closed (downloads are unaffected). The token is checked *before* the upload body is read, so unauthorized requests can't tie up the memory reserved for a package of up to 32MB.
 - **Self-update source**: `SELF_UPDATE_SOURCE` (comma-separated) accepts only `https://` (loopback `127.0.0.1` / `localhost` is allowed for local test directories). The self-update manifest and the binary URLs it declares travel the same link; cleartext `http://` hands integrity to a network attacker, so non-https sources are rejected, logged, and skipped.
-
-## One Apple rule about iOS push
-
-Push capability is bound to **the app's ownership**, not to the relay: only a key issued by the developer team that holds the app's bundle id can push to that app. So:
-
-- **You use the App Store build we publish**: push works on your relay only once you configure **the `.p8` key issued by our team**. Pushes signed by a key from your own Apple account are rejected by Apple (the app is not yours) — not a bug but Apple's ecosystem rule, and the same limitation applies to any self-hosted server pushing to an official client (WeChat, Telegram).
-- **You build your own app from a fork** (your own bundle id, signed with your own account): your key works end to end for your build; configure it as described above. This very path is what that section was built for.
-- Keys are unrelated to certificates: a `.p8` key does not expire (certificates rotate every year), and one key can push to every app that team owns — but it **cannot read push history**, nor push to apps owned by other teams.
 
 ## Development and testing
 

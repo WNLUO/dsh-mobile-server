@@ -21,7 +21,6 @@
 //! 隧道帧格式见 `../../relay-core/PROTOCOL.md`；编解码与类型表在
 //! `../../relay-core/rust`，与 JS 实现由逐字节对撞测试钉住。
 
-pub mod apns;
 pub mod blobstore;
 pub mod config;
 pub mod console;
@@ -144,7 +143,13 @@ mod tests {
             );
         }
         // 反过来：Rust 表里的每一帧都必须在文档里有行。
+        // 0x1A / 0x1B 已退役（离线推送改由总控负责），编号留空、不复用。
         for code in 0x01..=0x1Eu8 {
+            if code == 0x1A || code == 0x1B {
+                assert!(dsh_relay_protocol::t::name(code).is_none(), "{code:#04x} 已退役，不该再有名字");
+                assert!(!documented.contains_key(&code), "PROTOCOL.md 不该再有 {code:#04x} 这一行");
+                continue;
+            }
             let name = dsh_relay_protocol::t::name(code).expect("每一帧都要有名字");
             assert!(
                 documented.contains_key(&code),

@@ -135,20 +135,27 @@
 - **资源收尾**：使用镜像前先取走原响应发送端，向仍在发送的宿主发一次 `HTTP_CANCEL` 并丢掉已入队错误正文；迟到帧不会再入队。写完镜像后由原请求收尾路径释放 pending 名额。不能只替换状态码，也不能先写上游响应头再改成镜像。
 - **守卫**：`cargo test --manifest-path server/relay/rust/Cargo.toml upstream_5xx` 走真实 HTTP 入口和隧道帧分发，覆盖会话/工作区、部署前缀、500/503/599、内容指纹、错凭据、无缓存、fresh、归档、分页、写操作、非列表、非 5xx、原正文保留、取消与 pending 回收；镜像全局容量测试与转发测试共用镜像表测试锁。将真实 5xx 分支禁用时，上述用例必须失败；完整子项目验证运行 `npm test`。
 - **根因**：此前转发只在等待响应头超过弱网阈值时使用镜像，收到 5xx 会直接写给手机，与插件依赖的“列表异常时保留上次正常列表”约定不一致。
+
+### A1-10. 离线推送整块搬出中转（0x1A / 0x1B 退役）
+
+- **典型说法**：「中转还要不要配 APNs 密钥」「`/api/mobile/v1/push-token` 怎么打不通了」「0x1A / 0x1B 是什么」「宿主发推送帧过来没反应」。
+- **改哪里**：离线推送由总控负责，中转只做转发。`server/relay-core/PROTOCOL.md` 的帧表与退役说明、`server/relay-core/protocol-types.js` 与 `server/relay-core/rust/src/lib.rs` 的类型表、`server/relay/rust/src/proxy.rs` 的帧分发、`server/relay/rust/src/http.rs` 的认领路径、`server/relay/rust/src/store.rs` 的表结构；这些地方都不该再出现推送专用逻辑。
+- **刻意设计**：**编号不复用**。0x1A / 0x1B 留空；旧宿主发来这两帧时按未知帧静默丢弃，与其它未知帧同一条路，不加兼容层。原 APNs 依赖（`p256`）与配置项（`APNS_*`）一并删除，纯转发部署不受影响。
+- **守卫**：`cargo test` 的 `every_type_has_a_name` 与 `protocol_doc_matches_the_frame_table` 把两个退役编号钉成「没有名字、文档里也没有行」；帧表三处由 parity 测试逐条对撞。
 <!-- END:TASK-PLAYBOOKS -->
 
 ## B 段 · 文件清单（机械生成，勿手改）
 
 <!-- BEGIN:GENERATED-FILES -->
-> **A 段未覆盖**：25 / 35 个源文件没有任何条目的「改哪里」收它们。
-> 其中 1 个被「联动」点到过——`affected` 按名字找得到，但只会提示「顺带被点到」，
+> **A 段未覆盖**：21 / 34 个源文件没有任何条目的「改哪里」收它们。
+> 其中 0 个被「联动」点到过——`affected` 按名字找得到，但只会提示「顺带被点到」，
 > 没有条目「拥有」它们。完整清单见
 > [`docs/.dev-map-uncovered.txt`](.dev-map-uncovered.txt)——那是一份「地图待补清单」，
 > 不是缺陷清单；把条目补进 A 段后跑 `npm run map`，它会自己变短。
 
 ### Rust 中转与隧道协议（全部源码）
 
-共 35 个文件。
+共 34 个文件。
 
 | 文件 | 用途 |
 | --- | --- |
@@ -166,7 +173,6 @@
 | `server/relay/rust/console/src/lib/useConsole.ts` | 控制台快照使用服务端时间判断节点新鲜度，浏览器墙钟不参与在线判定。 |
 | `server/relay/rust/console/src/main.tsx` | (无文件头注释) |
 | `server/relay/rust/console/vite.config.ts` | 中转控制台的构建配置。 |
-| `server/relay/rust/src/apns.rs` | APNs 推送转发：依赖可用令牌存储，永久失效令牌按当次发送值删除。 |
 | `server/relay/rust/src/blobstore.rs` | 管理加密历史 blob 的落盘、容量与设备凭据访问。 |
 | `server/relay/rust/src/blobstore/upload.rs` | 每条宿主隧道串行接收有界 blob 分片，写盘确认不阻塞隧道分发。 |
 | `server/relay/rust/src/config.rs` | 环境变量配置：隧道宿主45秒先判死，中转默认60秒清理未响应连接。 |

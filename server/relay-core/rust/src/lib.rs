@@ -44,8 +44,6 @@ pub mod t {
     pub const SYNC: u8 = 0x17;
     pub const REVOKE_ALL: u8 = 0x18;
     pub const REVOKE_ALL_ACK: u8 = 0x19;
-    pub const PUSH_REGISTER: u8 = 0x1A;
-    pub const PUSH_SEND: u8 = 0x1B;
     /// 宿主断开旧隧道之前报「我搬到 `to` 了」；`to` 为空串撤销这条记录。
     pub const MIGRATE: u8 = 0x1C;
     /// 旧 id=0 上传整份密文或以空 cipher 刷新凭据；中转只存不解。
@@ -82,8 +80,6 @@ pub mod t {
             SYNC => "sync",
             REVOKE_ALL => "revokeAll",
             REVOKE_ALL_ACK => "revokeAllAck",
-            PUSH_REGISTER => "pushRegister",
-            PUSH_SEND => "pushSend",
             MIGRATE => "migrate",
             BLOB_PUT => "blobPut",
             BLOB_DELETE => "blobDelete",
@@ -360,6 +356,11 @@ mod tests {
     #[test]
     fn every_type_has_a_name() {
         for code in 0x01..=0x1Eu8 {
+            // 0x1A / 0x1B 已退役（离线推送改由总控负责），编号留空、不复用。
+            if code == 0x1A || code == 0x1B {
+                assert!(t::name(code).is_none(), "{code:#04x} 已退役，不该再有名字");
+                continue;
+            }
             assert!(t::name(code).is_some(), "{code:#04x} 没有名字");
         }
     }

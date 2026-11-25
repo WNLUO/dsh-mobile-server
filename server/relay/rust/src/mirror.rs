@@ -50,8 +50,8 @@ const MIN_ENTRY_BYTES: usize = 1024;
 /// **条数不能写死**：2026-11-24 美国那台在线 4400 多台，上限 4096 只差一点点，结果不是
 /// 「挤掉几百台」，而是**每一台都在下次推送前被挤掉**——全站每秒八百多帧，一台每 5 秒
 /// 推一次，两次推送之间要插进来四千多份，4096 个位置正好被整个换过一遍。于是每帧都是
-/// 「第一次落地」：一分钟四万行日志（一小时 290MB），凭据摘要每次都被丢掉，推送令牌
-/// 上报全变 403。台数跟着字节预算走，才会随机器大小留出余量。
+/// 「第一次落地」：一分钟四万行日志（一小时 290MB），凭据摘要每次都被丢掉，镜像读
+/// 全变 403。台数跟着字节预算走，才会随机器大小留出余量。
 fn max_instances() -> usize {
     cap_for(total_bytes_budget())
 }
@@ -310,8 +310,8 @@ pub fn remember(instance_id: &str, payload: &[u8]) -> bool {
 /// `keep_bodies = false` 时只留凭据摘要与时间戳，不留两份清单正文。
 ///
 /// 纯转发的部署（`MIRROR_CACHE=0`）本来就不提供离线兜底，正文存进来一次都不会被读到，
-/// 却要跟着每次推送解析、序列化、占内存。**摘要不能一起丢**：推送令牌上报（`/push-token`）
-/// 的鉴权判据就是这本账里的摘要，丢了它，那台机器上报的令牌全变成 403。
+/// 却要跟着每次推送解析、序列化、占内存。**摘要不能一起丢**：镜像读的鉴权判据
+/// 就是这本账里的摘要，丢了它，那台机器的缓存读全变成 403。
 fn remember_with(instance_id: &str, payload: &[u8], keep_bodies: bool) -> bool {
     let key = instance_id.trim();
     if key.is_empty() || payload.len() > MAX_SYNC_BYTES {
@@ -517,20 +517,6 @@ pub fn lookup(
     serde_json::to_string(&value).ok()
 }
 
-/// 这台实例当前这份摘要清单能不能放行这次出示的凭据。推送令牌上报（`http.rs` 的
-/// `/api/mobile/v1/push-token`）与镜像读用同一个判据，别另写一份校验。
-pub(crate) fn credential_ok(instance_id: &str, credentials: &[String]) -> bool {
-    let now = now_ms();
-    let creds = {
-        let ledger = store().lock().unwrap_or_else(|e| e.into_inner());
-        match ledger.map.get(instance_id.trim()) {
-            Some(entry) if now.saturating_sub(entry.stored_at_ms) <= ENTRY_IDLE_MS => entry.creds.clone(),
-            _ => Vec::new(),
-        }
-    };
-    creds_allow(&creds, credentials, now as i64)
-}
-
 /// 宿主与中转绝对时钟的最大容差。
 pub(crate) const CREDENTIAL_CLOCK_SKEW_MS: i64 = 5 * 60 * 1000;
 
@@ -547,8 +533,7 @@ pub(crate) fn credential_not_expired(expires_at: i64, now_ms: i64) -> bool {
 /// 一段任意 Bearer（`<instanceId>.<exp>.<random>`），按 `dshc_` 筛会把新配对之后的镜像
 /// 读整片挡住；旧 HMAC token 的哈希不在宿主推上来的表里，本来就会被这条判据拒掉。
 ///
-/// 推送令牌上报那条自有路径（`http.rs`）用同一个判据：同一套摘要、同一个「空摘要
-/// 不放行」的口径，别为它另写一份校验。
+/// 同一套摘要、同一个「空摘要不放行」的口径，别另写一份校验。
 pub(crate) fn creds_allow(creds: &[(String, i64)], credentials: &[String], now_ms: i64) -> bool {
     if creds.is_empty() || credentials.is_empty() {
         return false;
@@ -977,7 +962,7 @@ mod tests {
     ///
     /// 2026-10-27 实测：美国那台 124 台在线，上限 16 的账本每插一台就挤掉最旧那台，
     /// 于是每台每 5 秒推上来的那帧都被当成「第一次落地」——一天两百万行日志，而且
-    /// 兜底缓存与推送令牌的凭据核对随时失效。这条按公用规模插一遍、逐台读回来，
+    /// 兜底缓存与凭据核对随时失效。这条按公用规模插一遍、逐台读回来，
     /// 谁把上限调回单机口径就红。
     #[test]
     fn a_busy_public_relay_keeps_every_instance() {
@@ -1115,9 +1100,13 @@ mod tests {
             None,
             "纯转发不该留正文，缓存读也一个字节都不给"
         );
+        let creds = {
+            let ledger = store().lock().unwrap_or_else(|e| e.into_inner());
+            ledger.map.get(instance).map(|entry| entry.creds.clone()).unwrap_or_default()
+        };
         assert!(
-            credential_ok(instance, &presented(&[cred])),
-            "摘要必须留着：推送令牌上报靠它鉴权"
+            creds_allow(&creds, &presented(&[cred]), now_ms() as i64),
+            "摘要必须留着：镜像读靠它鉴权"
         );
         // 这台改成开机镜像之后，下一帧就把正文补上（切配置不用重启中转）。
         assert!(remember_with(

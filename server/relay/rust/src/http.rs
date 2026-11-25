@@ -93,7 +93,6 @@ const OWNED_PATHS: &[&str] = &[
     "/healthz",
     "/status",
     "/api/mobile/v1/health",
-    "/api/mobile/v1/push-token",
     "/tunnel",
 ];
 
@@ -793,81 +792,6 @@ pub async fn handle_owned_path(
             respond_json(reader, 200, &body).await?;
             Ok(true)
         }
-        "/api/mobile/v1/push-token" => {
-            // iOS 推送令牌上报。**必须带设备凭据**：判据与镜像读同一个（mirror::credential_ok），
-            // 没配对过的手机报上来的令牌一律不收。控制台没开时也收——推送依赖的是 APNs
-            // 配置（APNS_*），不是控制台开关。
-            if head.method != "POST" {
-                respond_json(reader, 405, r#"{"ok":false,"error":"method not allowed"}"#).await?;
-                return Ok(true);
-            }
-            let instance_id = head
-                .header("x-dsh-instance")
-                .unwrap_or_default()
-                .trim()
-                .to_string();
-            let credentials = presented_credentials(head);
-            if credentials.is_empty() {
-                respond_json(reader, 401, r#"{"ok":false,"error":"device credential required"}"#).await?;
-                return Ok(true);
-            }
-            if instance_id.is_empty() {
-                respond_json(reader, 400, r#"{"ok":false,"error":"x-dsh-instance required"}"#).await?;
-                return Ok(true);
-            }
-            if !crate::mirror::credential_ok(&instance_id, &credentials) {
-                respond_json(reader, 403, r#"{"ok":false,"error":"bad device credential"}"#).await?;
-                return Ok(true);
-            }
-            let body = match read_console_body(reader, head, MAX_CONSOLE_BODY).await {
-                Ok(body) => body,
-                Err(error) => {
-                    let body = serde_json::json!({"ok": false, "error": error.message()}).to_string();
-                    respond_json(reader, error.status(), &body).await?;
-                    return Ok(true);
-                }
-            };
-            let request: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
-            let device_id = request
-                .get("deviceId")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .trim()
-                .to_string();
-            let token = request
-                .get("token")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .trim()
-                .to_string();
-            let platform = request
-                .get("platform")
-                .and_then(|v| v.as_str())
-                .unwrap_or("ios")
-                .trim()
-                .to_string();
-            // 提醒偏好：任意 JSON，原样落表（中转只读其中的 levels / muted）。没带就
-            // 沿用旧值——不主动删，免得旧的 App 一上报就把偏好清空。
-            let prefs = request
-                .get("prefs")
-                .filter(|v| !v.is_null())
-                .map(|v| v.to_string());
-            if device_id.is_empty() || token.is_empty() {
-                respond_json(reader, 400, r#"{"ok":false,"error":"deviceId and token are required"}"#).await?;
-                return Ok(true);
-            }
-            match crate::console() {
-                Some(console) => {
-                    console.store.upsert_push_token(&instance_id, &device_id, &platform, &token);
-                    if let Some(prefs) = prefs {
-                        console.store.upsert_push_prefs(&instance_id, &device_id, &prefs);
-                    }
-                    respond_json(reader, 200, r#"{"ok":true}"#).await?;
-                }
-                None => respond_json(reader, 503, r#"{"ok":false,"error":"no store on this relay"}"#).await?,
-            }
-            Ok(true)
-        }
         other => {
             // 插件 OTA 临时通道共用控制台数据库，需要 PLATFORM_ENABLED=1。
             // 单独匹配宿主救急路径，不额外开启独立服务。
@@ -1256,10 +1180,6 @@ mod tests {
             "/api/mobile/v1/health"
         );
         assert_eq!(strip_deploy_prefix("/relay/tunnel"), "/tunnel");
-        assert_eq!(
-            strip_deploy_prefix("/relay/api/mobile/v1/push-token"),
-            "/api/mobile/v1/push-token"
-        );
         // 末尾判定是刻意取舍：`/relay/status` 会命中 `/status`。但**手机 API 前缀下的
         // 路径绝不能被末尾匹配抢走**——见下面那条用例。
     }

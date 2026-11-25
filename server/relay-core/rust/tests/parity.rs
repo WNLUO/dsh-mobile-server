@@ -95,8 +95,6 @@ fn encode_frame_matches_js_byte_for_byte() {
         ("sync", t::SYNC),
         ("revokeAll", t::REVOKE_ALL),
         ("revokeAllAck", t::REVOKE_ALL_ACK),
-        ("pushRegister", t::PUSH_REGISTER),
-        ("pushSend", t::PUSH_SEND),
         ("migrate", t::MIGRATE),
         ("blobPut", t::BLOB_PUT),
         ("blobDelete", t::BLOB_DELETE),
@@ -184,7 +182,6 @@ for (const [path, expected] of [
   ['/relay/api/mobile/v1/status', '/api/mobile/v1/status'],
   ['/relay/api/mobile/v1/healthz', '/api/mobile/v1/healthz'],
   ['/relay/api/mobile/v1/health', '/api/mobile/v1/health'],
-  ['/relay/api/mobile/v1/push-token', '/api/mobile/v1/push-token'],
   ['/relay/whatever/thing', '/relay/whatever/thing'],
 ]) assert.equal(t.stripDeployPrefix(path), expected, path);
 for (const [path, query, expected] of [
@@ -350,8 +347,6 @@ fn type_table_matches_js() {
         ("sync", t::SYNC),
         ("revokeAll", t::REVOKE_ALL),
         ("revokeAllAck", t::REVOKE_ALL_ACK),
-        ("pushRegister", t::PUSH_REGISTER),
-        ("pushSend", t::PUSH_SEND),
         ("migrate", t::MIGRATE),
         ("blobPut", t::BLOB_PUT),
         ("blobDelete", t::BLOB_DELETE),

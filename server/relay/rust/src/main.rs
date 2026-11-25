@@ -102,9 +102,6 @@ async fn main() {
         }
     }
 
-    // APNs令牌与发送依赖实际初始化成功的控制台，配置了但不可用时明确关闭。
-    dsh_relay::apns::init_from_env();
-
     // 历史 blob 仓库：默认关。开着时把密文落到 data 目录下，注入转发与 HTTP 两侧。
     // 建不起来（磁盘不可写等）只记日志、不挡转发——中转的首要职责仍是转发。
     if config.blob_store {
